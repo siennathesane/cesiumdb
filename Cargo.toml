@@ -1,35 +1,17 @@
 [package]
 name = "cesiumdb"
-authors = ["Sienna Lloyd <sienna@r3t.io>", "CesiumDB Authors"]
+authors = ["Sienna Satterwhite <sienna@linux.com>", "CesiumDB Authors"]
 version = "0.0.1"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[build-dependencies]
-flatc-rust = "*"
-prost-build = "*"
+[features]
+default_features = []
 
 [dependencies]
-aes = { version = "0.8.3"}
-bytes = { version = "1.5.0", features = ["serde"] }
-crc = { git = "https://github.com/mrhooray/crc-rs", branch = "master", features = ["slice16-mem-limit"] }
-crossbeam-deque = "0.8.3"
-crossbeam-utils = "0.8.16"
-flatbuffers = "23.5.26"
-flexbuffers = "2.0.0"
-generic-array = "1.0.0"
-moka = {version =  "0.12.1" , features = ["sync"]}
-parking_lot = "0.12.1"
-prost = {version =  "0.12.3" }
-rand = { version = "0.8.5", features = ["small_rng"] }
-serde = { version = "1.0.193", features = ["derive"] }
-xxhash-rust = { version = "0.8.7", features = ["xxh3"] }
-zstd = "0.13.0"
-
-[dev-dependencies]
-criterion = "0.5.1"
-
-[[bench]]
-name    = "main"
-harness = false
+libc = "0.2.159"
+memmap2 = "0.9.5"
+rkyv = { version = "0.8.8", features = ["little_endian"] }
+tracing = "0.1.40"
+bytes = "1.7.2"
+crc32fast = "1.4.2"
+bytemuck = { version = "1.19.0" , features = ["extern_crate_alloc", "zeroable_maybe_uninit"]}

@@ -1,0 +1,25 @@
+[build]
+rustflags = [
+    "--cfg", "tracing_unstable",
+    "-Awarnings",
+]
+
+[unstable]
+codegen-backend = true
+
+[profile.dev]
+codegen-backend = "cranelift"
+codegen-units = 256
+debug = true
+debug-assertions = true
+incremental = true
+lto = false
+overflow-checks = true
+panic = 'abort'
+rpath = false
+strip = "none"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
