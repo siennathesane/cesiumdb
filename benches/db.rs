@@ -90,7 +90,7 @@ pub fn db_get(c: &mut Criterion) {
 
     // the largest number of potential keys
     let total_keys = BATCH_SIZES[BATCH_SIZES.len() - 1];
-    let mut rng = rand::thread_rng();
+    let rng = rand::thread_rng();
 
     let random_batch = move |mut x: ThreadRng| x.gen_range(0..total_keys);
 

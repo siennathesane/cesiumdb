@@ -1,10 +1,6 @@
 use std::{
     collections::Bound,
-    hash::{
-        BuildHasher,
-        Hasher,
-        RandomState,
-    },
+    hash::RandomState,
     mem::transmute,
     sync::{
         atomic::{
@@ -37,10 +33,7 @@ use crossbeam_skiplist::{
 };
 use gxhash::gxhash64;
 use parking_lot::Mutex;
-use rand::{
-    random,
-    Rng,
-};
+use rand::random;
 use tracing::instrument;
 
 use crate::{
