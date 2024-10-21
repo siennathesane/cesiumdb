@@ -6,14 +6,33 @@ edition = "2021"
 
 [features]
 default_features = []
+secure = ["mimalloc/secure"]
 
 [dependencies]
-libc = "0.2.159"
-memmap2 = "0.9.5"
-rkyv = { version = "0.8.8", features = ["little_endian"] }
-tracing = "0.1.40"
+bloom2 = { version = "0.4.3", features = ["serde"] }
 bytes = "1.7.2"
 crc32fast = "1.4.2"
-bytemuck = { version = "1.19.0" , features = ["extern_crate_alloc", "zeroable_maybe_uninit"]}
+crossbeam-channel = "0.5.13"
+crossbeam-skiplist = "0.1.3"
+gxhash = "3.4.1"
+libc = "0.2"
+memmap2 = "0.9.5"
+mimalloc = "0.1.43"
+parking_lot = "0.12.3"
+rand = "0.8.5"
 thiserror = "1.0.64"
-tempfile = "3.13.0"
+tracing = "0.1.40"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hlc"
+harness = false
+
+[[bench]]
+name = "db"
+harness = false
+
+[build-dependencies]
+cbindgen = "0.27.0"
