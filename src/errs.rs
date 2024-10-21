@@ -3,13 +3,11 @@ use std::io;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum Error {
-    #[error("general i/o error")]
-    Io(IoError),
-}
-
-#[derive(Error, Debug)]
-pub enum IoError {
+pub enum CesiumError {
     #[error("os i/o error")]
-    Error(io::Error),
+    IoError(io::Error),
+    #[error("data insertion would exceed maximum capacity")]
+    DataExceedsMaximum,
+    #[error("memtable is frozen")]
+    MemtableIsFrozen
 }

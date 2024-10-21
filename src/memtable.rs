@@ -5,13 +5,14 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicU64,
             Ordering::Relaxed,
         },
         Arc,
     },
     thread,
 };
-use std::sync::atomic::AtomicU64;
+
 use bloom2::{
     Bloom2,
     BloomFilterBuilder,
@@ -36,7 +37,13 @@ use rand::random;
 use tracing::instrument;
 
 use crate::{
-    errs::Error,
+    errs::{
+        CesiumError,
+        CesiumError::{
+            DataExceedsMaximum,
+            MemtableIsFrozen,
+        },
+    },
     keypair::{
         map_key_bound,
         KeyBytes,
@@ -45,21 +52,25 @@ use crate::{
     stats::STATS,
 };
 
+pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 2 << 28; // 256MiB
+
 #[derive(Debug)]
 pub struct Memtable {
-    id: usize,
+    id: u64,
     gx_seed: Arc<i64>,
     tx: Sender<Bytes>,
     bloom: Arc<Mutex<Bloom2<RandomState, CompressedBitmap, u64>>>,
     map: Arc<SkipMap<Bytes, Bytes>>,
     size: AtomicU64,
+    max_size: AtomicU64,
     frozen: Arc<AtomicBool>,
     // TODO(@siennathesane): add optional wal hook to memtable
-    // TODO(@siennathesane): add cache and performance test. test if
+    // nb (sienna): the retrieval performance on the memtable is so fucking good
+    // that checking a cache is actually _slower_, so no caches for the memtables
 }
 
 impl Memtable {
-    pub fn new(id: usize) -> Self {
+    pub fn new(id: u64, max_size: u64) -> Self {
         let frozen = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded::<Bytes>(1_000);
         let gx_seed: Arc<i64> = Arc::new(random());
@@ -88,11 +99,12 @@ impl Memtable {
             bloom,
             map: Arc::new(SkipMap::new()),
             size: AtomicU64::new(0),
+            max_size: AtomicU64::new(max_size),
             frozen,
         }
     }
 
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
@@ -115,7 +127,7 @@ impl Memtable {
     }
 
     #[instrument(level = "debug")]
-    pub fn put(&self, key: KeyBytes, val: ValueBytes) -> Result<(), Error> {
+    pub fn put(&self, key: KeyBytes, val: ValueBytes) -> Result<(), CesiumError> {
         self.put_batch(&[(key, val)])
     }
 
@@ -130,7 +142,12 @@ impl Memtable {
     /// find the latest version of a key with a million versions took about
     /// 2.2s on a Macbook M1 Pro. This optimization allows for O(2) lookups.
     #[instrument(level = "debug")]
-    pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<(), Error> {
+    pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<(), CesiumError> {
+        // we don't want to write to a frozen memtable
+        if self.frozen.load(Relaxed) {
+            return Err(MemtableIsFrozen);
+        }
+
         for (key, val) in data.iter() {
             let _key = key.clone().serialize_for_memory();
             let _key_ptr = key.clone().serialize_for_latest();
@@ -139,11 +156,16 @@ impl Memtable {
             // on physical storage, so we account for that. we also have to
             // account for the key, the key pointer, and the key pointer's value (re: the
             // key)
-            let estimated_size = (_key.len() * 3) + _val.len() + size_of::<u128>();
+            let payload_size = ((_key.len() * 3) + _val.len() + size_of::<u128>()) as u64;
+
+            // we don't want to exceed it
+            if payload_size + self.size.load(Relaxed) > self.max_size.load(Relaxed) {
+                return Err(DataExceedsMaximum);
+            }
 
             self.map.insert(_key.clone(), _val);
             self.map.insert(_key_ptr.clone(), _key);
-            self.size.fetch_add(estimated_size as u64, Relaxed);
+            self.size.fetch_add(payload_size, Relaxed);
 
             // send to the background to prevent a massive performance hit
             let _ = self.tx.send(_key_ptr);
@@ -166,11 +188,17 @@ impl Memtable {
 
         MemtableIterator::new(range)
     }
+
+    pub fn freeze(&self) {
+        self.frozen.store(true, Relaxed);
+    }
 }
 
 impl Drop for Memtable {
+    // just in case this is randomly dropped, this will ensure the background thread
+    // gets cleaned up
     fn drop(&mut self) {
-        self.frozen.store(false, Relaxed);
+        self.frozen.store(true, Relaxed);
     }
 }
 
@@ -207,7 +235,10 @@ impl Iterator for MemtableIterator {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use rand::Rng;
+    use rand::{
+        Rng,
+        RngCore,
+    };
 
     use crate::{
         hlc::{
@@ -219,12 +250,15 @@ mod tests {
             ValueBytes,
             DEFAULT_NS,
         },
-        memtable::Memtable,
+        memtable::{
+            Memtable,
+            DEFAULT_MEMTABLE_SIZE_IN_BYTES,
+        },
     };
 
     #[test]
     fn test_memtable_basic() {
-        let memtable = Memtable::new(0);
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
         let clock = HybridLogicalClock::new();
 
         let original_key = KeyBytes::new(DEFAULT_NS, Bytes::from("test"), clock.time());
@@ -240,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_memtable_versioning() {
-        let memtable = Memtable::new(0);
+        let memtable = Memtable::new(0, 2 << 23);
         let clock = HybridLogicalClock::new();
 
         let mut rng = rand::thread_rng();
@@ -272,5 +306,46 @@ mod tests {
         val_arr.copy_from_slice(&val.unwrap().value.as_ref()[0..8]);
 
         assert_eq!(usize::from_le_bytes(val_arr), VERSIONS - 1);
+    }
+
+    #[test]
+    fn test_exceeds_max_size() {
+        const MAX_SIZE: u64 = 2 << 6;
+        let memtable = Memtable::new(0, MAX_SIZE);
+        let clock = HybridLogicalClock::new();
+
+        let mut rng = rand::thread_rng();
+        let buf = &mut [0_u8; MAX_SIZE as usize];
+        rng.fill_bytes(buf);
+
+        // this will exceed the size of the memtable
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("test-key"), clock.time());
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::copy_from_slice(buf));
+
+        assert!(
+            memtable.put(key, val.clone()).is_err(),
+            "there must be an error inserting a key pair larger than the max configured size"
+        );
+    }
+
+    #[test]
+    fn test_frozen() {
+        const MAX_SIZE: u64 = 2 << 6;
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        memtable.freeze();
+        let clock = HybridLogicalClock::new();
+
+        let mut rng = rand::thread_rng();
+        let buf = &mut [0_u8; MAX_SIZE as usize];
+        rng.fill_bytes(buf);
+
+        // this will exceed the size of the memtable
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("test-key"), clock.time());
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::copy_from_slice(buf));
+
+        assert!(
+            memtable.put(key, val.clone()).is_err(),
+            "there must be an error inserting a key pair while the memtable is frozen"
+        );
     }
 }

@@ -1,13 +1,18 @@
 #![feature(integer_atomics)]
 #[allow(dead_code)]
+#[cfg(not(unix))]
+compile_error!("this crate won't work on non-unix platforms, sorry");
+#[cfg(not(target_pointer_width = "64"))]
+compile_warn!("this crate is not tested on 32-bit platforms");
+
 use std::sync::Arc;
 
 use bytes::Bytes;
 use mimalloc::MiMalloc;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
-    errs::Error,
+    errs::CesiumError,
     hlc::{
         HybridLogicalClock,
         HLC,
@@ -63,13 +68,13 @@ impl Db {
     }
 
     /// Put a key into a specific namespace.
-    pub fn put_ns(&self, ns: u64, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    pub fn put_ns(&self, ns: u64, key: &[u8], value: &[u8]) -> Result<(), CesiumError> {
         self.inner
             .batch(&[PutNs(ns, key, value, self.clock.time())])
     }
 
     /// Get a key from a specific namespace.
-    pub fn get_ns(&self, ns: u64, key: &[u8]) -> Result<Option<Bytes>, Error> {
+    pub fn get_ns(&self, ns: u64, key: &[u8]) -> Result<Option<Bytes>, CesiumError> {
         match self
             .inner
             .get(KeyBytes::new(ns, Bytes::copy_from_slice(key), 0))
@@ -83,29 +88,29 @@ impl Db {
     }
 
     /// Delete a key from a specific namespace.
-    pub fn delete_ns(&self, ns: u64, key: &[u8]) -> Result<(), Error> {
+    pub fn delete_ns(&self, ns: u64, key: &[u8]) -> Result<(), CesiumError> {
         self.inner
             .batch::<&[u8], &[u8]>(&[DeleteNs(ns, key, self.clock.time())])
     }
 
     /// Put a key.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), CesiumError> {
         self.put_ns(DEFAULT_NS, key, value)
     }
 
     /// Get a key.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, Error> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, CesiumError> {
         self.get_ns(DEFAULT_NS, key)
     }
 
     /// Delete a key.
-    pub fn delete(&self, key: &[u8]) -> Result<(), Error> {
+    pub fn delete(&self, key: &[u8]) -> Result<(), CesiumError> {
         self.put_ns(DEFAULT_NS, key, key)
     }
 
     /// Write a batch of records to the database. It is safe to mix namespaced
     /// and un-namespaced records.
-    pub fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, ops: &[Batch<K, V>]) -> Result<(), Error> {
+    pub fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, ops: &[Batch<K, V>]) -> Result<(), CesiumError> {
         let _ops = ops
             .iter()
             .map(|b| match b {
@@ -120,13 +125,13 @@ impl Db {
 
     /// Sync the database to disk. This is a blocking operation and will cause
     /// delays under heavy write scenarios.
-    pub fn sync(&self) -> Result<(), Error> {
+    pub fn sync(&self) -> Result<(), CesiumError> {
         self.inner.sync()
     }
 
     /// Close the database. This drops all associated resources and the handle
     /// will no longer be valid.
-    pub fn close(&self) -> Result<(), Error> {
+    pub fn close(&self) -> Result<(), CesiumError> {
         todo!()
     }
 }
@@ -189,13 +194,11 @@ impl DbOptions {
     }
 
     pub fn build(&self) -> Arc<Db> {
-        let state = Arc::new(RwLock::new(
-            DbStorageBuilder::new()
+        let state = DbStorageBuilder::new()
                 .block_size(self.engine_opts.block_size)
                 .target_sst_size(self.engine_opts.target_sst_size)
                 .num_memtable_limit(self.engine_opts.num_memtable_limit)
-                .build(),
-        ));
+                .build();
 
         let inner = DbInner { state };
 
@@ -222,14 +225,14 @@ pub enum Batch<K: AsRef<[u8]>, V: AsRef<[u8]>> {
 
 #[repr(C)]
 struct DbInner {
-    state: Arc<RwLock<Arc<DbStorageState>>>,
+    state: Mutex<DbStorageState>,
 }
 
 impl DbInner {
-    fn get(&self, key: KeyBytes) -> Result<Option<ValueBytes>, Error> {
+    fn get(&self, key: KeyBytes) -> Result<Option<ValueBytes>, CesiumError> {
         // check the current memtable
         {
-            let guard = self.state.read();
+            let guard = self.state.lock();
             let val = guard.current_memtable().get(key);
             if let Some(val) = val {
                 return Ok(Some(val));
@@ -238,7 +241,7 @@ impl DbInner {
         Ok(None)
     }
 
-    fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, ops: &[Batch<K, V>]) -> Result<(), Error> {
+    fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, ops: &[Batch<K, V>]) -> Result<(), CesiumError> {
         let _batch = ops
             .iter()
             .filter_map(|b| match b {
@@ -254,13 +257,13 @@ impl DbInner {
             })
             .collect::<Vec<_>>();
         {
-            let guard = self.state.write();
+            let guard = self.state.lock();
             let mtable = guard.current_memtable();
             mtable.put_batch(_batch.as_ref())
         }
     }
 
-    fn sync(&self) -> Result<(), Error> {
+    fn sync(&self) -> Result<(), CesiumError> {
         todo!()
     }
 }
@@ -295,7 +298,7 @@ mod tests {
         }
 
         {
-            let guard = db.inner.state.read();
+            let guard = db.inner.state.lock();
             assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
         }
 
@@ -308,7 +311,7 @@ mod tests {
         }
 
         {
-            let guard = db.inner.state.read();
+            let guard = db.inner.state.lock();
             assert!(
                 guard.current_memtable().size() > (keypair_size * 2) as u64,
                 "the memtable must be at least twice as big as before with the new versions"
@@ -336,7 +339,7 @@ mod tests {
             assert!(db.batch(&batch).is_ok());
 
             {
-                let guard = db.inner.state.read();
+                let guard = db.inner.state.lock();
                 assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
             }
 
