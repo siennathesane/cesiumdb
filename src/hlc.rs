@@ -13,6 +13,7 @@ use std::{
         SystemTime,
     },
 };
+use crate::stats::STATS;
 
 pub trait HLC: Send + Sync {
     fn time(&self) -> u128;
@@ -53,7 +54,9 @@ impl HybridLogicalClock {
                 }
                 last_tick_clone.fetch_add(diff, Relaxed);
             }
+            STATS.current_threads.fetch_sub(1, Relaxed);
         });
+        STATS.current_threads.fetch_add(1, Relaxed);
 
         Self { last_tick, done }
     }

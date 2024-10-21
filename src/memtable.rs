@@ -5,14 +5,13 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
-            AtomicUsize,
             Ordering::Relaxed,
         },
         Arc,
     },
     thread,
 };
-
+use std::sync::atomic::AtomicU64;
 use bloom2::{
     Bloom2,
     BloomFilterBuilder,
@@ -53,7 +52,7 @@ pub struct Memtable {
     tx: Sender<Bytes>,
     bloom: Arc<Mutex<Bloom2<RandomState, CompressedBitmap, u64>>>,
     map: Arc<SkipMap<Bytes, Bytes>>,
-    approx_size: AtomicUsize,
+    size: AtomicU64,
     frozen: Arc<AtomicBool>,
     // TODO(@siennathesane): add optional wal hook to memtable
     // TODO(@siennathesane): add cache and performance test. test if
@@ -78,6 +77,7 @@ impl Memtable {
                     bloom_clone.lock().insert(&gxhash64(&_key_ptr, *seed_clone))
                 }
             }
+            STATS.current_threads.fetch_sub(1, Relaxed);
         });
         STATS.current_threads.fetch_add(1, Relaxed);
 
@@ -87,7 +87,7 @@ impl Memtable {
             tx,
             bloom,
             map: Arc::new(SkipMap::new()),
-            approx_size: AtomicUsize::new(0),
+            size: AtomicU64::new(0),
             frozen,
         }
     }
@@ -96,8 +96,8 @@ impl Memtable {
         self.id
     }
 
-    pub fn size(&self) -> usize {
-        self.approx_size.load(Relaxed)
+    pub fn size(&self) -> u64 {
+        self.size.load(Relaxed)
     }
 
     /// Get a key.
@@ -143,7 +143,7 @@ impl Memtable {
 
             self.map.insert(_key.clone(), _val);
             self.map.insert(_key_ptr.clone(), _key);
-            self.approx_size.fetch_add(estimated_size, Relaxed);
+            self.size.fetch_add(estimated_size as u64, Relaxed);
 
             // send to the background to prevent a massive performance hit
             let _ = self.tx.send(_key_ptr);

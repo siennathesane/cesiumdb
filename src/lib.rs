@@ -296,7 +296,7 @@ mod tests {
 
         {
             let guard = db.inner.state.read();
-            assert!(guard.current_memtable().size() > keypair_size, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
+            assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
         }
 
         // re-insert the same keys but with new versions
@@ -310,7 +310,7 @@ mod tests {
         {
             let guard = db.inner.state.read();
             assert!(
-                guard.current_memtable().size() > keypair_size * 2,
+                guard.current_memtable().size() > (keypair_size * 2) as u64,
                 "the memtable must be at least twice as big as before with the new versions"
             );
         }
@@ -337,7 +337,7 @@ mod tests {
 
             {
                 let guard = db.inner.state.read();
-                assert!(guard.current_memtable().size() > keypair_size, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
+                assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
             }
 
             println!(
