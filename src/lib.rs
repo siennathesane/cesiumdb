@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use mimalloc::MiMalloc;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use crate::{
     errs::CesiumError,
