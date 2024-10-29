@@ -2,7 +2,7 @@
 
 set -eu
 
-echo "getting diff"
+echo "getting tag diff"
 
 prior_tag=$(git describe --tags --abbrev=0 "$(git rev-list --tags --skip=1 --max-count=1)")
 current_tag=$(git describe --tags --abbrev=0)
@@ -20,9 +20,9 @@ while IFS= read -r file_path; do
     fi
 done < filesf
 
-echo "making claude give me patch notes"
+echo "making claude give me release notes from the diff"
 
-changes=$(aichat "${result[@]}" "generate a bullet list of changes to the database code for developers of all skill levels and backgrounds that can be used in release notes. copy this prompt's grammatical structure (re: no caps). use markdown.")
+changes=$(aichat "${result[@]}" "generate a bullet list of changes to the database code for developers of all skill levels and backgrounds that can be used in release notes. copy this prompt's grammatical structure (re: no caps). use markdown. don't include the instruction prompt in the final output.")
 
 echo "running benchmarks"
 

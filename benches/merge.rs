@@ -78,7 +78,7 @@ fn bench_full_scan(c: &mut Criterion) {
     for size in [10_000, 100_000].iter() {
         for memtables in [2, 4, 8].iter() {
             group.bench_with_input(
-                BenchmarkId::new(format!("size_{}_tables_{}", size, memtables), size),
+                BenchmarkId::new(format!("tables/{}/size", memtables), size),
                 size,
                 |b, &size| {
                     b.iter_batched(
@@ -112,7 +112,7 @@ fn bench_range_scan(c: &mut Criterion) {
     for size in [10_000, 100_000].iter() {
         for memtables in [2, 4, 8].iter() {
             group.bench_with_input(
-                BenchmarkId::new(format!("size_{}_tables_{}", size, memtables), size),
+                BenchmarkId::new(format!("tables/{}/size", memtables), size),
                 size,
                 |b, &size| {
                     b.iter_batched(
@@ -166,7 +166,7 @@ fn bench_latest_versions(c: &mut Criterion) {
     for size in [10_000, 100_000].iter() {
         for memtables in [2, 4, 8].iter() {
             group.bench_with_input(
-                BenchmarkId::new(format!("size_{}_tables_{}", size, memtables), size),
+                BenchmarkId::new(format!("tables/{}/size", memtables), size),
                 size,
                 |b, &size| {
                     b.iter_batched(
