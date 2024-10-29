@@ -61,6 +61,8 @@ impl Default for DbStorageBuilder {
     }
 }
 
+// TODO(@siennathesane): all universal ids (memtable, sstable, etc.) need to be
+// monotonically increasing
 pub struct DbStorageState {
     curr_memtable: RwLock<Arc<Memtable>>,
     frozen_memtables: Mutex<Vec<Arc<Memtable>>>,
@@ -102,9 +104,9 @@ mod tests {
     #[test]
     fn test_new_memtable() {
         let state = DbStorageBuilder::default().build();
-        
+
         assert!(state.lock().frozen_memtables.lock().is_empty());
-        
+
         state.lock().new_memtable();
     }
 }

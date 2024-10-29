@@ -39,25 +39,6 @@ def get_memory_info():
     print(f"Used: {get_size(svmem.used)}")
     print(f"Percentage: {svmem.percent}%")
 
-def get_disk_info():
-    print("="*40, "Disk Information", "="*40)
-    partitions = psutil.disk_partitions()
-    for partition in partitions:
-        print(f"=== Device: {partition.device} ===")
-        print(f"  Mountpoint: {partition.mountpoint}")
-        print(f"  File system type: {partition.fstype}")
-
-def get_network_info():
-    print("="*40, "Network Information", "="*40)
-    if_addrs = psutil.net_if_addrs()
-    for interface_name, interface_addresses in if_addrs.items():
-        for address in interface_addresses:
-            print(f"=== Interface: {interface_name} ===")
-            if str(address.family) == 'AddressFamily.AF_INET':
-                print(f"  IP Address: {address.address}")
-                print(f"  Netmask: {address.netmask}")
-                print(f"  Broadcast IP: {address.broadcast}")
-
 def main():
     parser = argparse.ArgumentParser(description="CLI tool to get system information")
     parser.add_argument("-a", "--all", action="store_true", help="Show all information")

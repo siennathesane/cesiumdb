@@ -15,7 +15,7 @@ use bytes::{
 use crc32fast::Hasher;
 use tracing::instrument;
 
-pub(crate) const DEFAULT_NS: u64 = 0;
+pub const DEFAULT_NS: u64 = 0;
 
 #[instrument]
 pub fn map_key_bound(bound: Bound<KeyBytes>) -> Bound<Bytes> {

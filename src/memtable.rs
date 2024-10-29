@@ -37,18 +37,17 @@ use rand::random;
 use tracing::instrument;
 
 use crate::{
-    errs::{
-        CesiumError,
-        CesiumError::{
-            DataExceedsMaximum,
-            MemtableIsFrozen,
-        },
+    errs::CesiumError::{
+        self,
+        DataExceedsMaximum,
+        MemtableIsFrozen,
     },
     keypair::{
         map_key_bound,
         KeyBytes,
         ValueBytes,
     },
+    peek::Peekable,
     stats::STATS,
 };
 
@@ -211,6 +210,11 @@ impl MemtableIterator {
     #[instrument(level = "trace")]
     fn new(inner: Range<'static, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>) -> Self {
         MemtableIterator { inner }
+    }
+
+    #[instrument(level = "trace")]
+    fn peekable(self) -> Peekable<Self> {
+        Peekable::new(self)
     }
 }
 

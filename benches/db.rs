@@ -65,7 +65,7 @@ pub fn db_put_batch(c: &mut Criterion) {
         for batch_size in BATCH_SIZES.iter() {
             put_group.throughput(Throughput::Bytes(*size as u64));
             put_group.bench_with_input(
-                BenchmarkId::new(format!("batch/{}", batch_size), size),
+                BenchmarkId::new(format!("batch/{}/size", batch_size), size),
                 size,
                 |b, &size| {
                     let mut batch: Vec<Batch<&[u8], &[u8]>> = Vec::with_capacity(*batch_size);

@@ -40,8 +40,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod errs;
 pub mod hlc;
-pub(crate) mod keypair;
-pub(crate) mod memtable;
+pub mod keypair;
+pub mod memtable;
+pub mod merge;
+pub mod peek;
+mod sstable;
 pub(crate) mod state;
 mod stats;
 
@@ -110,7 +113,10 @@ impl Db {
 
     /// Write a batch of records to the database. It is safe to mix namespaced
     /// and un-namespaced records.
-    pub fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, ops: &[Batch<K, V>]) -> Result<(), CesiumError> {
+    pub fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &self,
+        ops: &[Batch<K, V>],
+    ) -> Result<(), CesiumError> {
         let _ops = ops
             .iter()
             .map(|b| match b {
@@ -195,10 +201,10 @@ impl DbOptions {
 
     pub fn build(&self) -> Arc<Db> {
         let state = DbStorageBuilder::new()
-                .block_size(self.engine_opts.block_size)
-                .target_sst_size(self.engine_opts.target_sst_size)
-                .num_memtable_limit(self.engine_opts.num_memtable_limit)
-                .build();
+            .block_size(self.engine_opts.block_size)
+            .target_sst_size(self.engine_opts.target_sst_size)
+            .num_memtable_limit(self.engine_opts.num_memtable_limit)
+            .build();
 
         let inner = DbInner { state };
 
@@ -241,7 +247,10 @@ impl DbInner {
         Ok(None)
     }
 
-    fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, ops: &[Batch<K, V>]) -> Result<(), CesiumError> {
+    fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &self,
+        ops: &[Batch<K, V>],
+    ) -> Result<(), CesiumError> {
         let _batch = ops
             .iter()
             .filter_map(|b| match b {
