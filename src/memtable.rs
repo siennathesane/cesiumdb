@@ -107,6 +107,7 @@ impl Memtable {
         self.id
     }
 
+    #[inline]
     pub fn size(&self) -> u64 {
         self.size.load(Relaxed)
     }
@@ -114,6 +115,7 @@ impl Memtable {
     /// Get a key.
     // TODO(@siennathesane): update this with the cuckoo filter and latest cache
     #[instrument(level = "debug")]
+    #[inline]
     pub fn get(&self, key: KeyBytes) -> Option<ValueBytes> {
         let _key_ptr = key.serialize_for_latest();
         match self.map.get(&_key_ptr) {
@@ -126,6 +128,7 @@ impl Memtable {
     }
 
     #[instrument(level = "debug")]
+    #[inline]
     pub fn put(&self, key: KeyBytes, val: ValueBytes) -> Result<(), CesiumError> {
         self.put_batch(&[(key, val)])
     }
@@ -141,6 +144,7 @@ impl Memtable {
     /// find the latest version of a key with a million versions took about
     /// 2.2s on a Macbook M1 Pro. This optimization allows for O(2) lookups.
     #[instrument(level = "debug")]
+    #[inline]
     pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<(), CesiumError> {
         // we don't want to write to a frozen memtable
         if self.frozen.load(Relaxed) {
@@ -176,6 +180,7 @@ impl Memtable {
     }
 
     #[instrument(level = "debug")]
+    #[inline]
     pub fn scan(&self, lower: Bound<KeyBytes>, upper: Bound<KeyBytes>) -> MemtableIterator {
         let (_lower, _upper) = (map_key_bound(lower), map_key_bound(upper));
         let ranger = self.map.range((_lower, _upper));
@@ -222,6 +227,7 @@ impl Iterator for MemtableIterator {
     type Item = (KeyBytes, ValueBytes);
 
     #[instrument(level = "trace")]
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|entry: Entry<'_, Bytes, Bytes>| {
             (
@@ -231,6 +237,7 @@ impl Iterator for MemtableIterator {
         })
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }

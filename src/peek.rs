@@ -10,6 +10,7 @@ impl<I: Iterator> Peekable<I> {
         Self { iter, peeked: None }
     }
 
+    #[inline]
     pub(crate) fn peek(&mut self) -> Option<&I::Item> {
         if self.peeked.is_none() {
             self.peeked = Some(self.iter.next());
@@ -17,6 +18,7 @@ impl<I: Iterator> Peekable<I> {
         self.peeked.as_ref().unwrap().as_ref()
     }
 
+    #[inline]
     pub(crate) fn peek_mut(&mut self) -> Option<&mut I::Item> {
         if self.peeked.is_none() {
             self.peeked = Some(self.iter.next());
@@ -28,6 +30,7 @@ impl<I: Iterator> Peekable<I> {
 impl<I: Iterator> Iterator for Peekable<I> {
     type Item = I::Item;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(peeked) = self.peeked.take() {
             peeked
@@ -36,19 +39,13 @@ impl<I: Iterator> Iterator for Peekable<I> {
         }
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let peek_size = self
-            .peeked
-            .as_ref()
-            .and_then(|v| v.is_some().then_some(1))
-            .unwrap_or(0);
         let (lower, upper) = self.iter.size_hint();
-
-        // Add 1 to both bounds if we have a peeked value
-        (
-            lower.saturating_add(peek_size),
-            upper.map(|u| u.saturating_add(peek_size)),
-        )
+        match &self.peeked {
+            | Some(Some(_)) => (lower + 1, upper.map(|u| u + 1)),
+            | _ => (lower, upper),
+        }
     }
 }
 

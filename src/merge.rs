@@ -1,8 +1,8 @@
 use std::{
     cell::RefCell,
-    cmp::Ordering::{
-        self,
-        Equal,
+    cmp::{
+        Ordering,
+        Reverse,
     },
     collections::BinaryHeap,
 };
@@ -29,7 +29,10 @@ impl<I> MergeIterator<I>
 where
     I: Iterator<Item = (KeyBytes, ValueBytes)>,
 {
-    pub fn new(iters: Vec<I>) -> Self {
+    pub fn new(mut iters: Vec<I>) -> Self {
+        // sort by size for better merge performance
+        iters.sort_by_key(|iter| Reverse(iter.size_hint().0));
+
         let heap = iters
             .into_iter()
             .enumerate()
@@ -85,6 +88,7 @@ where
         }
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let mut size = 0;
         for iter in self.iters.iter() {
@@ -105,6 +109,7 @@ impl<I> PartialEq for HeapItem<I>
 where
     I: Iterator<Item = (KeyBytes, ValueBytes)>,
 {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
@@ -116,6 +121,7 @@ impl<I> PartialOrd for HeapItem<I>
 where
     I: Iterator<Item = (KeyBytes, ValueBytes)>,
 {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -125,6 +131,7 @@ impl<I> Ord for HeapItem<I>
 where
     I: Iterator<Item = (KeyBytes, ValueBytes)>,
 {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         match (
             self.iter.borrow_mut().peek(),
@@ -133,7 +140,7 @@ where
             | (Some((left, _)), Some((right, _))) => right.cmp(left),
             | (Some(_), None) => Ordering::Less,
             | (None, Some(_)) => Ordering::Greater,
-            | (None, None) => self.index.cmp(&other.index).reverse(),
+            | (None, None) => other.index.cmp(&self.index),
         }
     }
 }
