@@ -1,21 +1,16 @@
 # CesiumDB
 
-A key-value store focused on performance and security.
+A key-value store focused on performance and security. Internally, it's an LSM-tree.
 
-## About
+## License
 
-CesiumDB is a key-value store. Internally, it's an LSM-tree with a whack of optimizations. Some of these optimizations include:
-
-- Key-value separations, keys are stored in different files than values
-- Key-size separations (pending)
-- Direct device access via raw syscalls
-- Reference-only memcpys
+CesiumDB is license under GPL v2.0 with Class Path Exception. This means you can use CesiumDB in your project without having to open source your project. However, if you modify CesiumDB, you must open source your changes. If you would like a non-GPL license, please reach out :smile:
 
 ## MVCC
 
-CesiumDB doesn't contain MVCC semantics due to the use of a hybrid linear clock (HLC). This provides guaranteed operation ordering based on the database's view of the data after it enters the boundary; operations are linear and non-collidable. This removes a transaction API and pushes the responsibility of correct ordering to the application. This is a tradeoff between ergonomics & maintainability. Application owners know their application best, and it's easier to reason about the ordering of operations in the application layer.
+CesiumDB doesn't contain MVCC semantics due to the use of a hybrid linear clock (HLC). This provides guaranteed operation ordering based on the database's view of the data after it enters the boundary; operations are linear and non-collidable. This removes a transaction API and pushes the responsibility of correct ordering to the application. This is a tradeoff between ergonomics & maintainability for everyone. Application owners know their application best, and it's easier to reason about the ordering of operations in the application layer.
 
-While the HLC is monotonic, it is also exceedingly performant with nanosecond precision. This allows for a an exceedingly degree of concurrency and parallelism. As an example, on @siennathesane's Macbook Pro M1 Pro chipset, the clock has a general resolution of about 2 nanoseconds. So if you can write lock-free, highly concurrent code, you can achieve _very_ high throughput.
+While the HLC is monotonic, it is also exceedingly performant with nanosecond precision. This allows for a high degree of concurrency and parallelism. As an example, on @siennathesane's Macbook Pro M1 Pro chipset, the clock has a general resolution of about 2 nanoseconds.
 
 If you have your heart set on transactions, you can wrap the database in a `MutexGuard` or `RwLock` to provide transactional semantics. Like this:
 

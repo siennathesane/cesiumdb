@@ -1,3 +1,6 @@
+// Copyright (c) Sienna Satterwhite, CesiumDB Contributors
+// SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
+
 use std::{
     sync::{
         atomic::{
@@ -13,6 +16,7 @@ use std::{
         SystemTime,
     },
 };
+
 use crate::stats::STATS;
 
 pub trait HLC: Send + Sync {

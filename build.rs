@@ -1,3 +1,6 @@
+// Copyright (c) Sienna Satterwhite, CesiumDB Contributors
+// SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
+
 extern crate cbindgen;
 
 use std::env;

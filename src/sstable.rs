@@ -1,3 +1,6 @@
+// Copyright (c) Sienna Satterwhite, CesiumDB Contributors
+// SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
+
 //! SSTables are made of two separate components: a key table and a value table.
 //! This is to optimize disk reads. When an SSTable is created, it will spawn
 //! three threads: a key reader thread and two value reader threads. Generally,

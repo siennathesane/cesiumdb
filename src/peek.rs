@@ -1,3 +1,6 @@
+// Copyright (c) Sienna Satterwhite, CesiumDB Contributors
+// SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
+
 /// A peekable adapter for an iterator. This allows us to peek at the next item
 /// without consuming it. It's designed for use with the iterators.
 pub(crate) struct Peekable<I: Iterator> {
