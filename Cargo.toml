@@ -9,6 +9,7 @@ default_features = []
 secure = ["mimalloc/secure"]
 
 [dependencies]
+bitflags = "2.6.0"
 bloom2 = { version = "0.4.3", features = ["serde"] }
 bytes = "1.7.2"
 crc32fast = "1.4.2"

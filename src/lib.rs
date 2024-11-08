@@ -41,13 +41,13 @@ use crate::{
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+pub mod disk;
 pub mod errs;
 pub mod hlc;
 pub mod keypair;
 pub mod memtable;
 pub mod merge;
 pub mod peek;
-mod sstable;
 pub(crate) mod state;
 mod stats;
 
