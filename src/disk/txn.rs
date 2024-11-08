@@ -2,36 +2,71 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 use std::{
-    mem::transmute,
+    ptr::NonNull,
     sync::atomic::{
         AtomicU32,
         AtomicU64,
         Ordering::{
             Acquire,
+            Relaxed,
             Release,
         },
     },
-    thread::ThreadId,
+};
+use std::sync::Arc;
+use bitflags::bitflags;
+use parking_lot::Mutex;
+use crate::{cache_line_padding, CACHE_LINE};
+use crate::disk::{
+    page::{
+        LoosePage,
+        Page,
+    },
+    reader::Reader,
 };
 
-use parking_lot::Mutex;
-
-/// The size of a cache line in bytes.
-pub(crate) const CACHE_LINE: usize = 64;
-
-/// Calculate the padding needed to align a type to a cache line
-macro_rules! cache_line_padding {
-    ($t:ty) => {{
-        const BODY_SIZE: usize = size_of::<$t>();
-        const PADDING: usize = (BODY_SIZE + CACHE_LINE - 1) & !(CACHE_LINE - 1);
-        PADDING - BODY_SIZE
-    }};
-}
-
 // compile-time verifications that things are cache aligned.
-const _: () = assert!(align_of::<Reader>() >= CACHE_LINE);
 const _: () = assert!(align_of::<MainSection>() >= CACHE_LINE);
 const _: () = assert!(align_of::<WriterSection>() >= CACHE_LINE);
+
+pub(crate) struct Transaction {
+    /// Parent transaction if this is a nested transaction
+    parent: Option<Arc<Transaction>>,
+    /// Child transaction if one exists
+    child: Option<Arc<Transaction>>,
+    /// Next unallocated page number
+    next_page_num: u64,
+    txn_id: u64,
+    // env: Arc<Environment>,
+    free_pages: Vec<NonNull<Page>>, // TODO(@siennathesane): maybe not right
+    inner: TransactionInner,
+    spill_pages: Vec<u64>,
+}
+
+bitflags! {
+    pub(crate) struct TransactionFlags: u32 {
+        const READ_ONLY = 0x01;
+        const WRITE_MAP = 0x02;
+        const FINISHED = 0x04;
+        const ERROR = 0x08;
+        const DIRTY = 0x10;
+        const SPILLS = 0x20;
+        const HAS_CHILD = 0x40;
+        
+        const BLOCKED = Self::FINISHED.bits() | Self::ERROR.bits() | Self::HAS_CHILD.bits();
+    }
+}
+
+bitflags! {
+    pub (crate) struct DbFlags: u8 {
+        const DIRTY = 0x01;
+        const STALE = 0x02;
+        const NEW = 0x04;
+        const VALID = 0x08;
+        const USR_VALID = 0x10;
+        const DUP_DATA = 0x20;
+    }
+}
 
 impl TransactionBody {
     #[inline]
@@ -158,6 +193,7 @@ impl TransactionInfo {
     }
 }
 
+/// The body of a transaction.
 #[repr(C, align(64))]
 pub(crate) struct TransactionBody {
     // encryption would break that guarantee.
@@ -195,86 +231,38 @@ impl Default for TransactionBody {
     }
 }
 
-// TODO(@siennathesane): not sure we'll need this since we have ARCs soooo?
-// we'll find out
-#[repr(C)]
-pub(crate) struct ReadBody {
-    /// Current Transaction ID when this transaction began, or (txnid_t)-1.
-    /// Multiple readers that start at the same time will probably have the same
-    /// ID here. Again, it's not important to exclude them from  anything; all
-    /// we need to know is which version of the DB they  started from so we can
-    /// avoid overwriting any data used in that particular version.
-    tx_id: AtomicU64,
-    /// The process ID of the process owning this reader transaction
-    pid: AtomicU64,
-    /// The thread ID of the thread owning this reader transaction
-    thread_id: AtomicU64,
+pub(crate) struct TransactionInner {
+    loose_head: Option<NonNull<Page>>,
+    loose_count: AtomicU64,
 }
 
-/// A reader for a transaction.
-#[repr(C, align(64))]
-pub(crate) struct Reader {
-    /// The reader data
-    inner: ReadBody,
-
-    /// Padding to ensure that the reader is the size of a cache line
-    _pad: [u8; {
-        const BODY_SIZE: usize = size_of::<ReadBody>();
-        const PADDING: usize = (BODY_SIZE + CACHE_LINE - 1) & !(CACHE_LINE - 1);
-        PADDING - BODY_SIZE
-    }],
-}
-
-impl Reader {
-    #[inline]
-    pub fn tx_id(&self) -> u64 {
-        self.inner.tx_id.load(Acquire)
+impl TransactionInner {
+    #[inline(always)]
+    pub(crate) fn push_loose_page(&mut self, page: NonNull<Page>) {
+        let mut loose = LoosePage::new(page);
+        loose.set_next(self.loose_head.map(|mut ptr| unsafe { ptr.as_mut() }));
+        self.loose_head = Some(loose.page());
+        self.loose_count.fetch_add(1, Acquire);
     }
 
-    #[inline]
-    pub fn set_tx_id(&self, id: u64) {
-        self.inner.tx_id.store(id, Release)
-    }
-
-    #[inline]
-    pub fn pid(&self) -> u64 {
-        self.inner.pid.load(Acquire)
-    }
-
-    #[inline]
-    pub fn set_pid(&self, pid: u64) {
-        self.inner.pid.store(pid, Release)
-    }
-
-    #[inline]
-    pub fn thread_id(&self) -> u64 {
-        self.inner.thread_id.load(Acquire)
-    }
-
-    #[inline]
-    pub fn set_thread_id(&self, thread_id: u64) {
-        self.inner.thread_id.store(thread_id, Release)
-    }
-}
-
-impl Default for Reader {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            inner: ReadBody {
-                tx_id: AtomicU64::new(u64::MAX),
-                pid: AtomicU64::new(std::process::id() as u64),
-                thread_id: AtomicU64::new(
-                    // just the init, we'll set it later
-                    unsafe { transmute::<ThreadId, u64>(std::thread::current().id()) },
-                ),
-            },
-            _pad: [0u8; {
-                const BODY_SIZE: usize = size_of::<ReadBody>();
-                const PADDING: usize = (BODY_SIZE + CACHE_LINE - 1) & !(CACHE_LINE - 1);
-                PADDING - BODY_SIZE
-            }],
+    #[inline(always)]
+    pub(crate) fn pop_loose_page(&mut self) -> Option<NonNull<Page>> {
+        if let Some(mut ptr) = self.loose_head {
+            unsafe {
+                let page = ptr.as_mut();
+                let loose = LoosePage::new(page);
+                self.loose_head = loose.next();
+                self.loose_count.fetch_sub(1, Acquire);
+                Some(page)
+            }
+        } else {
+            None
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn loose_count(&self) -> u64 {
+        self.loose_count.load(Relaxed)
     }
 }
 
@@ -284,16 +272,6 @@ mod tests {
 
     #[test]
     fn verify_cache_alignment() {
-        assert_eq!(
-            align_of::<Reader>(),
-            CACHE_LINE,
-            "Reader is not cache aligned"
-        );
-        assert_eq!(
-            size_of::<Reader>() % CACHE_LINE,
-            0,
-            "Reader is not a multiple of a cache line"
-        );
         assert_eq!(
             align_of::<MainSection>(),
             CACHE_LINE,

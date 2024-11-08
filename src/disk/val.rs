@@ -16,6 +16,7 @@ impl<T: AsRef<[u8]>> Value<T> {
         }
     }
 
+    #[inline]
     pub(crate) fn size(&self) -> u32 {
         self.size
     }

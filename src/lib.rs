@@ -6,7 +6,7 @@
 #[cfg(not(unix))]
 compile_error!("this crate won't work on non-unix platforms, sorry");
 #[cfg(not(target_pointer_width = "64"))]
-compile_warn!("this crate is not tested on 32-bit platforms");
+compile_error!("this create is built for 64-bit pointers");
 
 use std::sync::Arc;
 
@@ -50,6 +50,19 @@ pub mod merge;
 pub mod peek;
 pub(crate) mod state;
 mod stats;
+
+/// The size of a cache line in bytes.
+pub(crate) const CACHE_LINE: usize = 64;
+
+/// Calculate the padding needed to align a type to a cache line
+#[macro_export]
+macro_rules! cache_line_padding {
+    ($t:ty) => {{
+        const BODY_SIZE: usize = size_of::<$t>();
+        const PADDING: usize = (BODY_SIZE + CACHE_LINE - 1) & !(CACHE_LINE - 1);
+        PADDING - BODY_SIZE
+    }};
+}
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
