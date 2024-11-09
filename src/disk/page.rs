@@ -7,47 +7,105 @@ use std::ptr::{
 };
 
 use bitflags::bitflags;
+use bytes::Bytes;
 
 use crate::disk::page::PageBounds::{
     Overflow,
     Regular,
 };
 
-pub(crate) const PAGE_HEADER_SIZE: usize = std::mem::offset_of!(Page, ptrs);
+pub(crate) const PAGE_HEADER_SIZE: usize = std::mem::offset_of!(Page, data);
 pub(crate) const PAGE_BASE: usize = if cfg!(debug_assertions) {
     PAGE_HEADER_SIZE
 } else {
     0
 };
+pub(crate) const MIN_KEYS: usize = 2;
+
+// NB(@siennathesane): this is what really breaks the 32-bit compatibility. for
+// 32-bit compatibility, it should be 0x8000;
+pub(crate) const MAX_PAGE_SIZE: usize = 0x10000;
+
+pub(crate) type PageNum = u64;
 
 /// Common header for all pages
-#[repr(C)]
 pub(crate) struct Page {
-    header: PageHeader,
-    padding: u16,
+    num: PageNum,
     flags: PageFlags,
-    bounds: PageBounds,
-    ptrs: Vec<u16>, // TODO(@siennathesane): unfuck this later
+    lower: u16,
+    upper: u16,
+    data: Vec<u8>, // og field: mp_ptrs[0]
 }
 
 impl Page {
-    #[inline]
-    fn num_keys(&self) -> usize {
-        (self.bounds.lower() as usize - (PAGE_HEADER_SIZE - PAGE_BASE)) >> 1
-    }
-
-    #[inline]
-    fn size_left(&self) -> u16 {
-        match self.bounds {
-            | Regular { upper, lower } => upper - lower,
-            | Overflow { .. } => todo!(),
+    pub(crate) fn get_ptr(&self, idx: u16) -> Option<u16> {
+        if idx >= self.lower() {
+            return None;
         }
+        Some(0)
     }
 
-    #[inline]
-    fn fill_percentage(&self, page_size: usize) -> u32 {
-        (1000 * (page_size - PAGE_HEADER_SIZE - self.size_left() as usize) /
-            (page_size - PAGE_HEADER_SIZE)) as u32
+    /// Number of keys/pointers
+    pub(crate) fn num_keys(&self) -> u16 {
+        (self.lower - PAGE_HEADER_SIZE as u16) >> 1
+    }
+
+    /// Space remaining in page
+    pub(crate) fn size_left(&self) -> u16 {
+        self.upper.saturating_sub(self.lower)
+    }
+}
+
+// getters and setters for the page struct
+impl Page {
+    #[inline(always)]
+    pub(crate) fn num(&self) -> PageNum {
+        self.num
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_num(&mut self, num: PageNum) {
+        self.num = num;
+    }
+
+    #[inline(always)]
+    pub(crate) fn flags(self) -> PageFlags {
+        self.flags
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_flags(&mut self, flags: PageFlags) {
+        self.flags = flags;
+    }
+
+    #[inline(always)]
+    pub(crate) fn lower(&self) -> u16 {
+        self.lower
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_lower(&mut self, lower: u16) {
+        self.lower = lower;
+    }
+
+    #[inline(always)]
+    pub(crate) fn upper(&self) -> u16 {
+        self.upper
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_upper(&mut self, upper: u16) {
+        self.upper = upper;
+    }
+
+    #[inline(always)]
+    pub(crate) fn data(&self) -> &Vec<u8> {
+        &self.data
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_data(&mut self, data: Vec<u8>) {
+        self.data = data;
     }
 }
 
@@ -102,7 +160,6 @@ impl PageFlags {
     }
 }
 
-#[repr(C)]
 pub(crate) enum PageBounds {
     Regular { lower: u16, upper: u16 },
     Overflow { pages: u32 },

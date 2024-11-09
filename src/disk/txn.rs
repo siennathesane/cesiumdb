@@ -13,6 +13,7 @@ use std::{
         },
     },
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use bitflags::bitflags;
 use parking_lot::Mutex;
@@ -24,27 +25,46 @@ use crate::disk::{
     },
     reader::Reader,
 };
+use crate::disk::env::Environment;
+use crate::disk::mdb::{DbId, DbMetadata};
+use crate::disk::page::PageNum;
+
+pub(crate) type TxnId = u64;
 
 // compile-time verifications that things are cache aligned.
 const _: () = assert!(align_of::<MainSection>() >= CACHE_LINE);
 const _: () = assert!(align_of::<WriterSection>() >= CACHE_LINE);
 
-pub(crate) struct Transaction {
-    /// Parent transaction if this is a nested transaction
-    parent: Option<Arc<Transaction>>,
-    /// Child transaction if one exists
-    child: Option<Arc<Transaction>>,
-    /// Next unallocated page number
-    next_page_num: u64,
-    txn_id: u64,
-    // env: Arc<Environment>,
-    free_pages: Vec<NonNull<Page>>, // TODO(@siennathesane): maybe not right
-    inner: TransactionInner,
-    spill_pages: Vec<u64>,
+pub(crate) struct TxnManager {
+    active_txns: HashMap<TxnId, TxnKind>,
+    next_txn_id: TxnId,
+}
+
+pub(crate) struct TxHandle {
+    id: TxnId,
+    env: Arc<Environment>
+}
+
+pub(crate) struct TxnState {
+    id: TxnId,
+    flags: TxnFlags,
+    parent_id: Option<TxnId>,
+    child_id: Option<TxnId>,
+    next_page: PageNum,
+    dbs: HashMap<DbId, DbMetadata>
+}
+
+pub(crate) enum TxnKind {
+    Write {
+        dirty_list: Vec<(u64, NonNull<Page>)> // id2l equivalent
+    },
+    Read {
+        reader: Option<Box<Reader>>
+    }
 }
 
 bitflags! {
-    pub(crate) struct TransactionFlags: u32 {
+    pub(crate) struct TxnFlags: u32 {
         const READ_ONLY = 0x01;
         const WRITE_MAP = 0x02;
         const FINISHED = 0x04;
@@ -54,17 +74,6 @@ bitflags! {
         const HAS_CHILD = 0x40;
         
         const BLOCKED = Self::FINISHED.bits() | Self::ERROR.bits() | Self::HAS_CHILD.bits();
-    }
-}
-
-bitflags! {
-    pub (crate) struct DbFlags: u8 {
-        const DIRTY = 0x01;
-        const STALE = 0x02;
-        const NEW = 0x04;
-        const VALID = 0x08;
-        const USR_VALID = 0x10;
-        const DUP_DATA = 0x20;
     }
 }
 
@@ -241,23 +250,19 @@ impl TransactionInner {
     pub(crate) fn push_loose_page(&mut self, page: NonNull<Page>) {
         let mut loose = LoosePage::new(page);
         loose.set_next(self.loose_head.map(|mut ptr| unsafe { ptr.as_mut() }));
-        self.loose_head = Some(loose.page());
+        self.loose_head = Some(NonNull::from(loose.page()));
         self.loose_count.fetch_add(1, Acquire);
     }
 
     #[inline(always)]
     pub(crate) fn pop_loose_page(&mut self) -> Option<NonNull<Page>> {
-        if let Some(mut ptr) = self.loose_head {
-            unsafe {
-                let page = ptr.as_mut();
-                let loose = LoosePage::new(page);
-                self.loose_head = loose.next();
-                self.loose_count.fetch_sub(1, Acquire);
-                Some(page)
-            }
-        } else {
-            None
-        }
+        self.loose_head.take().map(|ptr| unsafe {
+            let loose = LoosePage::new(ptr);
+            self.loose_head = loose.next()
+                .map(|next| NonNull::new(next as *const _ as *mut Page).unwrap());
+            self.loose_count.fetch_sub(1, Acquire);
+            ptr
+        })
     }
 
     #[inline(always)]
