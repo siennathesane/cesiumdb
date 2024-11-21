@@ -53,6 +53,7 @@ use crate::{
     peek::Peekable,
     stats::STATS,
 };
+use crate::utils::{Deserializer, Serializer};
 
 pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 2 << 28; // 256MiB
 

@@ -18,6 +18,11 @@ use bytes::{
 use crc32fast::Hasher;
 use tracing::instrument;
 
+use crate::utils::{
+    Deserializer,
+    Serializer,
+};
+
 pub const DEFAULT_NS: u64 = 0;
 
 #[instrument]
@@ -84,9 +89,65 @@ impl Key<Bytes> {
         self.ns
     }
 
+    pub fn as_bytes(&self) -> Bytes {
+        self.key.clone()
+    }
+
     #[instrument(level = "trace")]
     #[inline]
-    pub fn deserialize_from_memory(slice: Bytes) -> Self {
+    pub fn serialize_for_latest(&self) -> Bytes {
+        let original = self.serialize_for_memory();
+        let mut bytes = BytesMut::from(original.as_ref());
+        for idx in 0..size_of::<u128>() {
+            bytes[original.len() - idx - 1] = 0xff;
+        }
+        bytes.freeze()
+    }
+}
+
+impl Serializer for Key<Bytes> {
+    #[instrument(level = "trace")]
+    #[inline]
+    fn serialize_for_memory(&self) -> Bytes {
+        let mut bytes =
+            BytesMut::with_capacity(size_of::<u64>() + self.key.as_ref().len() + size_of::<u128>());
+
+        // this is the serialized key
+        bytes.put_u64_le(self.ns);
+        bytes.put_slice(self.key.as_ref());
+        bytes.put_u128_le(u128::MAX - self.ts);
+
+        bytes.freeze()
+    }
+
+    #[instrument(level = "trace")]
+    #[inline]
+    fn serialize_for_storage(&self) -> Bytes {
+        // TODO(@siennathesane): add secure flag
+        let mut hasher = Hasher::new();
+        hasher.update(self.key.as_ref());
+        let checksum = hasher.finalize();
+
+        // namespace + key + timestamp
+        let len = size_of::<u64>() + self.key.as_ref().len() + size_of::<u64>();
+
+        let mut bytes = BytesMut::with_capacity(size_of::<u32>() + size_of::<u32>() + len);
+
+        // this is the serialized key
+        bytes.put_u32_le(checksum);
+        bytes.put_u32_le(len as u32);
+        bytes.put_u64_le(self.ns);
+        bytes.put_slice(self.key.as_ref());
+        bytes.put_u128_le(u128::MAX - self.ts);
+
+        bytes.freeze()
+    }
+}
+
+impl Deserializer for Key<Bytes> {
+    #[instrument(level = "trace")]
+    #[inline]
+    fn deserialize_from_memory(slice: Bytes) -> Self {
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&slice[0..8]);
 
@@ -102,7 +163,7 @@ impl Key<Bytes> {
 
     #[instrument(level = "trace")]
     #[inline]
-    pub fn deserialize_from_storage(slice: Bytes) -> Self {
+    fn deserialize_from_storage(slice: Bytes) -> Self {
         #[cfg(feature = "secure")]
         {
             let mut hasher = Hasher::new();
@@ -131,57 +192,6 @@ impl Key<Bytes> {
             key: Bytes::copy_from_slice(&slice[16..slice.len() - 8]),
             ts: u128::MAX - u128::from_le_bytes(ts_arr),
         }
-    }
-
-    pub fn as_bytes(&self) -> Bytes {
-        self.key.clone()
-    }
-
-    #[instrument(level = "trace")]
-    #[inline]
-    pub fn serialize_for_storage(&self) -> Bytes {
-        let mut hasher = Hasher::new();
-        hasher.update(self.key.as_ref());
-        let checksum = hasher.finalize();
-
-        // namespace + key + timestamp
-        let len = size_of::<u64>() + self.key.as_ref().len() + size_of::<u64>();
-
-        let mut bytes = BytesMut::with_capacity(size_of::<u32>() + size_of::<u32>() + len);
-
-        // this is the serialized key
-        bytes.put_u32_le(checksum);
-        bytes.put_u32_le(len as u32);
-        bytes.put_u64_le(self.ns);
-        bytes.put_slice(self.key.as_ref());
-        bytes.put_u128_le(u128::MAX - self.ts);
-
-        bytes.freeze()
-    }
-
-    #[instrument(level = "trace")]
-    #[inline]
-    pub fn serialize_for_memory(&self) -> Bytes {
-        let mut bytes =
-            BytesMut::with_capacity(size_of::<u64>() + self.key.as_ref().len() + size_of::<u128>());
-
-        // this is the serialized key
-        bytes.put_u64_le(self.ns);
-        bytes.put_slice(self.key.as_ref());
-        bytes.put_u128_le(u128::MAX - self.ts);
-
-        bytes.freeze()
-    }
-
-    #[instrument(level = "trace")]
-    #[inline]
-    pub fn serialize_for_latest(&self) -> Bytes {
-        let original = self.serialize_for_memory();
-        let mut bytes = BytesMut::from(original.as_ref());
-        for idx in 0..size_of::<u128>() {
-            bytes[original.len() - idx - 1] = 0xff;
-        }
-        bytes.freeze()
     }
 }
 
@@ -357,10 +367,14 @@ impl<T: AsRef<[u8]> + Ord> Ord for Value<T> {
 mod tests {
     use bytes::Bytes;
 
-    use crate::keypair::{
-        KeyBytes,
-        ValueBytes,
+    use crate::{
+        keypair::{
+            KeyBytes,
+            ValueBytes,
+        },
+        utils::Serializer,
     };
+    use crate::utils::Deserializer;
 
     #[test]
     fn test_key_serialization() {
