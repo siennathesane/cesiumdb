@@ -1,6 +1,6 @@
 [build]
 rustflags = [
-    "-Awarnings",
+    "-Awarnings,unused",
     "-Ctarget-cpu=native"
 ]
 
