@@ -9,7 +9,6 @@ compile_error!("this crate won't work on non-unix platforms, sorry");
 compile_error!("this crate is built for 64-bit pointers");
 
 #[allow(unused)]
-
 use std::sync::Arc;
 
 use bytes::Bytes;
