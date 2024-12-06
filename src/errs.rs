@@ -13,4 +13,8 @@ pub enum CesiumError {
     DataExceedsMaximum,
     #[error("memtable is frozen")]
     MemtableIsFrozen,
+    #[error("block is full")]
+    BlockFull,
+    #[error("entry is too large for block")]
+    TooLargeForBlock,
 }

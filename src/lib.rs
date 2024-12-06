@@ -50,6 +50,9 @@ pub mod merge;
 pub mod peek;
 pub(crate) mod state;
 mod stats;
+mod sbtable;
+mod utils;
+mod block;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
