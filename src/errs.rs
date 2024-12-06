@@ -17,4 +17,8 @@ pub enum CesiumError {
     BlockFull,
     #[error("entry is too large for block")]
     TooLargeForBlock,
+    #[error("segment is full")]
+    SegmentFull,
+    #[error("segment must be multiple of 4096")]
+    SegmentSizeInvalid,
 }

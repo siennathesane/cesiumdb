@@ -65,20 +65,43 @@ impl Block {
         Ok(())
     }
 
-    /// Finalize the block by writing the number of entries, the offsets, and the entries
-    pub(crate) fn finalize(&mut self) -> Bytes {
-        let mut block = BytesMut::with_capacity(BLOCK_SIZE);
-        block.put_u16_le(self.num_entries);
-        block.put_slice(self.offsets.as_ref());
-        block.put_slice(self.entries.as_ref());
+    /// Finalize the block by writing directly to the provided memory location.
+    ///
+    /// # Safety
+    /// - dst must be valid for BLOCK_SIZE bytes
+    /// - dst must be properly aligned
+    /// - dst must not overlap with any source data
+    pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
+        // write num_entries
+        std::ptr::copy_nonoverlapping(
+            self.num_entries.to_le_bytes().as_ptr(),
+            dst,
+            size_of::<u16>()
+        );
 
-        // zero out the remaining space in the block
-        let remaining = BLOCK_SIZE - block.len();
-        for _ in 0..remaining {
-            block.put_u8(0);
+        // write offsets
+        std::ptr::copy_nonoverlapping(
+            self.offsets.as_ptr(),
+            dst.add(size_of::<u16>()),
+            self.offsets.len()
+        );
+
+        // write entries
+        std::ptr::copy_nonoverlapping(
+            self.entries.as_ptr(),
+            dst.add(size_of::<u16>() + self.offsets.len()),
+            self.entries.len()
+        );
+
+        // zero remaining space
+        let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
+        if written < BLOCK_SIZE {
+            std::ptr::write_bytes(
+                dst.add(written),
+                0,
+                BLOCK_SIZE - written
+            );
         }
-
-        block.freeze()
     }
 }
 
@@ -180,10 +203,13 @@ mod tests {
 
     #[test]
     fn test_finalize_empty_block() {
-        let mut block = Block::new();
-        let finalized = block.finalize();
-        assert_eq!(finalized.len(), BLOCK_SIZE);
-        assert_eq!(&finalized[2..], &[0u8; BLOCK_SIZE - 2]);
+        let block = Block::new();
+        let mut buffer = vec![0u8; BLOCK_SIZE];
+        unsafe {
+            block.finalize(buffer.as_mut_ptr());
+        }
+        assert_eq!(buffer.len(), BLOCK_SIZE);
+        assert_eq!(&buffer[2..], &[0u8; BLOCK_SIZE - 2]);
     }
 
     #[test]
@@ -191,12 +217,15 @@ mod tests {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
         block.add_entry(&entry).unwrap();
-        let finalized = block.finalize();
-        assert_eq!(finalized.len(), BLOCK_SIZE);
-        assert_eq!(finalized[0..2], (1u16).to_le_bytes());
-        assert_eq!(finalized[2..4], (4u16).to_le_bytes());
-        assert_eq!(finalized[4..8], entry);
-        assert_eq!(&finalized[8..], &[0u8; BLOCK_SIZE - 8]);
+        let mut buffer = vec![0u8; BLOCK_SIZE];
+        unsafe {
+            block.finalize(buffer.as_mut_ptr());
+        }
+        assert_eq!(buffer.len(), BLOCK_SIZE);
+        assert_eq!(buffer[0..2], (1u16).to_le_bytes());
+        assert_eq!(buffer[2..4], (4u16).to_le_bytes());
+        assert_eq!(buffer[4..8], entry);
+        assert_eq!(&buffer[8..], &[0u8; BLOCK_SIZE - 8]);
     }
 
     #[test]
@@ -206,14 +235,17 @@ mod tests {
         let entry2 = [5, 6, 7, 8];
         block.add_entry(&entry1).unwrap();
         block.add_entry(&entry2).unwrap();
-        let finalized = block.finalize();
-        assert_eq!(finalized.len(), BLOCK_SIZE);
-        assert_eq!(finalized[0..2], (2u16).to_le_bytes());
-        assert_eq!(finalized[2..4], (4u16).to_le_bytes());
-        assert_eq!(finalized[4..6], (8u16).to_le_bytes());
-        assert_eq!(finalized[6..10], entry1);
-        assert_eq!(finalized[10..14], entry2);
-        assert_eq!(&finalized[14..], &[0u8; BLOCK_SIZE - 14]);
+        let mut buffer = vec![0u8; BLOCK_SIZE];
+        unsafe {
+            block.finalize(buffer.as_mut_ptr());
+        }
+        assert_eq!(buffer.len(), BLOCK_SIZE);
+        assert_eq!(buffer[0..2], (2u16).to_le_bytes());
+        assert_eq!(buffer[2..4], (4u16).to_le_bytes());
+        assert_eq!(buffer[4..6], (8u16).to_le_bytes());
+        assert_eq!(buffer[6..10], entry1);
+        assert_eq!(buffer[10..14], entry2);
+        assert_eq!(&buffer[14..], &[0u8; BLOCK_SIZE - 14]);
     }
 
     #[test]
@@ -221,11 +253,14 @@ mod tests {
         let mut block = Block::new();
         let entry = [0u8; BLOCK_SIZE - MAX_ENTRIES];
         block.add_entry(&entry).unwrap();
-        let finalized = block.finalize();
-        assert_eq!(finalized.len(), BLOCK_SIZE);
-        assert_eq!(finalized[0..2], (1u16).to_le_bytes());
-        assert_eq!(finalized[2..4], ((BLOCK_SIZE - MAX_ENTRIES) as u16).to_le_bytes());
-        // assert_eq!(finalized[4..BLOCK_SIZE], entry);
+        let mut buffer = vec![0u8; BLOCK_SIZE];
+        unsafe {
+            block.finalize(buffer.as_mut_ptr());
+        }
+        assert_eq!(buffer.len(), BLOCK_SIZE);
+        assert_eq!(buffer[0..2], (1u16).to_le_bytes());
+        assert_eq!(buffer[2..4], ((BLOCK_SIZE - MAX_ENTRIES) as u16).to_le_bytes());
+        // assert_eq!(buffer[4..BLOCK_SIZE], entry);
     }
 
     #[test]
@@ -235,13 +270,16 @@ mod tests {
         block.add_entry(&entry).unwrap();
         let entry2 = [5, 6, 7, 8, 9, 10];
         block.add_entry(&entry2).unwrap();
-        let finalized = block.finalize();
-        assert_eq!(finalized.len(), BLOCK_SIZE);
-        assert_eq!(finalized[0..2], (2u16).to_le_bytes());
-        assert_eq!(finalized[2..4], (4u16).to_le_bytes());
-        assert_eq!(finalized[4..6], (10u16).to_le_bytes());
-        assert_eq!(finalized[6..10], entry);
-        assert_eq!(finalized[10..16], entry2);
-        assert_eq!(&finalized[16..], &[0u8; BLOCK_SIZE - 16]);
+        let mut buffer = vec![0u8; BLOCK_SIZE];
+        unsafe {
+            block.finalize(buffer.as_mut_ptr());
+        }
+        assert_eq!(buffer.len(), BLOCK_SIZE);
+        assert_eq!(buffer[0..2], (2u16).to_le_bytes());
+        assert_eq!(buffer[2..4], (4u16).to_le_bytes());
+        assert_eq!(buffer[4..6], (10u16).to_le_bytes());
+        assert_eq!(buffer[6..10], entry);
+        assert_eq!(buffer[10..16], entry2);
+        assert_eq!(&buffer[16..], &[0u8; BLOCK_SIZE - 16]);
     }
 }
