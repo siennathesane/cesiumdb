@@ -21,4 +21,32 @@ pub enum CesiumError {
     SegmentFull,
     #[error("segment must be multiple of 4096")]
     SegmentSizeInvalid,
+    #[error("no free space available")]
+    NoFreeSpace,
+    #[error("invalid header format")]
+    InvalidHeaderFormat(String),
+    #[error("metadata growth error")]
+    MetadataGrowthError(MetadataGrowthError),
+    #[error("fs allocation error")]
+    FsAllocationError(FsAllocationError),
+}
+
+#[derive(Error, Debug)]
+pub enum MetadataGrowthError {
+    #[error("no adjacent space available, can't find a free range after metadata")]
+    NoAdjacentSpace,
+    #[error("adjacent space isn't big enough")]
+    InsufficientSpace,
+    #[error("metadata too large")]
+    MetadataTooLarge,
+}
+
+#[derive(Error, Debug)]
+pub enum FsAllocationError {
+    #[error("no contiguous space available, can't find a contiguous block big enough")]
+    NoContiguousSpace,
+    #[error("block is too fragmented")]
+    FragmentationLimit,
+    #[error("filesystem is full")]
+    StorageExhausted,
 }

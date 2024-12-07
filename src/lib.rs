@@ -54,6 +54,7 @@ mod sbtable;
 mod utils;
 mod block;
 mod segment_writer;
+pub mod fs;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and

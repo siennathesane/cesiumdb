@@ -83,7 +83,7 @@ impl SegmentWriter {
                 }
             }
 
-            let guard = completion_mutex_clone.lock();
+            let _guard = completion_mutex_clone.lock();
             completion_condvar_clone.notify_one();
             STATS.current_threads.fetch_sub(1, Relaxed);
         });
@@ -112,7 +112,7 @@ impl SegmentWriter {
         Ok(())
     }
 
-    // Add a new method to explicitly shutdown the writer
+    // Explicitly shutdown the writer
     pub(crate) fn shutdown(&self) {
         self.done.store(true, Relaxed);
     }
