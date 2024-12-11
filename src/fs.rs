@@ -1,28 +1,27 @@
-use std::{
-    io::{
-        Error,
-        ErrorKind::{
-            AlreadyExists,
-            InvalidInput,
+use std::{io::{
+    Error,
+    ErrorKind::{
+        AlreadyExists,
+        InvalidInput,
+    },
+}, ops::Range, ptr, sync::{
+    atomic,
+    atomic::{
+        fence,
+        AtomicU64,
+        Ordering::{
+            AcqRel,
+            Acquire,
+            Relaxed,
+            SeqCst,
         },
     },
-    ops::Range,
-    sync::{
-        atomic::{
-            fence,
-            AtomicU64,
-            {
-                
-            },
-        },
-        Arc,
-    },
-    time::{
-        SystemTime,
-        UNIX_EPOCH,
-    },
-};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
+    Arc,
+}, time::{
+    SystemTime,
+    UNIX_EPOCH,
+}};
+use std::mem::ManuallyDrop;
 use bytes::{
     Buf,
     BufMut,
@@ -45,15 +44,26 @@ use crate::{
     errs::{
         CesiumError,
         CesiumError::{
+            FsError,
             InvalidHeaderFormat,
             IoError,
+            MetadataGrowthError,
             NoFreeSpace,
+        },
+        FsError::{
+            FRangeAlreadyOpen,
+            FRangeNotFound,
+            FRangeStillOpen,
+            FragmentationLimit,
+            ReadOutOfBounds,
+            StorageExhausted,
+        },
+        MetadataGrowthError::{
+            InsufficientSpace,
+            NoAdjacentSpace,
         },
     },
 };
-use crate::errs::CesiumError::{FsAllocationError, MetadataGrowthError};
-use crate::errs::FsAllocationError::{FragmentationLimit, StorageExhausted};
-use crate::errs::MetadataGrowthError::{InsufficientSpace, NoAdjacentSpace};
 
 // TODO(@siennathesane): make this configurable
 const FLUSH_INTERVAL_SECS: u64 = 5;
@@ -290,12 +300,11 @@ pub struct Fs {
 
 impl Fs {
     pub(crate) fn new(mmap: MmapMut) -> Result<Self, CesiumError> {
-        
         match mmap.advise(memmap2::Advice::Random) {
             | Ok(_) => {},
             | Err(e) => return Err(IoError(e)),
         };
-        
+
         // Read header
         let header = {
             let mut header_bytes = [0u8; size_of::<FsHeader>()];
@@ -399,20 +408,16 @@ impl Fs {
 
         // Now lock is released, handle the result
         let range = match range {
-            Ok(range) => range,
-            Err(NoFreeSpace) => {
+            | Ok(range) => range,
+            | Err(NoFreeSpace) => {
                 let total_space = self.total_free_space();
-                if size > total_space {
-                    return Err(FsAllocationError(
-                        StorageExhausted
-                    ));
+                return if size > total_space {
+                    Err(FsError(StorageExhausted))
                 } else {
-                    return Err(FsAllocationError(
-                        FragmentationLimit
-                    ));
-                }
+                    Err(FsError(FragmentationLimit))
+                };
             },
-            Err(e) => return Err(e),
+            | Err(e) => return Err(e),
         };
 
         // Get the ID and create metadata
@@ -447,13 +452,13 @@ impl Fs {
         let mut open_franges = self.open_franges.write();
 
         if !open_franges.insert(id) {
-            return Err(IoError(Error::new(AlreadyExists, "FRange already open")));
+            return Err(FsError(FRangeAlreadyOpen));
         }
 
         let franges = self.franges.read();
         let metadata = match franges.get(&id) {
             | None => {
-                return Err(IoError(Error::new(InvalidInput, "FRange not found")));
+                return Err(FsError(FRangeNotFound));
             },
             | Some(v) => v.value().clone(), // Dereference and clone the value
         };
@@ -462,7 +467,7 @@ impl Fs {
             mmap: self.mmap.clone(),
             range: metadata.range.clone(),
             metadata, // Now metadata is owned
-            fs: self,
+            fs: ManuallyDrop::new(self),
         })
     }
 
@@ -472,7 +477,7 @@ impl Fs {
             let franges = self.franges.write();
             match franges.get(&handle.metadata.id) {
                 | None => {
-                    return Err(IoError(Error::new(InvalidInput, "FRange not found")));
+                    return Err(FsError(FRangeNotFound));
                 },
                 | Some(entry) => {
                     let mut updated = entry.value().clone();
@@ -498,7 +503,7 @@ impl Fs {
 
     pub fn delete_frange(&self, id: u64) -> Result<(), CesiumError> {
         if self.open_franges.read().contains(&id) {
-            return Err(IoError(Error::new(InvalidInput, "FRange still open")));
+            return Err(FsError(FRangeStillOpen));
         }
 
         // Remove the frange from the franges map
@@ -519,8 +524,8 @@ impl Fs {
 
         // Coalesce free ranges
         match self.coalesce_free_ranges() {
-            Ok(_) => {}
-            Err(e) => return Err(e),
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
         };
 
         // Persist changes
@@ -630,10 +635,10 @@ impl Fs {
     ) -> Result<OrderedRange, CesiumError> {
         // Find the rightmost suitable range by iterating in reverse
         let suitable_range = match free.iter().rev().find(|r| r.end - r.start >= size) {
-            None => {
-                return Err(CesiumError::NoFreeSpace);
+            | None => {
+                return Err(NoFreeSpace);
             },
-            Some(v) => v,
+            | Some(v) => v,
         };
 
         free.remove(&suitable_range);
@@ -776,7 +781,10 @@ impl Fs {
     /// Calculate total free space available in the filesystem
     pub fn total_free_space(&self) -> u64 {
         let free_ranges = self.free_ranges.read();
-        let sum = free_ranges.iter().map(|range| range.end - range.start).sum();
+        let sum = free_ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum();
         sum
     }
 
@@ -790,7 +798,9 @@ impl Fs {
     /// Check if a given size can be allocated contiguously
     pub fn can_allocate_contiguous(&self, size: u64) -> bool {
         let free_ranges = self.free_ranges.read();
-        let can_allocate = free_ranges.iter().any(|range| range.end - range.start >= size);
+        let can_allocate = free_ranges
+            .iter()
+            .any(|range| range.end - range.start >= size);
         can_allocate
     }
 
@@ -832,13 +842,16 @@ impl Fs {
     }
 
     /// Check if compaction is needed and perform it with custom config
-    pub fn maybe_compact_with_config(&self, config: &CompactionConfig) -> Result<bool, CesiumError> {
+    pub fn maybe_compact_with_config(
+        &self,
+        config: &CompactionConfig,
+    ) -> Result<bool, CesiumError> {
         // First check if compaction is needed
         let stats = self.fragmentation_stats();
         let total_space = self.total_free_space() + self.total_used_space();
 
-        let fragmentation_ratio = stats.free_range_count as f64 * stats.average_fragment_size as f64
-            / total_space as f64;
+        let fragmentation_ratio =
+            stats.free_range_count as f64 * stats.average_fragment_size as f64 / total_space as f64;
 
         if fragmentation_ratio < config.fragmentation_threshold {
             return Ok(false);
@@ -851,13 +864,16 @@ impl Fs {
         }
 
         // Perform compaction
-        self.compact_franges(candidates)?;
+        self.compact_franges(config.block_buffer_size, candidates)?;
 
         Ok(true)
     }
 
     /// Find candidate franges for compaction
-    fn find_compaction_candidates(&self, config: &CompactionConfig) -> Result<Vec<(u64, FRangeMetadata)>, CesiumError> {
+    fn find_compaction_candidates(
+        &self,
+        config: &CompactionConfig,
+    ) -> Result<Vec<(u64, FRangeMetadata)>, CesiumError> {
         let mut candidates = Vec::new();
 
         // Only consider closed franges
@@ -891,7 +907,11 @@ impl Fs {
     }
 
     /// Perform compaction on selected franges
-    fn compact_franges(&self, candidates: Vec<(u64, FRangeMetadata)>) -> Result<(), CesiumError> {
+    fn compact_franges(
+        &self,
+        buffer_size: usize,
+        candidates: Vec<(u64, FRangeMetadata)>,
+    ) -> Result<(), CesiumError> {
         for (id, metadata) in candidates {
             // Skip if frange was opened while preparing compaction
             if self.open_franges.read().contains(&id) {
@@ -903,9 +923,9 @@ impl Fs {
             let mut new_handle = self.open_frange(new_id)?;
 
             // Read data from old frange
-            // TODO(@siennathesane): use a more efficient way to copy data
+            // TODO(@siennathesane): find a more efficient way to copy data
             let old_handle = self.open_frange(id)?;
-            let mut buffer = vec![0u8; 4096]; // Use 4KB buffer for copying
+            let mut buffer = BytesMut::zeroed(buffer_size); // Use 4KB buffer for copying
 
             let mut remaining = metadata.length;
             let mut offset = 0;
@@ -927,7 +947,9 @@ impl Fs {
 
             // Get the new range information
             let new_range = {
-                self.franges.read().get(&new_id)
+                self.franges
+                    .read()
+                    .get(&new_id)
                     .ok_or_else(|| IoError(Error::new(InvalidInput, "new frange not found")))?
                     .value()
                     .range
@@ -938,11 +960,11 @@ impl Fs {
             {
                 let mut updated = match self.franges.read().get(&id) {
                     | None => {
-                        return Err(IoError(Error::new(InvalidInput, "original frange not found")));
+                        return Err(FsError(FRangeNotFound));
                     },
                     | Some(v) => v.value().clone(),
                 };
-                
+
                 updated.range = new_range;
                 self.franges.write().insert(updated.id, updated);
             }
@@ -977,6 +999,8 @@ pub struct CompactionConfig {
     pub min_fragment_size: u64,
     /// Maximum number of franges to compact in one operation
     pub max_compact_batch: usize,
+
+    pub block_buffer_size: usize,
 }
 
 impl Default for CompactionConfig {
@@ -985,6 +1009,7 @@ impl Default for CompactionConfig {
             fragmentation_threshold: 0.3, // 30% fragmentation triggers compaction
             min_fragment_size: 4096,      // Ignore fragments smaller than 4KB
             max_compact_batch: 10,        // Compact up to 10 franges at once
+            block_buffer_size: 4096,      // 4KiB
         }
     }
 }
@@ -995,7 +1020,7 @@ pub struct FragmentationStats {
     pub free_range_count: u64,
     pub largest_free_block: u64,
     pub average_fragment_size: u64,
-    pub small_fragments: u64,  // Fragments smaller than page size
+    pub small_fragments: u64, // Fragments smaller than page size
 }
 
 #[derive(Debug)]
@@ -1017,13 +1042,6 @@ pub struct FsHealth {
     pub fragmentation_stats: FragmentationStats,
 }
 
-pub struct FRangeHandle<'fs> {
-    mmap: Arc<MmapMut>,
-    range: OrderedRange,
-    metadata: FRangeMetadata,
-    fs: &'fs Fs,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct FRangeMetadata {
     range: OrderedRange,
@@ -1034,10 +1052,17 @@ pub(crate) struct FRangeMetadata {
     modified_at: u64,
 }
 
+pub struct FRangeHandle<'fs> {
+    mmap: Arc<MmapMut>,
+    range: OrderedRange,
+    metadata: FRangeMetadata,
+    fs: ManuallyDrop<&'fs Fs>,
+}
+
 impl<'fs> FRangeHandle<'fs> {
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CesiumError> {
         if offset as usize + data.len() > (self.range.end - self.range.start) as usize {
-            return Err(IoError(Error::new(InvalidInput, "read out of bounds")));
+            return Err(FsError(ReadOutOfBounds));
         }
 
         let base = self.range.start as usize + offset as usize;
@@ -1077,7 +1102,7 @@ impl<'fs> FRangeHandle<'fs> {
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), CesiumError> {
         // First check if the read would be out of bounds of our allocated range
         if offset as usize + buf.len() > (self.range.end - self.range.start) as usize {
-            return Err(IoError(Error::new(InvalidInput, "read out of bounds")));
+            return Err(FsError(ReadOutOfBounds));
         }
 
         // Then handle EOF case
@@ -1126,17 +1151,61 @@ impl<'fs> FRangeHandle<'fs> {
     }
 }
 
+impl<'fs> Drop for FRangeHandle<'fs> {
+    fn drop(&mut self) {
+        // we basically remove ourselves from the open ranges so that when this
+        // is dropped you can theoretically delete the frange
+        {
+            let franges = self.fs.franges.write();
+            match franges.get(&self.metadata.id) {
+                None => {},
+                Some(entry) => {
+                    let mut updated = entry.value().clone();
+                    updated.modified_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    updated.length = self.metadata.length;
+                    franges.insert(self.metadata.id, updated);
+                },
+            };
+        }
+        
+        {
+            let mut open_franges = self.fs.open_franges.write();
+            open_franges.remove(&self.metadata.id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs::{File, OpenOptions};
-    use std::io::Read;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering::Acquire;
+    use std::{
+        fs::{
+            File,
+            OpenOptions,
+        },
+        io::Read,
+        sync::{
+            atomic::Ordering::Acquire,
+            Arc,
+        },
+    };
+
     use memmap2::MmapMut;
     use tempfile::tempdir;
-    use crate::block::BLOCK_SIZE;
-    use crate::errs::CesiumError::InvalidHeaderFormat;
-    use crate::fs::{deserialize_header, CompactionConfig, Fs, FsHeader, INITIAL_METADATA_SIZE};
+
+    use crate::{
+        block::BLOCK_SIZE,
+        errs::CesiumError::InvalidHeaderFormat,
+        fs::{
+            deserialize_header,
+            CompactionConfig,
+            Fs,
+            FsHeader,
+            INITIAL_METADATA_SIZE,
+        },
+    };
 
     const TEST_FILE_SIZE: u64 = 1024 * 1024 * 10; // 10MB
 
@@ -1387,7 +1456,6 @@ mod tests {
             handle.join().unwrap();
         }
     }
-
 
     #[test]
     fn test_fs_init() {
@@ -1689,6 +1757,7 @@ mod tests {
             fragmentation_threshold: 0.2,
             min_fragment_size: 1024,
             max_compact_batch: 5,
+            block_buffer_size: 4096,
         };
 
         assert!(fs.maybe_compact_with_config(&config).unwrap());
@@ -1717,6 +1786,7 @@ mod tests {
             fragmentation_threshold: 0.0, // Always compact
             min_fragment_size: 1024,
             max_compact_batch: 1,
+            block_buffer_size: 4096,
         };
 
         fs.maybe_compact_with_config(&config).unwrap();
@@ -1731,14 +1801,24 @@ mod tests {
 
 #[cfg(test)]
 mod e2e_tests {
-    use super::*;
-    use std::fs::OpenOptions;
-    use std::sync::Arc;
-    use proptest::collection::vec;
-    use proptest::proptest;
-    use tokio::task;
+    use std::{
+        fs::OpenOptions,
+        sync::Arc,
+    };
+
+    use proptest::{
+        collection::vec,
+        proptest,
+    };
+    use rand::{
+        thread_rng,
+        Rng,
+        RngCore,
+    };
     use tempfile::tempdir;
-    use rand::{thread_rng, Rng, RngCore};
+    use tokio::task;
+
+    use super::*;
 
     const TEST_FILE_SIZE: u64 = 1024 * 1024 * 100; // 100MB for testing
 
@@ -1867,11 +1947,11 @@ mod e2e_tests {
 
         // Create mixed workload with different sizes
         let sizes = vec![
-            1024,           // 1KB
-            1024 * 1024,    // 1MB
-            1024 * 16,      // 16KB
-            1024 * 256,     // 256KB
-            1024 * 64       // 64KB
+            1024,        // 1KB
+            1024 * 1024, // 1MB
+            1024 * 16,   // 16KB
+            1024 * 256,  // 256KB
+            1024 * 64,   // 64KB
         ];
 
         let mut handles = vec![];
@@ -1888,7 +1968,7 @@ mod e2e_tests {
 
                         // Write some data
                         let mut handle = fs_clone.open_frange(id).unwrap();
-                        let data = vec![thread_rng().gen::<u8>(); (size/2) as usize];
+                        let data = vec![thread_rng().gen::<u8>(); (size / 2) as usize];
                         handle.write_at(0, &data).unwrap();
                         fs_clone.close_frange(handle).unwrap();
                     }
@@ -2112,7 +2192,10 @@ mod e2e_tests {
         let max_id = fs.create_frange(available_space).unwrap();
 
         // Attempt to create another frange should fail
-        assert!(matches!(fs.create_frange(1024), Err(FsAllocationError(StorageExhausted))));
+        assert!(matches!(
+            fs.create_frange(1024),
+            Err(FsError(StorageExhausted))
+        ));
 
         // Delete the large frange
         fs.delete_frange(max_id).unwrap();

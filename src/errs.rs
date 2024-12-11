@@ -27,8 +27,8 @@ pub enum CesiumError {
     InvalidHeaderFormat(String),
     #[error("metadata growth error")]
     MetadataGrowthError(MetadataGrowthError),
-    #[error("fs allocation error")]
-    FsAllocationError(FsAllocationError),
+    #[error("fs error")]
+    FsError(FsError),
 }
 
 #[derive(Error, Debug)]
@@ -42,11 +42,21 @@ pub enum MetadataGrowthError {
 }
 
 #[derive(Error, Debug)]
-pub enum FsAllocationError {
+pub enum FsError {
     #[error("no contiguous space available, can't find a contiguous block big enough")]
     NoContiguousSpace,
     #[error("block is too fragmented")]
     FragmentationLimit,
     #[error("filesystem is full")]
     StorageExhausted,
+    #[error("frange is already open")]
+    FRangeAlreadyOpen,
+    #[error("frange is already closed")]
+    FRangeAlreadyClosed,
+    #[error("frange not found")]
+    FRangeNotFound,
+    #[error("frange is still open")]
+    FRangeStillOpen,
+    #[error("read out of bounds")]
+    ReadOutOfBounds,
 }

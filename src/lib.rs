@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 #![feature(integer_atomics)]
-#[allow(dead_code)]
+#![allow(dead_code)] // TODO(@siennathesane): remove before release
+#![allow(unused)] // TODO(@siennathesane): remove before release
 #[cfg(not(unix))]
 compile_error!("this crate won't work on non-unix platforms, sorry");
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("this crate is built for 64-bit pointers");
+compile_warn!("this crate is not tested on 32-bit systems");
 
 #[allow(unused)]
 use std::sync::Arc;
