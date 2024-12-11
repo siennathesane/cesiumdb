@@ -103,6 +103,17 @@ impl Block {
             );
         }
     }
+
+    /// Returns an iterator over the entries in the block.
+    #[inline]
+    pub fn iter(&self) -> BlockIterator {
+        BlockIterator {
+            entries: self.entries.as_ref(),
+            offsets: self.offsets.as_ref(),
+            current: 0,
+            num_entries: self.num_entries,
+        }
+    }
 }
 
 /// Helper methods.
@@ -133,6 +144,60 @@ impl Block {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == size_of::<u16>()
+    }
+}
+
+/// An iterator over the entries in a block.
+pub struct BlockIterator<'a> {
+    /// Reference to the entries data
+    entries: &'a [u8],
+    /// Reference to the offsets data
+    offsets: &'a [u8],
+    /// Current entry index
+    current: usize,
+    /// Total number of entries
+    num_entries: u16,
+}
+
+impl<'a> Iterator for BlockIterator<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.num_entries as usize {
+            return None;
+        }
+
+        // Get the current entry's start offset
+        let start_offset = if self.current == 0 {
+            0
+        } else {
+            let offset_idx = (self.current - 1) * 2;
+            u16::from_le_bytes([
+                self.offsets[offset_idx],
+                self.offsets[offset_idx + 1]
+            ]) as usize
+        };
+
+        // Get the end offset (either from next entry or end of entries)
+        let end_offset = if self.current < self.num_entries as usize {
+            let offset_idx = self.current * 2;
+            u16::from_le_bytes([
+                self.offsets[offset_idx],
+                self.offsets[offset_idx + 1]
+            ]) as usize
+        } else {
+            self.entries.len()
+        };
+
+        self.current += 1;
+        Some(&self.entries[start_offset..end_offset])
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.num_entries as usize - self.current;
+        (remaining, Some(remaining))
     }
 }
 
@@ -281,5 +346,51 @@ mod tests {
         assert_eq!(buffer[6..10], entry);
         assert_eq!(buffer[10..16], entry2);
         assert_eq!(&buffer[16..], &[0u8; BLOCK_SIZE - 16]);
+    }
+
+    #[test]
+    fn test_iterator_empty_block() {
+        let block = Block::new();
+        let mut iter = block.iter();
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_iterator_single_entry() {
+        let mut block = Block::new();
+        let entry = [1, 2, 3, 4];
+        block.add_entry(&entry).unwrap();
+
+        let mut iter = block.iter();
+        assert_eq!(iter.next(), Some(&entry[..]));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_iterator_multiple_entries() {
+        let mut block = Block::new();
+        let entry1 = [1, 2, 3, 4];
+        let entry2 = [5, 6, 7, 8];
+        block.add_entry(&entry1).unwrap();
+        block.add_entry(&entry2).unwrap();
+
+        let mut iter = block.iter();
+        assert_eq!(iter.next(), Some(&entry1[..]));
+        assert_eq!(iter.next(), Some(&entry2[..]));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_iterator_size_hint() {
+        let mut block = Block::new();
+        block.add_entry(&[1, 2, 3, 4]).unwrap();
+        block.add_entry(&[5, 6, 7, 8]).unwrap();
+
+        let mut iter = block.iter();
+        assert_eq!(iter.size_hint(), (2, Some(2)));
+        iter.next();
+        assert_eq!(iter.size_hint(), (1, Some(1)));
+        iter.next();
+        assert_eq!(iter.size_hint(), (0, Some(0)));
     }
 }
