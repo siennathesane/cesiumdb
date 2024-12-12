@@ -1,8 +1,9 @@
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{
     errs::CesiumError,
 };
+use crate::utils::Deserializer;
 
 pub(crate) const BLOCK_SIZE: usize = 4096;
 pub(crate) const ENTRY_SIZE: usize = size_of::<u16>();
@@ -104,6 +105,36 @@ impl Block {
         }
     }
 
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.num_entries as usize {
+            return None;
+        }
+
+        // Get the offsets directly without going through iterator state
+        let start_offset = if index == 0 {
+            0
+        } else {
+            let offset_idx = (index - 1) * 2;
+            u16::from_le_bytes([
+                self.offsets[offset_idx],
+                self.offsets[offset_idx + 1]
+            ]) as usize
+        };
+
+        let end_offset = if index < self.num_entries as usize - 1 {
+            let offset_idx = index * 2;
+            u16::from_le_bytes([
+                self.offsets[offset_idx],
+                self.offsets[offset_idx + 1]
+            ]) as usize
+        } else {
+            self.entries.len()
+        };
+
+        Some(&self.entries[start_offset..end_offset])
+    }
+
     /// Returns an iterator over the entries in the block.
     #[inline]
     pub fn iter(&self) -> BlockIterator {
@@ -144,6 +175,40 @@ impl Block {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == size_of::<u16>()
+    }
+}
+
+impl Deserializer for Block {
+    fn deserialize_from_memory(payload: Bytes) -> Self {
+        let mut block = Block::new();
+
+        // First two bytes are num_entries
+        block.num_entries = u16::from_le_bytes([payload[0], payload[1]]);
+
+        // If we have entries, process them
+        if block.num_entries > 0 {
+            // Read all offsets first
+            let offsets_end = size_of::<u16>() + (block.num_entries as usize * size_of::<u16>());
+            let offsets_data = &payload[size_of::<u16>()..offsets_end];
+            block.offsets.extend_from_slice(offsets_data);
+
+            // Calculate entries size using last offset
+            let last_offset = u16::from_le_bytes([
+                offsets_data[offsets_data.len() - 2],
+                offsets_data[offsets_data.len() - 1]
+            ]) as usize;
+
+            // Copy entries data
+            let entries_data = &payload[offsets_end..offsets_end + last_offset];
+            block.entries.extend_from_slice(entries_data);
+        }
+
+        block
+    }
+
+    fn deserialize_from_storage(payload: Bytes) -> Self {
+        // Storage format is identical to memory format for blocks
+        Self::deserialize_from_memory(payload)
     }
 }
 
@@ -392,5 +457,129 @@ mod tests {
         assert_eq!(iter.size_hint(), (1, Some(1)));
         iter.next();
         assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    #[test]
+    fn test_deserialize_empty_block() {
+        let mut data = BytesMut::with_capacity(BLOCK_SIZE);
+        data.put_u16_le(0); // num_entries = 0
+        data.resize(BLOCK_SIZE, 0);
+
+        let block = Block::deserialize_from_storage(data.freeze());
+        assert_eq!(block.num_entries, 0);
+        assert!(block.offsets().is_empty());
+        assert!(block.entries().is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_single_entry() {
+        let mut data = BytesMut::with_capacity(BLOCK_SIZE);
+        data.put_u16_le(1); // num_entries = 1
+        data.put_u16_le(5); // offset to end of first entry
+
+        // Entry data
+        data.put_slice(b"hello");
+        data.resize(BLOCK_SIZE, 0);
+
+        let block = Block::deserialize_from_storage(data.freeze());
+        assert_eq!(block.num_entries, 1);
+        assert_eq!(block.offsets().len(), 2); // one u16 offset
+        assert_eq!(block.entries().len(), 5); // "hello"
+    }
+
+    #[test]
+    fn test_deserialize_multiple_entries() {
+        let mut data = BytesMut::with_capacity(BLOCK_SIZE);
+        data.put_u16_le(2); // num_entries = 2
+        data.put_u16_le(5); // offset to end of first entry
+        data.put_u16_le(8); // offset to end of second entry
+
+        // Entry data
+        data.put_slice(b"hello"); // first entry
+        data.put_slice(b"123");   // second entry
+        data.resize(BLOCK_SIZE, 0);
+
+        let block = Block::deserialize_from_storage(data.freeze());
+        assert_eq!(block.num_entries, 2);
+        assert_eq!(block.offsets().len(), 4); // two u16 offsets
+        assert_eq!(block.entries().len(), 8); // "hello123"
+    }
+
+    #[test]
+    fn test_get_empty_block() {
+        let block = Block::new();
+        assert_eq!(block.get(0), None);
+        assert_eq!(block.get(1), None);
+    }
+
+    #[test]
+    fn test_get_single_entry() {
+        let mut block = Block::new();
+        let entry = [1, 2, 3, 4];
+        block.add_entry(&entry).unwrap();
+
+        assert_eq!(block.get(0), Some(&entry[..]));
+        assert_eq!(block.get(1), None);
+    }
+
+    #[test]
+    fn test_get_multiple_entries() {
+        let mut block = Block::new();
+        let entry1 = [1, 2, 3, 4];
+        let entry2 = [5, 6, 7, 8];
+        let entry3 = [9, 10];
+
+        block.add_entry(&entry1).unwrap();
+        block.add_entry(&entry2).unwrap();
+        block.add_entry(&entry3).unwrap();
+
+        assert_eq!(block.get(0), Some(&entry1[..]));
+        assert_eq!(block.get(1), Some(&entry2[..]));
+        assert_eq!(block.get(2), Some(&entry3[..]));
+        assert_eq!(block.get(3), None);
+    }
+
+    #[test]
+    fn test_get_varying_sizes() {
+        let mut block = Block::new();
+        let entry1 = [1];
+        let entry2 = [2, 3, 4, 5, 6];
+        let entry3 = [7, 8, 9];
+
+        block.add_entry(&entry1).unwrap();
+        block.add_entry(&entry2).unwrap();
+        block.add_entry(&entry3).unwrap();
+
+        assert_eq!(block.get(0), Some(&entry1[..]));
+        assert_eq!(block.get(1), Some(&entry2[..]));
+        assert_eq!(block.get(2), Some(&entry3[..]));
+    }
+
+    #[test]
+    fn test_get_out_of_bounds() {
+        let mut block = Block::new();
+        block.add_entry(&[1, 2, 3]).unwrap();
+
+        assert_eq!(block.get(1), None);
+        assert_eq!(block.get(usize::MAX), None);
+    }
+
+    #[test]
+    fn test_get_matches_iterator() {
+        let mut block = Block::new();
+        let entries = vec![
+            vec![1, 2, 3],
+            vec![4, 5],
+            vec![6, 7, 8, 9],
+        ];
+
+        for entry in &entries {
+            block.add_entry(entry).unwrap();
+        }
+
+        // Verify get() matches iterator results
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(block.get(i), Some(entry.as_slice()));
+        }
     }
 }

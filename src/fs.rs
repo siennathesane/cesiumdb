@@ -47,7 +47,6 @@ use crate::{
             FsError,
             InvalidHeaderFormat,
             IoError,
-            MetadataGrowthError,
             NoFreeSpace,
         },
         FsError::{
@@ -58,12 +57,9 @@ use crate::{
             ReadOutOfBounds,
             StorageExhausted,
         },
-        MetadataGrowthError::{
-            InsufficientSpace,
-            NoAdjacentSpace,
-        },
     },
 };
+use crate::errs::FsError::{InsufficientSpace, NoAdjacentSpace};
 
 // TODO(@siennathesane): make this configurable
 const FLUSH_INTERVAL_SECS: u64 = 5;
@@ -601,10 +597,10 @@ impl Fs {
                     // Update header with new metadata size
                     header.metadata_size = new_size as u64;
                 } else {
-                    return Err(MetadataGrowthError(InsufficientSpace));
+                    return Err(FsError(InsufficientSpace));
                 }
             } else {
-                return Err(MetadataGrowthError(NoAdjacentSpace));
+                return Err(FsError(NoAdjacentSpace));
             }
         }
 

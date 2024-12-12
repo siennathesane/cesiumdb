@@ -4,7 +4,7 @@ A key-value store focused on performance, security, and stability.
 
 ## License
 
-CesiumDB is licensed under GPL v3.0 with the Class Path Exception. This means you can link to CesiumDB in your project without having to open source your project. So it's safe for corporate consumption, just not closed-source modification :simple_smile:
+CesiumDB is licensed under GPL v3.0 with the Class Path Exception. This means you can safely link to CesiumDB in your project. So it's safe for corporate consumption, just not closed-source modification :simple_smile:
 
 If you would like a non-GPL license, please reach out :simple_smile:
 

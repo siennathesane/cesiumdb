@@ -24,6 +24,8 @@ use crate::{
     errs::CesiumError,
     stats::STATS,
 };
+use crate::errs::CesiumError::FsError;
+use crate::errs::FsError::{SegmentFull, SegmentSizeInvalid};
 use crate::fs::Fs;
 
 pub(crate) struct SegmentWriter {
@@ -40,7 +42,7 @@ pub(crate) struct SegmentWriter {
 impl SegmentWriter {
     pub(crate) fn new(fs: Arc<Fs>, segment_size: u64) -> Result<Self, CesiumError> {
         if segment_size % BLOCK_SIZE as u64 != 0 {
-            return Err(CesiumError::SegmentSizeInvalid);
+            return Err(FsError(SegmentSizeInvalid));
         }
 
         // Create a new frange for this segment
@@ -120,7 +122,7 @@ impl SegmentWriter {
     pub(crate) fn write(&mut self, block: Block) -> Result<(), CesiumError> {
         if self.blocks_left.load(Relaxed) == 0 {
             self.segment_full.store(true, Relaxed);
-            return Err(CesiumError::SegmentFull);
+            return Err(FsError(SegmentFull));
         }
 
         self.block_queue.push(block);
@@ -280,7 +282,7 @@ mod tests {
         assert!(writer.write(block2).is_ok());
         assert!(matches!(
             writer.write(block3).unwrap_err(),
-            CesiumError::SegmentFull
+            FsError(SegmentFull)
         ));
     }
 

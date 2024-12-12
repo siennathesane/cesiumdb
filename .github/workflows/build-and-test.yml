@@ -1,0 +1,52 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+name: Build & Test
+
+jobs:
+  test:
+    name: Collect test coverage
+    runs-on: ubuntu-latest
+    # nightly rust might break from time to time
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2 # v2
+      - name: Install latest nextest release
+        uses: taiki-e/install-action@v2 # v2
+        with:
+          tool: nextest
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2 # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo nextest run
+      - name: Collect coverage data
+        run: |
+          cargo llvm-cov --no-report nextest
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Upload coverage data to codecov
+        uses: codecov/codecov-action@v5 # v5
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: lcov.info
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/nextest/ci/junit.xml

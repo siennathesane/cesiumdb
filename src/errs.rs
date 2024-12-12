@@ -17,28 +17,12 @@ pub enum CesiumError {
     BlockFull,
     #[error("entry is too large for block")]
     TooLargeForBlock,
-    #[error("segment is full")]
-    SegmentFull,
-    #[error("segment must be multiple of 4096")]
-    SegmentSizeInvalid,
     #[error("no free space available")]
     NoFreeSpace,
     #[error("invalid header format")]
     InvalidHeaderFormat(String),
-    #[error("metadata growth error")]
-    MetadataGrowthError(MetadataGrowthError),
     #[error("fs error")]
     FsError(FsError),
-}
-
-#[derive(Error, Debug)]
-pub enum MetadataGrowthError {
-    #[error("no adjacent space available, can't find a free range after metadata")]
-    NoAdjacentSpace,
-    #[error("adjacent space isn't big enough")]
-    InsufficientSpace,
-    #[error("metadata too large")]
-    MetadataTooLarge,
 }
 
 #[derive(Error, Debug)]
@@ -59,4 +43,18 @@ pub enum FsError {
     FRangeStillOpen,
     #[error("read out of bounds")]
     ReadOutOfBounds,
+    #[error("block index out of bounds")]
+    BlockIndexOutOfBounds,
+    #[error("segment is full")]
+    SegmentFull,
+    #[error("segment must be multiple of 4096")]
+    SegmentSizeInvalid,
+    #[error("no adjacent space available, can't find a free range after metadata")]
+    NoAdjacentSpace,
+    #[error("adjacent space isn't big enough")]
+    InsufficientSpace,
+    #[error("metadata too large")]
+    MetadataTooLarge,
+    #[error("block is corrupted")]
+    CorruptedBlock,
 }
