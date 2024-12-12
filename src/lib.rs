@@ -1,16 +1,14 @@
 // Copyright (c) Sienna Satterwhite, CesiumDB Contributors
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
-#![cfg(target_arch = "aarch64")]
-#![feature(integer_atomics)]
-
+#![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
 #![allow(dead_code)] // TODO(@siennathesane): remove before release
 #![allow(unused)] // TODO(@siennathesane): remove before release
 
 #[cfg(not(unix))]
-compile_error!("this crate won't work on non-unix platforms, sorry");
+compile_warn!("cesiumdb is not tested on windows");
 #[cfg(not(target_pointer_width = "64"))]
-compile_warn!("this crate is not tested on 32-bit systems");
+compile_warn!("cesiumdb is not tested on 32-bit systems");
 
 #[allow(unused)]
 use std::sync::Arc;
