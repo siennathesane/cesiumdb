@@ -43,11 +43,9 @@ jobs:
         uses: taiki-e/install-action@v2 # v2
         with:
           tool: cargo-llvm-cov
-      - name: Test
-        run: cargo nextest run
-      - name: Collect coverage data
+      - name: Test with coverage
         run: |
-          cargo llvm-cov --no-report nextest
+          cargo llvm-cov --no-report nextest --profile ci
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload coverage data to codecov
         uses: codecov/codecov-action@v5 # v5
