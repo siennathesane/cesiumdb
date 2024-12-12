@@ -1,10 +1,10 @@
 on:
   push:
     branches:
-      - main
+      - mainline
   pull_request:
     branches:
-      - main
+      - mainline
 
 name: Build & Test
 
