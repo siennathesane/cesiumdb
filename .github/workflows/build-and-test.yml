@@ -45,6 +45,7 @@ jobs:
           tool: cargo-llvm-cov
       - name: Test with coverage
         run: |
+          cargo nextest --profile ci run
           cargo llvm-cov --no-report nextest --profile ci
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload coverage data to codecov
