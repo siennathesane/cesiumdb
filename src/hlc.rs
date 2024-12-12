@@ -196,7 +196,7 @@ impl AtomicU128 {
 
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
-mod tests {
+mod x86_atomic_tests {
     use std::{
         sync::Arc,
         thread,
