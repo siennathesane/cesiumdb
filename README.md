@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/gh/siennathesane/cesiumdb/graph/badge.svg?token=D7RBD3OX2U)](https://codecov.io/gh/siennathesane/cesiumdb)
+
 # CesiumDB
 
 A key-value store focused on performance, security, and stability.
