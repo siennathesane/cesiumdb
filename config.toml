@@ -1,7 +1,7 @@
 [build]
 rustflags = [
-    "-Awarnings,unused",
-    "-Ctarget-cpu=native"
+    "-A warnings,unused",
+    "-C target-cpu=native"
 ]
 
 [unstable]
