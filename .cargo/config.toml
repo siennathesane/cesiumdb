@@ -1,14 +1,13 @@
 [build]
 rustflags = [
-    "-A warnings,unused",
-    "-C target-cpu=native"
+    "-C",
+    "target-cpu=native"
 ]
 
 [unstable]
 codegen-backend = true
 
 [profile.dev]
-codegen-backend = "cranelift"
 codegen-units = 256
 debug = true
 debug-assertions = true
