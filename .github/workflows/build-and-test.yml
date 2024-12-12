@@ -9,8 +9,18 @@ on:
 name: Build & Test
 
 jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
   test:
-    name: Collect test coverage
+    name: Test
     runs-on: ubuntu-latest
     # nightly rust might break from time to time
     continue-on-error: true
@@ -30,8 +40,6 @@ jobs:
         uses: taiki-e/install-action@v2 # v2
         with:
           tool: cargo-llvm-cov
-      - name: Build
-        run: cargo build --release
       - name: Test
         run: cargo nextest run
       - name: Collect coverage data
