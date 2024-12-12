@@ -372,9 +372,11 @@ mod tests {
             KeyBytes,
             ValueBytes,
         },
-        utils::Serializer,
+        utils::{
+            Deserializer,
+            Serializer,
+        },
     };
-    use crate::utils::Deserializer;
 
     #[test]
     fn test_key_serialization() {

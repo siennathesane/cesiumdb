@@ -1,4 +1,5 @@
 use std::fs::File;
+
 use bytes::Bytes;
 
 pub(crate) struct SBTable {
@@ -28,20 +29,20 @@ pub(crate) struct Entry {
 impl Entry {
     pub(crate) fn new(hash: u64, block: u64) -> Self {
         Self { hash, block }
-    }    
-    
+    }
+
     pub(crate) fn hash(&self) -> u64 {
         self.hash
     }
-    
+
     pub(crate) fn set_hash(&mut self, hash: u64) {
         self.hash = hash;
     }
-    
+
     pub(crate) fn block(&self) -> u64 {
         self.block
     }
-    
+
     pub(crate) fn set_block(&mut self, block: u64) {
         self.block = block;
     }

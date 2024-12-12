@@ -1,11 +1,12 @@
 // Copyright (c) Sienna Satterwhite, CesiumDB Contributors
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
+#[cfg(target_arch = "aarch64")]
+use std::sync::atomic::AtomicU128 as StdAtomicU128;
 use std::{
     sync::{
         atomic::{
             AtomicBool,
-            AtomicU128 as StdAtomicU128,
             Ordering::Relaxed,
         },
         Arc,

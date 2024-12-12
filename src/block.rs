@@ -1,9 +1,13 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{
+    BufMut,
+    Bytes,
+    BytesMut,
+};
 
 use crate::{
     errs::CesiumError,
+    utils::Deserializer,
 };
-use crate::utils::Deserializer;
 
 pub(crate) const BLOCK_SIZE: usize = 4096;
 pub(crate) const ENTRY_SIZE: usize = size_of::<u16>();
@@ -11,7 +15,8 @@ const MAX_ENTRIES: usize = BLOCK_SIZE / ENTRY_SIZE;
 
 /// A single block of data in the table. The block is a fixed size and is
 /// divided into two parts:
-/// 1. The offsets: a list of 4-byte integers that point to the start of each entry in the block.
+/// 1. The offsets: a list of 4-byte integers that point to the start of each
+///    entry in the block.
 /// 2. The entries: the actual data stored in the block.
 pub(crate) struct Block {
     /// The number of entries in the block.
@@ -33,7 +38,8 @@ impl Block {
         }
     }
 
-    /// Add an entry to the block. If the block is full, an error will be returned.
+    /// Add an entry to the block. If the block is full, an error will be
+    /// returned.
     pub(crate) fn add_entry(&mut self, entry: &[u8]) -> Result<(), CesiumError> {
         // check if the entry itself is too large to fit in an empty block
         if entry.len() + size_of::<u16>() > BLOCK_SIZE {
@@ -77,31 +83,27 @@ impl Block {
         std::ptr::copy_nonoverlapping(
             self.num_entries.to_le_bytes().as_ptr(),
             dst,
-            size_of::<u16>()
+            size_of::<u16>(),
         );
 
         // write offsets
         std::ptr::copy_nonoverlapping(
             self.offsets.as_ptr(),
             dst.add(size_of::<u16>()),
-            self.offsets.len()
+            self.offsets.len(),
         );
 
         // write entries
         std::ptr::copy_nonoverlapping(
             self.entries.as_ptr(),
             dst.add(size_of::<u16>() + self.offsets.len()),
-            self.entries.len()
+            self.entries.len(),
         );
 
         // zero remaining space
         let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
         if written < BLOCK_SIZE {
-            std::ptr::write_bytes(
-                dst.add(written),
-                0,
-                BLOCK_SIZE - written
-            );
+            std::ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
         }
     }
 
@@ -116,18 +118,12 @@ impl Block {
             0
         } else {
             let offset_idx = (index - 1) * 2;
-            u16::from_le_bytes([
-                self.offsets[offset_idx],
-                self.offsets[offset_idx + 1]
-            ]) as usize
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
         };
 
         let end_offset = if index < self.num_entries as usize - 1 {
             let offset_idx = index * 2;
-            u16::from_le_bytes([
-                self.offsets[offset_idx],
-                self.offsets[offset_idx + 1]
-            ]) as usize
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
         } else {
             self.entries.len()
         };
@@ -195,7 +191,7 @@ impl Deserializer for Block {
             // Calculate entries size using last offset
             let last_offset = u16::from_le_bytes([
                 offsets_data[offsets_data.len() - 2],
-                offsets_data[offsets_data.len() - 1]
+                offsets_data[offsets_data.len() - 1],
             ]) as usize;
 
             // Copy entries data
@@ -238,19 +234,13 @@ impl<'a> Iterator for BlockIterator<'a> {
             0
         } else {
             let offset_idx = (self.current - 1) * 2;
-            u16::from_le_bytes([
-                self.offsets[offset_idx],
-                self.offsets[offset_idx + 1]
-            ]) as usize
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
         };
 
         // Get the end offset (either from next entry or end of entries)
         let end_offset = if self.current < self.num_entries as usize {
             let offset_idx = self.current * 2;
-            u16::from_le_bytes([
-                self.offsets[offset_idx],
-                self.offsets[offset_idx + 1]
-            ]) as usize
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
         } else {
             self.entries.len()
         };
@@ -293,14 +283,20 @@ mod tests {
     fn test_add_entry_block_full() {
         let mut block = Block::new();
         let entry = [0u8; BLOCK_SIZE];
-        assert!(matches!(block.add_entry(&entry), Err(CesiumError::TooLargeForBlock)));
+        assert!(matches!(
+            block.add_entry(&entry),
+            Err(CesiumError::TooLargeForBlock)
+        ));
     }
 
     #[test]
     fn test_add_entry_too_large_for_block() {
         let mut block = Block::new();
         let entry = vec![0u8; BLOCK_SIZE - size_of::<u16>() + 1];
-        assert!(matches!(block.add_entry(&entry), Err(CesiumError::TooLargeForBlock)));
+        assert!(matches!(
+            block.add_entry(&entry),
+            Err(CesiumError::TooLargeForBlock)
+        ));
     }
 
     #[test]
@@ -319,7 +315,8 @@ mod tests {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
         block.add_entry(&entry).unwrap();
-        let expected_remaining = BLOCK_SIZE - (size_of::<u16>() + block.offsets.len() + block.entries.len());
+        let expected_remaining =
+            BLOCK_SIZE - (size_of::<u16>() + block.offsets.len() + block.entries.len());
         assert_eq!(block.remaining_space(), expected_remaining);
     }
 
@@ -389,7 +386,10 @@ mod tests {
         }
         assert_eq!(buffer.len(), BLOCK_SIZE);
         assert_eq!(buffer[0..2], (1u16).to_le_bytes());
-        assert_eq!(buffer[2..4], ((BLOCK_SIZE - MAX_ENTRIES) as u16).to_le_bytes());
+        assert_eq!(
+            buffer[2..4],
+            ((BLOCK_SIZE - MAX_ENTRIES) as u16).to_le_bytes()
+        );
         // assert_eq!(buffer[4..BLOCK_SIZE], entry);
     }
 
@@ -496,7 +496,7 @@ mod tests {
 
         // Entry data
         data.put_slice(b"hello"); // first entry
-        data.put_slice(b"123");   // second entry
+        data.put_slice(b"123"); // second entry
         data.resize(BLOCK_SIZE, 0);
 
         let block = Block::deserialize_from_storage(data.freeze());
@@ -567,11 +567,7 @@ mod tests {
     #[test]
     fn test_get_matches_iterator() {
         let mut block = Block::new();
-        let entries = vec![
-            vec![1, 2, 3],
-            vec![4, 5],
-            vec![6, 7, 8, 9],
-        ];
+        let entries = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9]];
 
         for entry in &entries {
             block.add_entry(entry).unwrap();

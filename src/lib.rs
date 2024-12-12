@@ -1,9 +1,12 @@
 // Copyright (c) Sienna Satterwhite, CesiumDB Contributors
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
+#![cfg(target_arch = "aarch64")]
 #![feature(integer_atomics)]
+
 #![allow(dead_code)] // TODO(@siennathesane): remove before release
 #![allow(unused)] // TODO(@siennathesane): remove before release
+
 #[cfg(not(unix))]
 compile_error!("this crate won't work on non-unix platforms, sorry");
 #[cfg(not(target_pointer_width = "64"))]
@@ -43,19 +46,19 @@ use crate::{
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+mod block;
 pub mod errs;
+pub mod fs;
 pub mod hlc;
 pub mod keypair;
 pub mod memtable;
 pub mod merge;
 pub mod peek;
+mod sbtable;
+mod segment_writer;
 pub(crate) mod state;
 mod stats;
-mod sbtable;
 mod utils;
-mod block;
-mod segment_writer;
-pub mod fs;
 // mod segment_reader;
 
 /// The core Cesium database! The API is simple by design, and focused on

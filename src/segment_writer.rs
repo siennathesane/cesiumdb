@@ -21,12 +21,17 @@ use crate::{
         Block,
         BLOCK_SIZE,
     },
-    errs::CesiumError,
+    errs::{
+        CesiumError,
+        CesiumError::FsError,
+        FsError::{
+            SegmentFull,
+            SegmentSizeInvalid,
+        },
+    },
+    fs::Fs,
     stats::STATS,
 };
-use crate::errs::CesiumError::FsError;
-use crate::errs::FsError::{SegmentFull, SegmentSizeInvalid};
-use crate::fs::Fs;
 
 pub(crate) struct SegmentWriter {
     fs: Arc<Fs>,
@@ -258,8 +263,8 @@ mod tests {
 
         // Should be able to delete if properly closed
         match fs.delete_frange(frange_id) {
-            Ok(_) => {},
-            Err(e) => panic!("Failed to delete frange: {:?}", e)
+            | Ok(_) => {},
+            | Err(e) => panic!("Failed to delete frange: {:?}", e),
         }
     }
 
@@ -448,8 +453,8 @@ mod tests {
 
         // Should be able to delete if properly closed
         match fs.delete_frange(frange_id) {
-            Ok(_) => {},
-            Err(e) => panic!("Failed to delete frange: {:?}", e)
+            | Ok(_) => {},
+            | Err(e) => panic!("Failed to delete frange: {:?}", e),
         }
     }
 }

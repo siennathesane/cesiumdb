@@ -1,27 +1,34 @@
-use std::{io::{
-    Error,
-    ErrorKind::{
-        AlreadyExists,
-        InvalidInput,
-    },
-}, ops::Range, ptr, sync::{
-    atomic,
-    atomic::{
-        fence,
-        AtomicU64,
-        Ordering::{
-            AcqRel,
-            Acquire,
-            Relaxed,
-            SeqCst,
+use std::{
+    io::{
+        Error,
+        ErrorKind::{
+            AlreadyExists,
+            InvalidInput,
         },
     },
-    Arc,
-}, time::{
-    SystemTime,
-    UNIX_EPOCH,
-}};
-use std::mem::ManuallyDrop;
+    mem::ManuallyDrop,
+    ops::Range,
+    ptr,
+    sync::{
+        atomic,
+        atomic::{
+            fence,
+            AtomicU64,
+            Ordering::{
+                AcqRel,
+                Acquire,
+                Relaxed,
+                SeqCst,
+            },
+        },
+        Arc,
+    },
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
+
 use bytes::{
     Buf,
     BufMut,
@@ -54,12 +61,13 @@ use crate::{
             FRangeNotFound,
             FRangeStillOpen,
             FragmentationLimit,
+            InsufficientSpace,
+            NoAdjacentSpace,
             ReadOutOfBounds,
             StorageExhausted,
         },
     },
 };
-use crate::errs::FsError::{InsufficientSpace, NoAdjacentSpace};
 
 // TODO(@siennathesane): make this configurable
 const FLUSH_INTERVAL_SECS: u64 = 5;
@@ -1154,8 +1162,8 @@ impl<'fs> Drop for FRangeHandle<'fs> {
         {
             let franges = self.fs.franges.write();
             match franges.get(&self.metadata.id) {
-                None => {},
-                Some(entry) => {
+                | None => {},
+                | Some(entry) => {
                     let mut updated = entry.value().clone();
                     updated.modified_at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1166,7 +1174,7 @@ impl<'fs> Drop for FRangeHandle<'fs> {
                 },
             };
         }
-        
+
         {
             let mut open_franges = self.fs.open_franges.write();
             open_franges.remove(&self.metadata.id);
