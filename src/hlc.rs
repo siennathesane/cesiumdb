@@ -352,25 +352,57 @@ mod x86_atomic_tests {
     #[test]
     fn test_ordering_combinations() {
         let atomic = AtomicU128::new(0);
-        let orderings = [
+
+        // Valid store orderings
+        let store_orderings = [
             Ordering::SeqCst,
             Ordering::Release,
-            Ordering::Acquire,
-            Ordering::AcqRel,
             Ordering::Relaxed,
         ];
 
-        for &store_order in &orderings {
-            for &load_order in &orderings {
+        // Valid load orderings
+        let load_orderings = [
+            Ordering::SeqCst,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ];
+
+        for &store_order in &store_orderings {
+            for &load_order in &load_orderings {
                 atomic.store(42, store_order);
                 assert_eq!(atomic.load(load_order), 42);
             }
         }
 
-        // Test compare_exchange with different ordering combinations
-        for &success_order in &orderings {
-            for &failure_order in &orderings {
-                let _ = atomic.compare_exchange(42, 100, success_order, failure_order);
+        // Test compare_exchange with valid ordering combinations
+        let success_orderings = [
+            Ordering::SeqCst,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ];
+
+        // Failure ordering must be no stronger than success and cannot be Release or AcqRel
+        let failure_orderings = [
+            Ordering::SeqCst,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ];
+
+        for &success_order in &success_orderings {
+            for &failure_order in &failure_orderings {
+                // Skip invalid combinations where failure is stronger than success
+                if (failure_order == Ordering::SeqCst && success_order != Ordering::SeqCst) {
+                    continue;
+                }
+
+                let _ = atomic.compare_exchange(
+                    42,
+                    100,
+                    success_order,
+                    failure_order,
+                );
             }
         }
     }
