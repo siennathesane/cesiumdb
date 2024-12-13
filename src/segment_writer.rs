@@ -1,20 +1,18 @@
-use std::{
-    sync::{
-        atomic::{
-            AtomicBool,
-            AtomicUsize,
-            Ordering::Relaxed,
-        },
-        Arc,
+use std::{marker, mem, sync::{
+    atomic::{
+        AtomicBool,
+        AtomicUsize,
+        Ordering::Relaxed,
     },
-    thread,
-};
-
+    Arc,
+}, thread};
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use bytes::BytesMut;
 use crossbeam_queue::SegQueue;
-use parking_lot::{
-    Condvar,
-    Mutex,
-};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::{
     block::{
@@ -32,10 +30,10 @@ use crate::{
     fs::Fs,
     stats::STATS,
 };
+use crate::fs::FRangeHandle;
 
 pub(crate) struct SegmentWriter {
-    fs: Arc<Fs>,
-    frange_id: u64,
+    handle: Arc<FRangeHandle>,
     blocks_left: Arc<AtomicUsize>,
     block_queue: Arc<SegQueue<Block>>,
     segment_full: Arc<AtomicBool>,
@@ -45,13 +43,11 @@ pub(crate) struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    pub(crate) fn new(fs: Arc<Fs>, segment_size: u64) -> Result<Self, CesiumError> {
+    pub(crate) fn new(handle: Arc<FRangeHandle>) -> Result<Self, CesiumError> {
+        let segment_size = handle.capacity();
         if segment_size % BLOCK_SIZE as u64 != 0 {
             return Err(FsError(SegmentSizeInvalid));
         }
-
-        // Create a new frange for this segment
-        let frange_id = fs.create_frange(segment_size)?;
 
         let blocks_left = Arc::new(AtomicUsize::new(segment_size as usize / BLOCK_SIZE));
         let done = Arc::new(AtomicBool::new(false));
@@ -62,50 +58,44 @@ impl SegmentWriter {
 
         let done_clone = done.clone();
         let queue_clone = queue.clone();
-        let segment_full_clone = segment_full.clone();
-        let fs_clone = fs.clone();
+        let handle_clone = handle.clone();
         let completion_mutex_clone = completion_mutex.clone();
         let completion_condvar_clone = completion_condvar.clone();
-        let frange_id_clone = frange_id;
 
         // Spawn the worker thread
         thread::spawn(move || {
+            println!("Worker thread started"); // Debug
             let mut current_offset = 0;
-            let mut frange = match fs_clone.open_frange(frange_id_clone) {
-                | Ok(handle) => handle,
-                | Err(_) => {
-                    // Handle error by notifying waiting threads and returning
-                    let _guard = completion_mutex_clone.lock();
-                    completion_condvar_clone.notify_one();
-                    STATS.current_threads.fetch_sub(1, Relaxed);
-                    return;
-                },
-            };
 
             loop {
                 if let Some(block) = queue_clone.pop() {
+                    println!("Processing block at offset {}", current_offset); // Debug
+
                     // Create a buffer for the block data
-                    let mut buffer = vec![0u8; BLOCK_SIZE];
+                    let mut buffer = BytesMut::with_capacity(BLOCK_SIZE);
+                    buffer.resize(BLOCK_SIZE, 0); // Important: resize buffer to full block size
+
                     unsafe {
                         block.finalize(buffer.as_mut_ptr());
                     }
+                    println!("Block finalized, first few bytes: {:?}", &buffer[..20]); // Debug
 
-                    // Write the block to the frange
-                    if let Err(_) = frange.write_at(current_offset, &buffer) {
+                    // Write the block to the handle
+                    if let Err(e) = handle_clone.write_at(current_offset, &buffer) {
+                        println!("Error writing block: {:?}", e); // Debug
                         break;
                     }
+                    println!("Block written successfully"); // Debug
 
                     current_offset += BLOCK_SIZE as u64;
                 } else if done_clone.load(Relaxed) {
-                    // No more blocks and we're done
+                    println!("Worker thread done signal received"); // Debug
                     break;
                 }
             }
 
-            // Close the frange before exiting
-            let _ = fs_clone.close_frange(frange);
-
-            // Notify completion after frange is closed
+            // Notify completion
+            println!("Worker thread completing"); // Debug
             let _guard = completion_mutex_clone.lock();
             completion_condvar_clone.notify_one();
             STATS.current_threads.fetch_sub(1, Relaxed);
@@ -113,8 +103,7 @@ impl SegmentWriter {
         STATS.current_threads.fetch_add(1, Relaxed);
 
         Ok(Self {
-            fs,
-            frange_id,
+            handle,
             blocks_left,
             block_queue: queue,
             done,
@@ -130,6 +119,7 @@ impl SegmentWriter {
             return Err(FsError(SegmentFull));
         }
 
+        println!("Adding block to queue"); // Debug
         self.block_queue.push(block);
         self.blocks_left.fetch_sub(1, Relaxed);
 
@@ -137,22 +127,28 @@ impl SegmentWriter {
     }
 
     pub(crate) fn shutdown(&self) {
+        println!("Shutting down writer"); // Debug
         self.done.store(true, Relaxed);
     }
 }
 
 impl Drop for SegmentWriter {
     fn drop(&mut self) {
+        println!("SegmentWriter being dropped"); // Debug
         // Signal the worker thread to finish
         self.done.store(true, Relaxed);
 
         {
+            println!("Waiting for worker to complete"); // Debug
             let mut guard = self.completion_mutex.lock();
             // Wait for both queue to be empty AND worker to finish
             while !self.block_queue.is_empty() || !self.done.load(Relaxed) {
                 self.completion_condvar.wait(&mut guard);
+                println!("Woke up from wait, queue empty: {}, done: {}",
+                         self.block_queue.is_empty(), self.done.load(Relaxed)); // Debug
             }
         }
+        println!("SegmentWriter dropped"); // Debug
     }
 }
 
@@ -163,16 +159,22 @@ mod tests {
         path::PathBuf,
         thread,
         time::Duration,
+        sync::Arc,
     };
 
     use memmap2::MmapMut;
     use rand::Rng;
     use tempfile::tempdir;
+    use parking_lot::RwLock;
 
     use super::*;
 
-    // Helper function to create a test filesystem
-    fn create_test_fs() -> (Arc<Fs>, PathBuf) {
+    struct TestContext {
+        handle: Arc<FRangeHandle>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn setup_fs() -> (Arc<Fs>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
 
@@ -183,13 +185,25 @@ mod tests {
             .open(&path)
             .unwrap();
 
-        file.set_len(1024 * 1024 * 10) // 10MB
-            .unwrap();
-
+        file.set_len(1024 * 1024 * 10).unwrap(); // 10MB
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
-        let fs = Arc::new(Fs::init(mmap).unwrap());
+        let fs = Fs::init(mmap).unwrap();
 
-        (fs, path)
+        (fs, dir)
+    }
+
+    // Helper function to create test context with required resources
+    // Update the test context to use Arc<Fs>
+    fn create_test_context(fs: &Arc<Fs>, size: u64) -> TestContext {
+        let dir = tempdir().unwrap();
+
+        let frange_id = fs.create_frange(size).unwrap();
+        let handle = fs.open_frange(frange_id).unwrap();
+
+        TestContext {
+            handle: Arc::new(handle),
+            _dir: dir,
+        }
     }
 
     fn create_test_block(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Block, CesiumError> {
@@ -205,6 +219,8 @@ mod tests {
         let num_entries = u16::from_le_bytes([data[0], data[1]]) as usize;
 
         if num_entries != expected_values.len() {
+            println!("Number of entries mismatch. Found: {}, Expected: {}",
+                     num_entries, expected_values.len());
             return false;
         }
 
@@ -226,6 +242,8 @@ mod tests {
             let entry_data = &data[entries_start + entry_start..entries_start + entry_end];
 
             if entry_data != expected_value {
+                println!("Entry {} mismatch. Found: {:?}, Expected: {:?}",
+                         i, entry_data, expected_value);
                 return false;
             }
         }
@@ -234,46 +252,61 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn test_basic_write_operation() {
-        let (fs, _path) = create_test_fs();
+        println!("Starting test_basic_write_operation");
         let segment_size = BLOCK_SIZE as u64 * 10;
+        let (fs, _dir) = setup_fs();
+        let fs = Arc::new(fs); // Wrap in Arc
+        let ctx = create_test_context(&fs, segment_size);
 
         let entries = vec![
             (vec![0u8; 1], vec![1u8; 100]), // Simple small entry
         ];
 
-        // Write data and get frange_id
-        let frange_id = {
-            let mut writer = SegmentWriter::new(fs.clone(), segment_size).unwrap();
-            let block = create_test_block(&entries).unwrap();
-            assert!(writer.write(block).is_ok());
-            writer.frange_id
-        }; // Writer dropped here, cleanup should happen
+        println!("Creating test block");
+        let block = create_test_block(&entries).unwrap();
 
-        // Verify written data
+        println!("Creating writer");
+        let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
+
+        println!("Writing block");
+        assert!(writer.write(block).is_ok());
+
+        println!("Shutting down writer");
+        writer.shutdown();
+
+        // Wait for writer to finish and properly sync
+        println!("Dropping writer to ensure completion");
+        drop(writer);
+
+        // Add a small delay to ensure filesystem sync
+        thread::sleep(Duration::from_millis(100));
+
+        println!("Reading back data");
         let mut buffer = vec![0u8; BLOCK_SIZE];
-        {
-            let frange = fs.open_frange(frange_id).unwrap();
-            assert!(frange.read_at(0, &mut buffer).is_ok());
-            drop(frange);
-        }
+        ctx.handle.read_at(0, &mut buffer).unwrap();
+
+        println!("First 20 bytes of buffer: {:?}", &buffer[..20]);
 
         let values: Vec<Vec<u8>> = entries.iter().map(|(_, value)| value.clone()).collect();
-        assert!(verify_block_contents(&buffer, &values));
+        println!("Expected values len: {}", values[0].len());
+        println!("Expected first 20 bytes: {:?}", &values[0][..20]);
 
-        // Should be able to delete if properly closed
-        match fs.delete_frange(frange_id) {
-            | Ok(_) => {},
-            | Err(e) => panic!("Failed to delete frange: {:?}", e),
-        }
+        assert!(verify_block_contents(&buffer, &values),
+                "Block contents verification failed\nBuffer: {:?}\nExpected values: {:?}",
+                &buffer[..20],
+                &values
+        );
     }
 
     #[test]
     fn test_segment_full() {
-        let (fs, _path) = create_test_fs();
         let segment_size = BLOCK_SIZE as u64 * 2; // Only 2 blocks
+        let (fs, _dir) = setup_fs();
+        let ctx = create_test_context(&fs, segment_size);
 
-        let mut writer = SegmentWriter::new(fs, segment_size).unwrap();
+        let mut writer = SegmentWriter::new(ctx.handle).unwrap();
 
         // Create test entries that fill blocks
         let test_entries = vec![(vec![1u8; 2000], vec![2u8; 1000])]; // Large entries
@@ -289,14 +322,17 @@ mod tests {
             writer.write(block3).unwrap_err(),
             FsError(SegmentFull)
         ));
+
+        writer.shutdown();
     }
 
     #[test]
     fn test_concurrent_writes() {
-        let (fs, _path) = create_test_fs();
         let segment_size = BLOCK_SIZE as u64 * 100; // 100 blocks
+        let (fs, _dir) = setup_fs();
+        let ctx = create_test_context(&fs, segment_size);
 
-        let writer = Arc::new(Mutex::new(SegmentWriter::new(fs, segment_size).unwrap()));
+        let writer = Arc::new(Mutex::new(SegmentWriter::new(ctx.handle).unwrap()));
         let mut handles = vec![];
 
         for thread_id in 0..10 {
@@ -321,16 +357,17 @@ mod tests {
         }
 
         let writer = writer.lock();
-        assert_eq!(writer.blocks_left.load(Relaxed), 50); // 100 - (10 threads *
-                                                          // 5 blocks)
+        assert_eq!(writer.blocks_left.load(Relaxed), 50); // 100 - (10 threads * 5 blocks)
+        writer.shutdown();
     }
 
     #[test]
     fn test_block_queue_ordering() {
-        let (fs, _path) = create_test_fs();
         let segment_size = BLOCK_SIZE as u64 * 10;
+        let (fs, _dir) = setup_fs();
+        let ctx = create_test_context(&fs, segment_size);
 
-        let mut writer = SegmentWriter::new(fs.clone(), segment_size).unwrap();
+        let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
         let mut expected_entries = Vec::new();
 
         // Write blocks with sequential numbers
@@ -354,20 +391,17 @@ mod tests {
 
         // Read back and verify order
         {
-            let frange = fs.open_frange(writer.frange_id).unwrap();
+            let handle = ctx.handle;
             let mut results = Vec::new();
 
             for i in 0..5 {
                 let mut buffer = vec![0u8; BLOCK_SIZE];
-                assert!(frange.read_at(i * BLOCK_SIZE as u64, &mut buffer).is_ok());
+                assert!(handle.read_at(i * BLOCK_SIZE as u64, &mut buffer).is_ok());
 
                 // Extract just the value for verification
                 let values = vec![expected_entries[i as usize].1.clone()];
                 results.push(verify_block_contents(&buffer, &values));
             }
-
-            // Drop frange before assertions
-            drop(frange);
 
             // Now verify all results
             for result in results {
@@ -378,19 +412,34 @@ mod tests {
 
     #[test]
     fn test_stress_write() {
-        let (fs, _path) = create_test_fs();
-        let segment_size = BLOCK_SIZE as u64 * 1000; // 1000 blocks
+        let segment_size = BLOCK_SIZE as u64 * 100; // 100 blocks
+        let (fs, _dir) = setup_fs();
 
-        let writer = Arc::new(Mutex::new(SegmentWriter::new(fs, segment_size).unwrap()));
+        let frange_id = fs.create_frange(segment_size).unwrap();
+        let handle = fs.open_frange(frange_id).unwrap();
+        let handle = Arc::new(handle);
+
+        let writer = Arc::new(Mutex::new(SegmentWriter::new(handle).unwrap()));
         let mut handles = vec![];
 
-        // Spawn 20 threads writing 50 blocks each
-        for thread_id in 0..20 {
+        let total_threads = 10;
+        let blocks_per_thread = 5;  // Reduced from 50 to ensure we don't overflow
+        let total_blocks = total_threads * blocks_per_thread;
+
+        // Verify we have enough space
+        assert!(segment_size >= (total_blocks * BLOCK_SIZE) as u64);
+
+        // Track errors across threads
+        let error_count = Arc::new(AtomicUsize::new(0));
+
+        for thread_id in 0..total_threads {
             let writer_clone = writer.clone();
+            let error_count = error_count.clone();
+
             let handle = thread::spawn(move || {
                 let mut rng = rand::thread_rng();
-                for i in 0..50 {
-                    // Create entries with random sizes
+                for i in 0..blocks_per_thread {
+                    // Create entries with random sizes but ensure they fit in a block
                     let key_size = rng.gen_range(1..100);
                     let value_size = rng.gen_range(1..1000);
 
@@ -399,11 +448,21 @@ mod tests {
                     rng.fill(&mut value[..]);
 
                     let entries = vec![(key, value)];
-                    let block = create_test_block(&entries).unwrap();
+                    match create_test_block(&entries) {
+                        Ok(block) => {
+                            let mut writer = writer_clone.lock();
+                            if writer.write(block).is_err() {
+                                error_count.fetch_add(1, Relaxed);
+                                break; // Exit if we hit an error
+                            }
+                        },
+                        Err(_) => {
+                            error_count.fetch_add(1, Relaxed);
+                            break;
+                        }
+                    }
 
-                    let mut writer = writer_clone.lock();
-                    assert!(writer.write(block).is_ok());
-
+                    // Small random sleep to increase concurrency variations
                     if rng.gen_ratio(1, 10) {
                         thread::sleep(Duration::from_millis(1));
                     }
@@ -412,49 +471,49 @@ mod tests {
             handles.push(handle);
         }
 
+        // Wait for all threads
         for handle in handles {
             handle.join().unwrap();
         }
 
+        // Get the final writer state
         let writer = writer.lock();
         writer.shutdown();
 
-        assert_eq!(writer.blocks_left.load(Relaxed), 1000 - (20 * 50));
+        // Verify results
+        assert_eq!(error_count.load(Relaxed), 0, "Some threads encountered errors");
+        assert_eq!(
+            writer.blocks_left.load(Relaxed),
+            segment_size as usize / BLOCK_SIZE - total_blocks
+        );
     }
 
     #[test]
     fn test_multiple_entry_block() {
-        let (fs, _path) = create_test_fs();
         let segment_size = BLOCK_SIZE as u64 * 10;
+        let (fs, _dir) = setup_fs();
+        let ctx = create_test_context(&fs, segment_size);
 
         let entries = vec![
             (vec![1u8; 1000], vec![2u8; 1000]),
             (vec![3u8; 500], vec![4u8; 500]),
         ];
 
-        // Get the frange id and write data
-        let frange_id = {
-            let mut writer = SegmentWriter::new(fs.clone(), segment_size).unwrap();
-            let block = create_test_block(&entries).unwrap();
-            assert!(writer.write(block).is_ok());
-            writer.frange_id
-        }; // Writer is dropped here, should handle cleanup
+        // Write data
+        let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
+        let block = create_test_block(&entries).unwrap();
+        assert!(writer.write(block).is_ok());
+        writer.shutdown();
+        drop(writer);
 
         // Verify written data
         let mut buffer = vec![0u8; BLOCK_SIZE];
         {
-            let frange = fs.open_frange(frange_id).unwrap();
-            assert!(frange.read_at(0, &mut buffer).is_ok());
-            drop(frange);
+            let handle = ctx.handle;
+            assert!(handle.read_at(0, &mut buffer).is_ok());
         }
 
         let values: Vec<Vec<u8>> = entries.iter().map(|(_, value)| value.clone()).collect();
         assert!(verify_block_contents(&buffer, &values));
-
-        // Should be able to delete if properly closed
-        match fs.delete_frange(frange_id) {
-            | Ok(_) => {},
-            | Err(e) => panic!("Failed to delete frange: {:?}", e),
-        }
     }
 }

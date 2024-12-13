@@ -1,3 +1,4 @@
+use std::ptr;
 use bytes::{
     BufMut,
     Bytes,
@@ -80,21 +81,21 @@ impl Block {
     /// - dst must not overlap with any source data
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
         // write num_entries
-        std::ptr::copy_nonoverlapping(
+        ptr::copy_nonoverlapping(
             self.num_entries.to_le_bytes().as_ptr(),
             dst,
             size_of::<u16>(),
         );
 
         // write offsets
-        std::ptr::copy_nonoverlapping(
+        ptr::copy_nonoverlapping(
             self.offsets.as_ptr(),
             dst.add(size_of::<u16>()),
             self.offsets.len(),
         );
 
         // write entries
-        std::ptr::copy_nonoverlapping(
+        ptr::copy_nonoverlapping(
             self.entries.as_ptr(),
             dst.add(size_of::<u16>() + self.offsets.len()),
             self.entries.len(),
@@ -103,7 +104,7 @@ impl Block {
         // zero remaining space
         let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
         if written < BLOCK_SIZE {
-            std::ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
+            ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
         }
     }
 

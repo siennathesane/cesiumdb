@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-
+use std::sync::Arc;
 use cesiumdb::fs::{
     CompactionConfig,
     Fs,
@@ -23,7 +23,7 @@ use tempfile::tempdir;
 const BENCH_FILE_SIZE: u64 = 1024 * 1024 * 256; // 256MB for benchmarking
 const FRAG_BENCH_SIZE: u64 = 1024 * 1024 * 1024 * 1; // 1GB for fragmentation tests
 
-fn setup_benchmark_fs() -> (Fs, tempfile::TempDir) {
+fn setup_benchmark_fs() -> (Arc<Fs>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench.db");
 
@@ -41,7 +41,7 @@ fn setup_benchmark_fs() -> (Fs, tempfile::TempDir) {
     (fs, dir)
 }
 
-fn setup_fragmented_fs(fragmentation_level: u32) -> (Fs, tempfile::TempDir) {
+fn setup_fragmented_fs(fragmentation_level: u32) -> (Arc<Fs>, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bench.db");
 
@@ -534,15 +534,15 @@ fn benchmark_compaction(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    // benchmark_frange_creation,
-    // benchmark_sequential_write,
-    // benchmark_random_write,
-    // benchmark_sequential_read,
-    // benchmark_random_read,
-    // benchmark_mixed_workload,
-    // benchmark_fragmentation,
-    // benchmark_fragmentation_impact,
+    benchmark_frange_creation,
+    benchmark_sequential_write,
+    benchmark_random_write,
+    benchmark_sequential_read,
+    benchmark_random_read,
+    benchmark_mixed_workload,
+    benchmark_fragmentation,
+    benchmark_fragmentation_impact,
     benchmark_compaction,
-    // benchmark_concurrent_access,
+    benchmark_concurrent_access,
 );
 criterion_main!(benches);

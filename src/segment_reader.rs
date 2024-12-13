@@ -36,21 +36,21 @@ impl Default for ReadConfig {
     }
 }
 
-pub(crate) struct SegmentReader<'a> {
-    frange: FRangeHandle<'a>,
+pub(crate) struct SegmentReader {
+    frange: FRangeHandle,
     num_blocks: usize,
     config: ReadConfig,
     // Cache for read-ahead blocks using a fixed-size queue
     cache: ArrayQueue<(usize, Block)>, // (block_index, block)
 }
 
-impl<'a> SegmentReader<'a> {
-    pub(crate) fn new(frange: FRangeHandle<'a>) -> Result<Self, CesiumError> {
+impl<'a> SegmentReader {
+    pub(crate) fn new(frange: FRangeHandle) -> Result<Self, CesiumError> {
         Self::with_config(frange, ReadConfig::default())
     }
 
     pub(crate) fn with_config(
-        frange: FRangeHandle<'a>,
+        frange: FRangeHandle,
         config: ReadConfig,
     ) -> Result<Self, CesiumError> {
         let segment_size = frange.capacity() as usize;
@@ -107,7 +107,7 @@ impl<'a> SegmentReader<'a> {
     }
 
     // TODO(@siennathesane): this feels weird and out of place
-    pub(crate) fn iter<'b>(&'b mut self) -> SegmentBlockIterator<'a, 'b> {
+    pub(crate) fn iter(&'a mut self) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator {
             reader: self,
             current_block: 0,
@@ -115,7 +115,7 @@ impl<'a> SegmentReader<'a> {
     }
 
     // TODO(@siennathesane): this also feels weird and out of place
-    pub(crate) fn seeking_iter<'b>(&'b mut self) -> SeekingBlockIterator<'a, 'b> {
+    pub(crate) fn seeking_iter(&'a mut self) -> SeekingBlockIterator<'a> {
         SeekingBlockIterator {
             start: 0,
             end: self.num_blocks,
@@ -186,12 +186,12 @@ impl<'a> SegmentReader<'a> {
     }
 }
 
-pub(crate) struct SegmentBlockIterator<'a, 'b> {
-    reader: &'b mut SegmentReader<'a>,
+pub(crate) struct SegmentBlockIterator<'a> {
+    reader: &'a mut SegmentReader,
     current_block: usize,
 }
 
-impl<'a, 'b> Iterator for SegmentBlockIterator<'a, 'b> {
+impl<'a> Iterator for SegmentBlockIterator<'a> {
     type Item = Result<Block, CesiumError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -210,14 +210,14 @@ impl<'a, 'b> Iterator for SegmentBlockIterator<'a, 'b> {
     }
 }
 
-pub(crate) struct SeekingBlockIterator<'a, 'b> {
+pub(crate) struct SeekingBlockIterator<'a> {
     start: usize,
     end: usize,
     current: usize,
-    reader: &'b mut SegmentReader<'a>,
+    reader: &'a mut SegmentReader,
 }
 
-impl<'a, 'b> SeekingBlockIterator<'a, 'b> {
+impl<'a> SeekingBlockIterator<'a> {
     pub(crate) fn seek(&mut self, block_index: usize) -> Result<(), CesiumError> {
         if block_index >= self.end {
             return Err(FsError(BlockIndexOutOfBounds));
@@ -236,7 +236,7 @@ impl<'a, 'b> SeekingBlockIterator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Iterator for SeekingBlockIterator<'a, 'b> {
+impl<'a> Iterator for SeekingBlockIterator<'a> {
     type Item = Result<Block, CesiumError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -283,7 +283,7 @@ mod tests {
 
         let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
 
-        let fs = Arc::new(Fs::init(mmap).unwrap());
+        let fs = Fs::init(mmap).unwrap();
         (fs, file)
     }
 
@@ -296,7 +296,7 @@ mod tests {
     }
 
     // Helper to create a segment with test data
-    fn create_test_segment<'a>(fs: &'a Arc<Fs>, num_blocks: u64) -> FRangeHandle<'a> {
+    fn create_test_segment(fs: &Arc<Fs>, num_blocks: u64) -> FRangeHandle {
         let segment_size = num_blocks * BLOCK_SIZE as u64;
         let frange_id = fs.create_frange(segment_size).unwrap();
         let mut frange = fs.open_frange(frange_id).unwrap();

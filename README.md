@@ -33,7 +33,26 @@ let db = Mutex::new(CesiumDB::new());
 
 CesiumDB does let you bring your own hybrid logical clock implementation. This is useful if you have a specific HLC implementation you want to use, or if you want to use a different clock entirely. This is done by implementing the `HLC` trait and passing it to the `CesiumDB` constructor. However, if you can provide a more precise clock than the provided one, please submit an issue or PR so we can all benefit from it.
 
+## Unsafety: Or... How To Do Dangerous Things Safely
+
+There is a non-trivial amount of `unsafe` code. Most of it is related to the internal filesystem implementation with `mmap` (which cannot be made safe), and some of it is lifetime elusions. Regarding lifetime elusions, this is primarily because I do not want `async` code in the core implementation. I do not believe a low-level db/storage library should require `async`.
+
+Internally, the filesystem I built for CesiumDB is a lock-free, thread-safe portable filesystem since one of my use cases is an embedded system that doesn't have a filesystem, only a device driver. LMDB is a huge inspiration for this project, so I wanted to utilize a lot of the same methodologies around `mmap`, but to make it as safe as possible. The nifty part is that Linux doesn't distinguish between a file and a block device for `mmap`, so I can `mmap` a block device and treat it like a file. The perk is that we get native write speeds for the device, we have a bin-packing filesystem that is portable across devices, and if all else fails, we can just `fallocate` a file and use that. The downside is that writing directly to device memory is dangerous and is inherently "unsafe", so a lot of the optimizations are `unsafe` because of this.
+
+I think the `SegmentWriter` is the most painful example of this. It takes an `Arc<RWLock<FRangeHandle<'a>>>` (a file handle) and wraps it in a `ManuallyDrop`. In `SegmentWriter<'a>`, when we're building it, we kick off an unmanaged background thread that is what actually writes blocks to the filesystem implementation. So when `SegmentWriter::write` is called during a `Memtable` flush, it's actually temporarily writing the data to an `Arc<SegQueue<Block>>` (a lock-free queue) that the background thread is reading from. When `drop(SegmentWriter)` happens, the background thread runs until it sees an `AtomicBool` is set to `true`, empty the queue, sets the `CondVar` and returns, the `drop(SegmentWriter)` sees the `CondVar` is set, and finishes. Notice how we're not actually calling `ManuallyDrop::drop` on the `Arc<RWLock<FRangeHandle<'a>>>`? This ensures that it doesn't get dropped by `SegmentWriter`, and since we're waiting for the thread to finish, our transmutation of lifetimes is safe.
+
+There is :sparkles: __EXTENSIVE__ :sparkles: testing around the `unsafe` code, and I am confident in its correctness. My goal is to keep this project at a high degree of code coverage with tests to help continue to ensure said confidence. However, if you find a bug, please submit an issue or PR.
+
+## Contributing
+
+Contributions are welcome! Please submit a PR with your changes. If you're unsure about the changes, please submit an issue first.
+
+I will not be accepting any pull requests which contain `async` code.
+
 ## To Do's
 
-- [ ] Investigate the point at which we can no longer `mmap` a physical device. Theoretically, even without swap space, I can `mmap` a 1TiB physical device to the filesystem implementation. But I feel like shit gets real weird. Unfortunately I don't have the ability to test it so volunteers would be great!
+- [ ] Write some kind of auto-configuration for the generalized configs.
+- [ ] Investigate the point at which we can no longer `mmap` a physical device. Theoretically, even without swap space, I can `mmap` a 1TiB physical device to the filesystem implementation. But I feel like shit gets real weird.
 - [ ] Figure out how hard it would be to support `no_std` for the embedded workloads. I suspect it would require a custom variation of `std::collections::BinaryHeap`, which would be... difficult lol
+- [ ] Add `miri` integration tests.
+- [ ] Add `loom` integration tests.

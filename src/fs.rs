@@ -215,10 +215,10 @@ impl FsMetadata {
             buf.put_u64_le(metadata.range.start);
             buf.put_u64_le(metadata.range.end);
             buf.put_u64_le(metadata.id);
-            buf.put_u64_le(metadata.length);
+            buf.put_u64_le(metadata.length.load(SeqCst));
             buf.put_u64_le(metadata.size);
             buf.put_u64_le(metadata.created_at);
-            buf.put_u64_le(metadata.modified_at);
+            buf.put_u64_le(metadata.modified_at.load(SeqCst));
         }
 
         // Write free ranges count
@@ -250,10 +250,10 @@ impl FsMetadata {
             let metadata = FRangeMetadata {
                 range,
                 id: bytes.get_u64_le(),
-                length: bytes.get_u64_le(),
+                length: AtomicU64::new(bytes.get_u64_le()),
                 size: bytes.get_u64_le(),
                 created_at: bytes.get_u64_le(),
-                modified_at: bytes.get_u64_le(),
+                modified_at: AtomicU64::new(bytes.get_u64_le()),
             };
 
             fs_metadata.franges.insert(key, metadata);
@@ -303,7 +303,7 @@ pub struct Fs {
 }
 
 impl Fs {
-    pub(crate) fn new(mmap: MmapMut) -> Result<Self, CesiumError> {
+    pub(crate) fn new(mmap: MmapMut) -> Result<Arc<Self>, CesiumError> {
         match mmap.advise(memmap2::Advice::Random) {
             | Ok(_) => {},
             | Err(e) => return Err(IoError(e)),
@@ -340,7 +340,7 @@ impl Fs {
             free_ranges.insert(range);
         }
 
-        Ok(Self {
+        Ok(Arc::new(Self {
             mmap: Arc::new(mmap),
             franges: RwLock::new(franges),
             free_ranges: RwLock::new(free_ranges),
@@ -349,11 +349,11 @@ impl Fs {
             last_flush: AtomicU64::new(0),
             dirty_pages: RwLock::new(SkipSet::new()),
             page_size: header.page_size as usize,
-        })
+        }))
     }
 
     /// Initialize a new filesystem in the given mmap
-    pub fn init(mut mmap: MmapMut) -> Result<Self, CesiumError> {
+    pub fn init(mut mmap: MmapMut) -> Result<Arc<Self>, CesiumError> {
         let total_size = mmap.len() as u64;
 
         // Calculate sizes
@@ -400,10 +400,10 @@ impl Fs {
             .write()
             .insert(OrderedRange::from(data_start as u64..total_size));
 
-        Ok(fs)
+        Ok(Arc::new(fs))
     }
 
-    pub fn create_frange(&self, size: u64) -> Result<u64, CesiumError> {
+    pub fn create_frange(self: &Arc<Self>, size: u64) -> Result<u64, CesiumError> {
         // Attempt allocation with a limited lock scope
         let range = {
             let free = self.free_ranges.write();
@@ -435,9 +435,9 @@ impl Fs {
             range: range.clone(),
             id,
             size,
-            length: 0,
+            length: AtomicU64::new(0),
             created_at: now,
-            modified_at: now,
+            modified_at: AtomicU64::new(now),
         };
 
         // Insert metadata with minimal lock duration
@@ -452,7 +452,7 @@ impl Fs {
         Ok(id)
     }
 
-    pub fn open_frange(&self, id: u64) -> Result<FRangeHandle, CesiumError> {
+    pub fn open_frange(self: &Arc<Self>, id: u64) -> Result<FRangeHandle, CesiumError> {
         let mut open_franges = self.open_franges.write();
 
         if !open_franges.insert(id) {
@@ -471,11 +471,11 @@ impl Fs {
             mmap: self.mmap.clone(),
             range: metadata.range.clone(),
             metadata, // Now metadata is owned
-            fs: ManuallyDrop::new(self),
+            fs: self.clone(),
         })
     }
 
-    pub fn close_frange(&self, handle: FRangeHandle) -> Result<(), CesiumError> {
+    pub fn close_frange(self: &Arc<Self>, handle: FRangeHandle) -> Result<(), CesiumError> {
         // Update metadata first
         {
             let franges = self.franges.write();
@@ -485,11 +485,11 @@ impl Fs {
                 },
                 | Some(entry) => {
                     let mut updated = entry.value().clone();
-                    updated.modified_at = SystemTime::now()
+                    updated.modified_at.store( SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
-                        .as_secs();
-                    updated.length = handle.metadata.length;
+                        .as_secs(), SeqCst);
+                    updated.length.store( handle.metadata.length.load(SeqCst), SeqCst);
                     franges.insert(handle.metadata.id, updated);
                 },
             };
@@ -505,7 +505,7 @@ impl Fs {
         self.maybe_flush(true)
     }
 
-    pub fn delete_frange(&self, id: u64) -> Result<(), CesiumError> {
+    pub fn delete_frange(self: &Arc<Self>, id: u64) -> Result<(), CesiumError> {
         if self.open_franges.read().contains(&id) {
             return Err(FsError(FRangeStillOpen));
         }
@@ -537,12 +537,12 @@ impl Fs {
     }
 
     /// Sync all changes to disk
-    pub fn sync(&self) -> Result<(), CesiumError> {
+    pub fn sync(self: &Arc<Self>) -> Result<(), CesiumError> {
         self.flush_dirty_pages()
     }
 
     /// Persist metadata changes to disk
-    fn persist_metadata(&self) -> Result<(), CesiumError> {
+    fn persist_metadata(self: &Arc<Self>) -> Result<(), CesiumError> {
         let metadata = {
             let metadata = FsMetadata::new();
 
@@ -624,16 +624,16 @@ impl Fs {
         Ok(())
     }
 
-    fn write_to_mmap(&self, offset: usize, data: &[u8]) {
+    fn write_to_mmap(self: &Arc<Self>, offset: usize, data: &[u8]) {
         unsafe {
             let ptr = self.mmap.as_ptr().add(offset) as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
         fence(SeqCst);
     }
 
     fn find_free_range(
-        &self,
+        self: &Arc<Self>,
         free: &RwLockWriteGuard<SkipSet<OrderedRange>>,
         size: u64,
     ) -> Result<OrderedRange, CesiumError> {
@@ -662,7 +662,7 @@ impl Fs {
         })
     }
 
-    fn coalesce_free_ranges(&self) -> Result<(), CesiumError> {
+    fn coalesce_free_ranges(self: &Arc<Self>) -> Result<(), CesiumError> {
         let free = self.free_ranges.write();
         let mut ranges: Vec<OrderedRange> = free.iter().map(|entry| (*entry).clone()).collect();
         ranges.sort();
@@ -686,7 +686,7 @@ impl Fs {
         Ok(())
     }
 
-    pub(crate) fn maybe_flush(&self, force: bool) -> Result<(), CesiumError> {
+    pub(crate) fn maybe_flush(self: &Arc<Self>, force: bool) -> Result<(), CesiumError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -708,7 +708,7 @@ impl Fs {
         self.flush_dirty_pages()
     }
 
-    fn flush_dirty_pages(&self) -> Result<(), CesiumError> {
+    fn flush_dirty_pages(self: &Arc<Self>) -> Result<(), CesiumError> {
         // First collect pages
         let pages = {
             let dirty_pages = self.dirty_pages.write();
@@ -745,7 +745,7 @@ impl Fs {
         Ok(())
     }
 
-    fn consolidate_pages(&self, pages: &[usize]) -> Vec<OrderedRange> {
+    fn consolidate_pages(self: &Arc<Self>, pages: &[usize]) -> Vec<OrderedRange> {
         let mut ranges = Vec::new();
         let mut current_range: Option<OrderedRange> = None;
 
@@ -783,7 +783,7 @@ impl Fs {
 
 impl Fs {
     /// Calculate total free space available in the filesystem
-    pub fn total_free_space(&self) -> u64 {
+    pub fn total_free_space(self: &Arc<Self>) -> u64 {
         let free_ranges = self.free_ranges.read();
         let sum = free_ranges
             .iter()
@@ -793,14 +793,14 @@ impl Fs {
     }
 
     /// Calculate total space used by allocated franges
-    pub fn total_used_space(&self) -> u64 {
+    pub fn total_used_space(self: &Arc<Self>) -> u64 {
         let franges = self.franges.read();
         let sum = franges.iter().map(|entry| entry.value().size).sum();
         sum
     }
 
     /// Check if a given size can be allocated contiguously
-    pub fn can_allocate_contiguous(&self, size: u64) -> bool {
+    pub fn can_allocate_contiguous(self: &Arc<Self>, size: u64) -> bool {
         let free_ranges = self.free_ranges.read();
         let can_allocate = free_ranges
             .iter()
@@ -809,7 +809,7 @@ impl Fs {
     }
 
     /// Get fragmentation statistics
-    pub fn fragmentation_stats(&self) -> FragmentationStats {
+    pub fn fragmentation_stats(self: &Arc<Self>) -> FragmentationStats {
         let free_ranges = self.free_ranges.read();
         let mut stats = FragmentationStats::default();
 
@@ -841,13 +841,13 @@ impl Fs {
 
 impl Fs {
     /// Check if compaction is needed and perform it if necessary
-    pub fn maybe_compact(&self) -> Result<bool, CesiumError> {
+    pub fn maybe_compact(self: &Arc<Self>) -> Result<bool, CesiumError> {
         self.maybe_compact_with_config(&CompactionConfig::default())
     }
 
     /// Check if compaction is needed and perform it with custom config
     pub fn maybe_compact_with_config(
-        &self,
+        self: &Arc<Self>,
         config: &CompactionConfig,
     ) -> Result<bool, CesiumError> {
         // First check if compaction is needed
@@ -875,7 +875,7 @@ impl Fs {
 
     /// Find candidate franges for compaction
     fn find_compaction_candidates(
-        &self,
+        self: &Arc<Self>,
         config: &CompactionConfig,
     ) -> Result<Vec<(u64, FRangeMetadata)>, CesiumError> {
         let mut candidates = Vec::new();
@@ -895,7 +895,7 @@ impl Fs {
 
             // Consider franges that might benefit from compaction
             let allocated_size = metadata.range.end - metadata.range.start;
-            let used_size = metadata.length;
+            let used_size = metadata.length.load(SeqCst);
 
             // Check if frange is significantly fragmented
             if allocated_size - used_size >= config.min_fragment_size {
@@ -912,7 +912,7 @@ impl Fs {
 
     /// Perform compaction on selected franges
     fn compact_franges(
-        &self,
+        self: &Arc<Self>,
         buffer_size: usize,
         candidates: Vec<(u64, FRangeMetadata)>,
     ) -> Result<(), CesiumError> {
@@ -923,15 +923,17 @@ impl Fs {
             }
 
             // Create new frange with exact size needed
-            let new_id = self.create_frange(metadata.length)?;
+            let new_id = self.create_frange(metadata.length.load(SeqCst))?;
             let mut new_handle = self.open_frange(new_id)?;
 
             // Read data from old frange
-            // TODO(@siennathesane): find a more efficient way to copy data
+            // TODO(@siennathesane): find a more efficient way to copy data. since we are using
+            // the `FRangeHandle` API, realistically we can load the ranges, calculate the offsets,
+            // then directly copy data with a single memcpy from the source to the dest.
             let old_handle = self.open_frange(id)?;
             let mut buffer = BytesMut::zeroed(buffer_size); // Use 4KB buffer for copying
 
-            let mut remaining = metadata.length;
+            let mut remaining = metadata.length.load(SeqCst);
             let mut offset = 0;
 
             while remaining > 0 {
@@ -1046,25 +1048,38 @@ pub struct FsHealth {
     pub fragmentation_stats: FragmentationStats,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct FRangeMetadata {
     range: OrderedRange,
     id: u64,
-    length: u64, // Track actual bytes written
+    length: AtomicU64, // Track actual bytes written
     size: u64,   // Keep this as allocated size
     created_at: u64,
-    modified_at: u64,
+    modified_at: AtomicU64,
 }
 
-pub struct FRangeHandle<'fs> {
+impl Clone for FRangeMetadata {
+    fn clone(&self) -> Self {
+        Self {
+            range: self.range.clone(),
+            id: self.id,
+            length: AtomicU64::new(self.length.load(SeqCst)),
+            size: self.size,
+            created_at: self.created_at,
+            modified_at: AtomicU64::new(self.modified_at.load(SeqCst)),
+        }
+    }
+}
+
+pub struct FRangeHandle {
     mmap: Arc<MmapMut>,
     range: OrderedRange,
     metadata: FRangeMetadata,
-    fs: ManuallyDrop<&'fs Fs>,
+    fs: Arc<Fs>,
 }
 
-impl<'fs> FRangeHandle<'fs> {
-    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), CesiumError> {
+impl FRangeHandle {
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), CesiumError> {
         if offset as usize + data.len() > (self.range.end - self.range.start) as usize {
             return Err(FsError(ReadOutOfBounds));
         }
@@ -1085,17 +1100,17 @@ impl<'fs> FRangeHandle<'fs> {
         unsafe {
             // Get mutable pointer for destination
             let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+            ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
 
         fence(SeqCst);
 
-        self.metadata.length += data.len() as u64;
+        self.metadata.length.fetch_add( data.len() as u64, SeqCst);
 
-        self.metadata.modified_at = SystemTime::now()
+        self.metadata.modified_at.store(SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_secs(), SeqCst);
 
         // Maybe flush
         self.fs.maybe_flush(false)?;
@@ -1147,7 +1162,7 @@ impl<'fs> FRangeHandle<'fs> {
     }
 
     pub(crate) fn len(&self) -> u64 {
-        self.metadata.length
+        self.metadata.length.load(SeqCst)
     }
 
     pub(crate) fn metadata(&self) -> &FRangeMetadata {
@@ -1155,7 +1170,7 @@ impl<'fs> FRangeHandle<'fs> {
     }
 }
 
-impl<'fs> Drop for FRangeHandle<'fs> {
+impl Drop for FRangeHandle {
     fn drop(&mut self) {
         // we basically remove ourselves from the open ranges so that when this
         // is dropped you can theoretically delete the frange
@@ -1165,11 +1180,11 @@ impl<'fs> Drop for FRangeHandle<'fs> {
                 | None => {},
                 | Some(entry) => {
                     let mut updated = entry.value().clone();
-                    updated.modified_at = SystemTime::now()
+                    updated.modified_at.store( SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
-                        .as_secs();
-                    updated.length = self.metadata.length;
+                        .as_secs(), SeqCst);
+                    updated.length.store(self.metadata.length.load(SeqCst), SeqCst);
                     franges.insert(self.metadata.id, updated);
                 },
             };
@@ -1195,7 +1210,7 @@ mod tests {
             Arc,
         },
     };
-
+    use std::sync::atomic::Ordering::SeqCst;
     use memmap2::MmapMut;
     use tempfile::tempdir;
 
@@ -1228,7 +1243,7 @@ mod tests {
         (dir, file)
     }
 
-    fn create_and_reopen_fs() -> (tempfile::TempDir, File, Fs) {
+    fn create_and_reopen_fs() -> (tempfile::TempDir, File, Arc<Fs>) {
         let (dir, file) = setup_test_file();
 
         println!("Creating initial filesystem...");
@@ -1577,11 +1592,11 @@ mod tests {
 
         let metadata1 = franges.get(&id1).unwrap();
         assert_eq!(metadata1.value().size, 1024);
-        assert_eq!(metadata1.value().length, 11); // "test data 1" length
+        assert_eq!(metadata1.value().length.load(SeqCst), 11); // "test data 1" length
 
         let metadata2 = franges.get(&id2).unwrap();
         assert_eq!(metadata2.value().size, 2048);
-        assert_eq!(metadata2.value().length, 11); // "test data 2" length
+        assert_eq!(metadata2.value().length.load(SeqCst), 11); // "test data 2" length
 
         dir.close().unwrap();
     }
@@ -1826,7 +1841,7 @@ mod e2e_tests {
 
     const TEST_FILE_SIZE: u64 = 1024 * 1024 * 100; // 100MB for testing
 
-    async fn setup_test_fs() -> (Fs, tempfile::TempDir) {
+    async fn setup_test_fs() -> (Arc<Fs>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
 
