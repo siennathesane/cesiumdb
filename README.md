@@ -60,4 +60,5 @@ Things I'd like to actually do, preferably before other people consume this.
 - [ ] Add `miri` integration tests.
 - [ ] Add `loom` integration tests.
 - [ ] Revisit the merge operator because it seems... slow? Idk. 115ms to do a full table scan of 800,000 keys across 8 memtables feels really slow.
-- Add more granular `madvise` commands to the filesystem to give the kernel some hints.
+- [ ] Add more granular `madvise` commands to the filesystem to give the kernel some hints.
+- [ ]  Revisit the merge iterator. The benchmarks have it at ~120ms for a full scan of 8 memtables with 100,000 keys each. I have no idea if this is a mismatch of my expectations or a gross inability of mine to optimize it further. Every optimization I've tried is 5-20% slower (including my own cache-optimized min heap) than this.
