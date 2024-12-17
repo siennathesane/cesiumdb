@@ -41,6 +41,7 @@ use crossbeam_skiplist::{
 };
 use gxhash::HashSet;
 use memmap2::MmapMut;
+use memmap2::UncheckedAdvice::DontNeed;
 use parking_lot::{
     RwLock,
     RwLockWriteGuard,
@@ -920,6 +921,11 @@ impl Fs {
             // Skip if frange was opened while preparing compaction
             if self.open_franges.read().contains(&id) {
                 continue;
+            }
+
+            match self.mmap.advise_range(memmap2::Advice::WillNeed, (metadata.range.end - metadata.range.start) as usize, metadata.range.start as usize) {
+                | Ok(_) => {},
+                | Err(e) => return Err(IoError(e)),
             }
 
             // Create new frange with exact size needed
