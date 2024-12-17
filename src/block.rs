@@ -203,7 +203,7 @@ impl Deserializer for Block {
         block
     }
 
-    fn deserialize_from_storage(payload: Bytes) -> Self {
+    fn deserialize(payload: Bytes) -> Self {
         // Storage format is identical to memory format for blocks
         Self::deserialize_from_memory(payload)
     }
@@ -466,7 +466,7 @@ mod tests {
         data.put_u16_le(0); // num_entries = 0
         data.resize(BLOCK_SIZE, 0);
 
-        let block = Block::deserialize_from_storage(data.freeze());
+        let block = Block::deserialize(data.freeze());
         assert_eq!(block.num_entries, 0);
         assert!(block.offsets().is_empty());
         assert!(block.entries().is_empty());
@@ -482,7 +482,7 @@ mod tests {
         data.put_slice(b"hello");
         data.resize(BLOCK_SIZE, 0);
 
-        let block = Block::deserialize_from_storage(data.freeze());
+        let block = Block::deserialize(data.freeze());
         assert_eq!(block.num_entries, 1);
         assert_eq!(block.offsets().len(), 2); // one u16 offset
         assert_eq!(block.entries().len(), 5); // "hello"
@@ -500,7 +500,7 @@ mod tests {
         data.put_slice(b"123"); // second entry
         data.resize(BLOCK_SIZE, 0);
 
-        let block = Block::deserialize_from_storage(data.freeze());
+        let block = Block::deserialize(data.freeze());
         assert_eq!(block.num_entries, 2);
         assert_eq!(block.offsets().len(), 4); // two u16 offsets
         assert_eq!(block.entries().len(), 8); // "hello123"

@@ -50,8 +50,14 @@ I will not be accepting any pull requests which contain `async` code.
 
 ## To Do's
 
+Things I'd like to actually do, preferably before other people consume this.
+
+- [ ] Bloom filter size is currently hardcoded. I'd like to make it configurable.
+- [ ] Add some kind of `fallocate` automation or growth strategy for the filesystem when it's not a block device.
 - [ ] Write some kind of auto-configuration for the generalized configs.
 - [ ] Investigate the point at which we can no longer `mmap` a physical device. Theoretically, even without swap space, I can `mmap` a 1TiB physical device to the filesystem implementation. But I feel like shit gets real weird.
 - [ ] Figure out how hard it would be to support `no_std` for the embedded workloads. I suspect it would require a custom variation of `std::collections::BinaryHeap`, which would be... difficult lol
 - [ ] Add `miri` integration tests.
 - [ ] Add `loom` integration tests.
+- [ ] Revisit the merge operator because it seems... slow? Idk. 115ms to do a full table scan of 800,000 keys across 8 memtables feels really slow.
+- Add more granular `madvise` commands to the filesystem to give the kernel some hints.

@@ -131,7 +131,7 @@ impl<'a> SegmentReader {
 
         self.frange.read_at(offset as u64, &mut buffer)?;
 
-        let block = Block::deserialize_from_storage(buffer.freeze());
+        let block = Block::deserialize(buffer.freeze());
 
         Ok(block)
     }

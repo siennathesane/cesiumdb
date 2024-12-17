@@ -113,17 +113,27 @@ impl SegmentWriter {
         })
     }
 
-    pub(crate) fn write(&mut self, block: Block) -> Result<(), CesiumError> {
+    pub(crate) fn write_block(&mut self, block: Block) -> Result<(), CesiumError> {
         if self.blocks_left.load(Relaxed) == 0 {
             self.segment_full.store(true, Relaxed);
             return Err(FsError(SegmentFull));
         }
-
-        println!("Adding block to queue"); // Debug
+        
         self.block_queue.push(block);
         self.blocks_left.fetch_sub(1, Relaxed);
 
         Ok(())
+    }
+    
+    pub(crate) fn write_index(&mut self, index: u64, data: &[u8]) -> Result<(), CesiumError> {
+        if data.len() > BLOCK_SIZE {
+            return Err(FsError(SegmentSizeInvalid));
+        }
+
+        let mut block = Block::new();
+        block.add_entry(data)?;
+
+        self.write_block(block)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -271,7 +281,7 @@ mod tests {
         let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
 
         println!("Writing block");
-        assert!(writer.write(block).is_ok());
+        assert!(writer.write_block(block).is_ok());
 
         println!("Shutting down writer");
         writer.shutdown();
@@ -316,10 +326,10 @@ mod tests {
         let block2 = create_test_block(&test_entries).unwrap();
         let block3 = create_test_block(&test_entries).unwrap();
 
-        assert!(writer.write(block1).is_ok());
-        assert!(writer.write(block2).is_ok());
+        assert!(writer.write_block(block1).is_ok());
+        assert!(writer.write_block(block2).is_ok());
         assert!(matches!(
-            writer.write(block3).unwrap_err(),
+            writer.write_block(block3).unwrap_err(),
             FsError(SegmentFull)
         ));
 
@@ -346,7 +356,7 @@ mod tests {
 
                     let block = create_test_block(&entries).unwrap();
                     let mut writer = writer_clone.lock();
-                    assert!(writer.write(block).is_ok());
+                    assert!(writer.write_block(block).is_ok());
                 }
             });
             handles.push(handle);
@@ -379,7 +389,7 @@ mod tests {
             expected_entries.push(entries[0].clone());
 
             let block = create_test_block(&entries).unwrap();
-            assert!(writer.write(block).is_ok());
+            assert!(writer.write_block(block).is_ok());
         }
 
         // Wait for writes to complete
@@ -451,7 +461,7 @@ mod tests {
                     match create_test_block(&entries) {
                         Ok(block) => {
                             let mut writer = writer_clone.lock();
-                            if writer.write(block).is_err() {
+                            if writer.write_block(block).is_err() {
                                 error_count.fetch_add(1, Relaxed);
                                 break; // Exit if we hit an error
                             }
@@ -502,7 +512,7 @@ mod tests {
         // Write data
         let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
         let block = create_test_block(&entries).unwrap();
-        assert!(writer.write(block).is_ok());
+        assert!(writer.write_block(block).is_ok());
         writer.shutdown();
         drop(writer);
 

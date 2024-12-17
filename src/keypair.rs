@@ -122,7 +122,7 @@ impl Serializer for Key<Bytes> {
 
     #[instrument(level = "trace")]
     #[inline]
-    fn serialize_for_storage(&self) -> Bytes {
+    fn serialize(&self) -> Bytes {
         // TODO(@siennathesane): add secure flag
         let mut hasher = Hasher::new();
         hasher.update(self.key.as_ref());
@@ -163,7 +163,7 @@ impl Deserializer for Key<Bytes> {
 
     #[instrument(level = "trace")]
     #[inline]
-    fn deserialize_from_storage(slice: Bytes) -> Self {
+    fn deserialize(slice: Bytes) -> Self {
         #[cfg(feature = "secure")]
         {
             let mut hasher = Hasher::new();
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(key, de_key);
 
         // 4 + 4 + 8 + 4 + 16
-        let storage_serialized = key.serialize_for_storage();
+        let storage_serialized = key.serialize();
         assert_eq!(storage_serialized.len(), 36);
         let de_key =
             KeyBytes::deserialize_from_memory(Bytes::copy_from_slice(&storage_serialized[8..]));
