@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 #![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
+
+// for code quality
+#![allow(dead_code)]
+#![allow(unused)]
+#![deny(clippy::missing_safety_doc)]
+#![deny(clippy::multiple_unsafe_ops_per_block)]
+
+// for @siennathesane's sanity
+#![deny(clippy::question_mark_used)]
+#![deny(clippy::needless_borrow)]
 #![allow(bindings_with_variant_name)]
-#![allow(dead_code)] // TODO(@siennathesane): remove before release
-#![allow(unused)] // TODO(@siennathesane): remove before release
-// #![deny(clippy::question_mark_used)] // for @siennathesane's sanity
 
 #[cfg(not(unix))]
 compile_warn!("cesiumdb is not tested on windows");
