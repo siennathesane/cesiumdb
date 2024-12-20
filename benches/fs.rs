@@ -70,7 +70,7 @@ fn setup_fragmented_fs(fragmentation_level: u32) -> (Arc<Fs>, tempfile::TempDir)
 
         if let Ok(id) = fs.create_frange(size) {
             // Write random amounts of data to simulate partially filled franges
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
             let write_size = (size as f64 * rng.gen_range(0.3..0.9)) as u64;
             let data = vec![rng.gen::<u8>(); 4096];
 

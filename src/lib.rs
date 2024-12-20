@@ -8,6 +8,7 @@
 #![allow(unused)]
 #![deny(clippy::missing_safety_doc)]
 #![deny(clippy::multiple_unsafe_ops_per_block)]
+#![deny(unused_mut)]
 
 // for @siennathesane's sanity
 #![deny(clippy::question_mark_used)]

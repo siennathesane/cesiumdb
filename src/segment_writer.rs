@@ -269,7 +269,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_basic_write_operation() {
         println!("Starting test_basic_write_operation");
         let segment_size = BLOCK_SIZE as u64 * 10;
