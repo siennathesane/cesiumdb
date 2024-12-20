@@ -56,7 +56,11 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let smallest = self.iters.pop()?;
+            // TODO(@siennathesane): figure out what this logic should be
+            let smallest = match self.iters.pop() {
+                None => continue,
+                Some(v) => v,
+            };
 
             // Get next item and check if we have more items
             let has_more = {
@@ -251,7 +255,7 @@ mod tests {
         .into_iter();
 
         let iters = vec![iter1, iter2, iter3];
-        let mut merge_iter = MergeIterator::new(iters);
+        let merge_iter = MergeIterator::new(iters);
 
         let results: Vec<_> = merge_iter.collect();
         assert_eq!(results.len(), 6);
@@ -277,8 +281,8 @@ mod tests {
         let iter3 = Vec::<(KeyBytes, ValueBytes)>::new().into_iter();
 
         let mut results = Vec::new();
-        let mut merge_iter = MergeIterator::new(vec![iter1, iter2, iter3]);
-        while let Some(item) = merge_iter.next() {
+        let merge_iter = MergeIterator::new(vec![iter1, iter2, iter3]);
+        for item in merge_iter {
             results.push(item);
         }
 
