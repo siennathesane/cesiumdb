@@ -1,4 +1,5 @@
 use std::ops::DerefMut;
+
 use bytes::{
     Bytes,
     BytesMut,
@@ -11,11 +12,11 @@ use crate::{
         BLOCK_SIZE,
     },
     errs::{
-        CesiumError,
-        CesiumError::FsError,
-        FsError::{
-            BlockIndexOutOfBounds,
-            SegmentSizeInvalid,
+        FsError,
+        SegmentError,
+        SegmentError::{
+            InvalidSize,
+            ReadOutOfBounds,
         },
     },
     fs::FRangeHandle,
@@ -44,18 +45,18 @@ pub(crate) struct SegmentReader {
 }
 
 impl<'a> SegmentReader {
-    pub(crate) fn new(frange: FRangeHandle) -> Result<Self, CesiumError> {
+    pub(crate) fn new(frange: FRangeHandle) -> Result<Self, SegmentError> {
         Self::with_config(frange, ReadConfig::default())
     }
 
     pub(crate) fn with_config(
         frange: FRangeHandle,
         config: ReadConfig,
-    ) -> Result<Self, CesiumError> {
+    ) -> Result<Self, SegmentError> {
         let segment_size = frange.capacity() as usize;
 
         if segment_size % BLOCK_SIZE != 0 {
-            return Err(FsError(SegmentSizeInvalid));
+            return Err(InvalidSize);
         }
 
         let num_blocks = segment_size / BLOCK_SIZE;
@@ -68,9 +69,9 @@ impl<'a> SegmentReader {
         })
     }
 
-    pub(crate) fn read_block(&mut self, block_index: usize) -> Result<Block, CesiumError> {
+    pub(crate) fn read_block(&mut self, block_index: usize) -> Result<Block, SegmentError> {
         if block_index >= self.num_blocks {
-            return Err(FsError(BlockIndexOutOfBounds));
+            return Err(ReadOutOfBounds);
         }
 
         // Check cache first and collect any blocks we may want to keep
@@ -93,22 +94,22 @@ impl<'a> SegmentReader {
                 let _ = self.cache.push(b);
             }
             match self.fill_cache(block_index + 1) {
-                Ok(_) => {}
-                Err(e) => return Err(e),
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
             };
             return Ok(block);
         }
 
         // Read the requested block
         let block = match self.read_block_at(block_index) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
         };
 
         // Fill read-ahead cache
         match self.fill_cache(block_index + 1) {
-            Ok(_) => {}
-            Err(e) => return Err(e),
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
         };
 
         Ok(block)
@@ -133,13 +134,16 @@ impl<'a> SegmentReader {
     }
 
     /// Internal method to read a single block without caching
-    fn read_block_at(&mut self, block_index: usize) -> Result<Block, CesiumError> {
+    fn read_block_at(&mut self, block_index: usize) -> Result<Block, SegmentError> {
         let offset = block_index * BLOCK_SIZE;
         let mut buffer = BytesMut::zeroed(BLOCK_SIZE);
 
         match self.frange.read_at(offset as u64, &mut buffer) {
-            Ok(_) => {}
-            Err(e) => return Err(e),
+            | Ok(_) => {},
+            | Err(fse) => match fse {
+                | FsError::ReadOutOfBounds => return Err(ReadOutOfBounds),
+                | _ => !unreachable!("unexpected error reading block"),
+            },
         };
 
         let block = Block::deserialize(buffer.freeze());
@@ -148,7 +152,7 @@ impl<'a> SegmentReader {
     }
 
     /// Fill the read-ahead cache starting from the given block index
-    fn fill_cache(&mut self, start_index: usize) -> Result<(), CesiumError> {
+    fn fill_cache(&mut self, start_index: usize) -> Result<(), SegmentError> {
         // Clear old cache entries
         while self.cache.pop().is_some() {}
 
@@ -203,7 +207,7 @@ pub(crate) struct SegmentBlockIterator<'a> {
 }
 
 impl<'a> Iterator for SegmentBlockIterator<'a> {
-    type Item = Result<Block, CesiumError>;
+    type Item = Result<Block, SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_block >= self.reader.num_blocks {
@@ -229,9 +233,9 @@ pub(crate) struct SeekingBlockIterator<'a> {
 }
 
 impl<'a> SeekingBlockIterator<'a> {
-    pub(crate) fn seek(&mut self, block_index: usize) -> Result<(), CesiumError> {
+    pub(crate) fn seek(&mut self, block_index: usize) -> Result<(), SegmentError> {
         if block_index >= self.end {
-            return Err(FsError(BlockIndexOutOfBounds));
+            return Err(ReadOutOfBounds);
         }
         self.reader.clear_cache();
         self.current = block_index;
@@ -248,7 +252,7 @@ impl<'a> SeekingBlockIterator<'a> {
 }
 
 impl<'a> Iterator for SeekingBlockIterator<'a> {
-    type Item = Result<Block, CesiumError>;
+    type Item = Result<Block, SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.end {
@@ -284,11 +288,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        block::Block,
+        block::{
+            Block,
+            EntryFlag,
+            EntryFlag::Complete,
+        },
+        errs::CesiumError::FsError,
         fs::Fs,
     };
-    use crate::block::EntryFlag;
-    use crate::block::EntryFlag::Complete;
 
     const TEST_FS_SIZE: u64 = BLOCK_SIZE as u64 * 16; // 16 blocks total space
 
@@ -351,10 +358,7 @@ mod tests {
             if let Ok(frange) = fs.open_frange(frange_id) {
                 // Debug the actual result
                 let result = SegmentReader::new(frange);
-                assert!(matches!(
-                result,
-                Err(FsError(SegmentSizeInvalid))
-            ));
+                assert!(matches!(result, Err(SegmentSizeInvalid)));
             }
         }
     }
@@ -377,10 +381,7 @@ mod tests {
 
         let mut reader = SegmentReader::new(frange).unwrap();
         let result = reader.read_block(1);
-        assert!(matches!(
-            result.err().unwrap(),
-            CesiumError::FsError(BlockIndexOutOfBounds)
-        ));
+        assert!(matches!(result.err().unwrap(), ReadOutOfBounds));
     }
 
     // #[test]
@@ -388,39 +389,39 @@ mod tests {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 4);
     //     let mut reader = SegmentReader::new(frange).unwrap();
-    // 
+    //
     //     // First read should cache next blocks
     //     let block1 = reader.read_block(0).unwrap();
     //     assert_eq!(block1.get(0).unwrap(), &vec![1u8; 8]);
-    // 
+    //
     //     // This should come from cache
     //     let block2 = reader.read_block(1).unwrap();
     //     assert_eq!(block2.get(0).unwrap(), &vec![2u8; 8]);
-    // 
+    //
     //     // Moving beyond cache should trigger new reads
     //     let block4 = reader.read_block(3).unwrap();
     //     assert_eq!(block4.get(0).unwrap(), &vec![4u8; 8]);
     // }
-    // 
+    //
     // #[test]
     // fn test_read_block_sequential() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 4);
     //     let mut reader = SegmentReader::new(frange).unwrap();
-    // 
+    //
     //     // Read all blocks sequentially
     //     for i in 0..4 {
     //         let block = reader.read_block(i).unwrap();
     //         assert_eq!(block.get(0).unwrap(), &vec![(i + 1) as u8; 8]);
     //     }
     // }
-    // 
+    //
     // #[test]
     // fn test_block_iterator() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 3);
     //     let mut reader = SegmentReader::new(frange).unwrap();
-    // 
+    //
     //     let mut count = 0;
     //     for block_result in reader.iter() {
     //         let block = block_result.unwrap();
@@ -429,19 +430,19 @@ mod tests {
     //     }
     //     assert_eq!(count, 3);
     // }
-    // 
+    //
     // #[test]
     // fn test_seeking_iterator() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 4);
     //     let mut reader = SegmentReader::new(frange).unwrap();
     //     let mut seeking_iter = reader.seeking_iter();
-    //     
+    //
     //     // Seek to middle
     //     seeking_iter.seek(2).unwrap();
     //     assert_eq!(seeking_iter.current_position(), 2);
     //     assert_eq!(seeking_iter.blocks_remaining(), 2);
-    // 
+    //
     //     // Read blocks and verify
     //     for i in 2..4 {
     //         let block = seeking_iter.next().unwrap().unwrap();
@@ -449,26 +450,26 @@ mod tests {
     //     }
     //     assert!(seeking_iter.next().is_none()); // Verify we hit the end
     // }
-    // 
+    //
     // #[test]
     // fn test_config_update() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 2);
     //     let mut reader = SegmentReader::new(frange).unwrap();
-    // 
+    //
     //     let new_config = ReadConfig { read_ahead: 4 };
     //     reader.set_config(new_config.clone());
-    // 
+    //
     //     assert_eq!(reader.config().read_ahead, 4);
     //     reader.clear_cache(); // Verify cache clearing works
     // }
-    // 
+    //
     // #[test]
     // fn test_read_block_random_access() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 8);
     //     let mut reader = SegmentReader::new(frange).unwrap();
-    // 
+    //
     //     // Read blocks in random order
     //     let indices = vec![3, 1, 4, 2, 6, 5];
     //     for &i in indices.iter() {
@@ -476,29 +477,29 @@ mod tests {
     //         assert_eq!(block.get(0).unwrap(), &vec![(i + 1) as u8; 8]);
     //     }
     // }
-    // 
+    //
     // #[test]
     // fn test_iterator_size_hint() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 5);
     //     let mut reader = SegmentReader::new(frange).unwrap();
     //     let iter = reader.iter();
-    // 
+    //
     //     let (min, max) = iter.size_hint();
     //     assert_eq!(min, 5);
     //     assert_eq!(max, Some(5));
     // }
-    // 
+    //
     // #[test]
     // fn test_seeking_iterator_bounds() {
     //     let (fs, _file) = setup_test_fs();
     //     let frange = create_test_segment(&fs, 3);
     //     let mut reader = SegmentReader::new(frange).unwrap();
     //     let mut seeking_iter = reader.seeking_iter();
-    // 
+    //
     //     // Test seeking out of bounds
     //     assert!(seeking_iter.seek(3).is_err());
-    // 
+    //
     //     // Test seeking to last block
     //     assert!(seeking_iter.seek(2).is_ok());
     //     assert_eq!(seeking_iter.blocks_remaining(), 1);

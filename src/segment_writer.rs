@@ -30,20 +30,15 @@ use crate::{
         EntryFlag::Complete,
         BLOCK_SIZE,
     },
-    errs::{
-        CesiumError,
-        CesiumError::FsError,
-        FsError::{
-            SegmentFull,
-            SegmentSizeInvalid,
-        },
-    },
     fs::{
         FRangeHandle,
         Fs,
     },
+    segment::Segment,
     stats::STATS,
 };
+use crate::errs::SegmentError;
+use crate::errs::SegmentError::{InsufficientSpace, InvalidSize};
 
 pub(crate) struct SegmentWriter {
     handle: Arc<FRangeHandle>,
@@ -56,12 +51,12 @@ pub(crate) struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    pub(crate) fn new(handle: Arc<FRangeHandle>) -> Result<Self, CesiumError> {
+    pub(crate) fn new(handle: Arc<FRangeHandle>) -> Result<Self, SegmentError> {
         let segment_size = handle.capacity();
         if segment_size % BLOCK_SIZE as u64 != 0 {
-            return Err(FsError(SegmentSizeInvalid));
+            return Err(InvalidSize);
         }
-
+        
         let blocks_left = Arc::new(AtomicUsize::new(segment_size as usize / BLOCK_SIZE));
         let done = Arc::new(AtomicBool::new(false));
         let segment_full = Arc::new(AtomicBool::new(false));
@@ -87,7 +82,7 @@ impl SegmentWriter {
                     // Create a buffer for the block data
                     let mut buffer = BytesMut::with_capacity(BLOCK_SIZE);
                     buffer.resize(BLOCK_SIZE, 0); // Important: resize buffer to full block size
-                    
+
                     #[allow(clippy::missing_safety_doc)]
                     #[allow(clippy::undocumented_unsafe_blocks)]
                     unsafe {
@@ -123,30 +118,16 @@ impl SegmentWriter {
         })
     }
 
-    pub(crate) fn write_block(&mut self, block: Block) -> Result<(), CesiumError> {
+    pub(crate) fn write_block(&mut self, block: Block) -> Result<(), SegmentError> {
         if self.blocks_left.load(Relaxed) == 0 {
             self.segment_full.store(true, Relaxed);
-            return Err(FsError(SegmentFull));
+            return Err(InsufficientSpace);
         }
 
         self.block_queue.push(block);
         self.blocks_left.fetch_sub(1, Relaxed);
 
         Ok(())
-    }
-
-    pub(crate) fn write_index(&mut self, index: u64, data: &[u8]) -> Result<(), CesiumError> {
-        if data.len() > BLOCK_SIZE {
-            return Err(FsError(SegmentSizeInvalid));
-        }
-
-        let mut block = Block::new();
-        match block.add_entry(data, Complete) {
-            Ok(_) => {}
-            Err(e) => return Err(e),
-        };
-
-        self.write_block(block)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -181,13 +162,15 @@ mod tests {
         thread,
         time::Duration,
     };
+
     use bytes::Bytes;
     use memmap2::MmapMut;
     use parking_lot::RwLock;
     use rand::Rng;
     use tempfile::tempdir;
-    use crate::utils::Deserializer;
+    use crate::errs::BlockError;
     use super::*;
+    use crate::utils::Deserializer;
 
     struct TestContext {
         handle: Arc<FRangeHandle>,
@@ -226,7 +209,7 @@ mod tests {
         }
     }
 
-    fn create_test_block(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Block, CesiumError> {
+    fn create_test_block(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Block, BlockError> {
         let mut block = Block::new();
         // Only store values, not key-value pairs
         for (_, value) in entries {
@@ -237,17 +220,17 @@ mod tests {
 
     fn verify_block_contents(data: &[u8], expected_values: &[Vec<u8>]) -> bool {
         let block = Block::deserialize(Bytes::copy_from_slice(data));
-    
+
         // Verify each entry
         if let Some((idx, expected_value)) = expected_values.iter().enumerate().next() {
             let entry = match block.get(idx) {
-                Some(entry) => entry.1,
-                None => return false,
+                | Some(entry) => entry.1,
+                | None => return false,
             };
             if entry.len() != expected_value.len() {
                 return false;
             }
-            return entry == expected_value
+            return entry == expected_value;
         }
         true
     }
@@ -263,13 +246,13 @@ mod tests {
         let entries = vec![
             (vec![0u8; 1], vec![1u8; 100]), // Simple small entry
         ];
-        
+
         let block = create_test_block(&entries).unwrap();
-        
+
         let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
-        
+
         assert!(writer.write_block(block).is_ok());
-        
+
         writer.shutdown();
 
         // Wait for writer to finish and properly sync
@@ -277,7 +260,7 @@ mod tests {
 
         // Add a small delay to ensure filesystem sync
         thread::sleep(Duration::from_millis(100));
-        
+
         let mut buffer = vec![0u8; BLOCK_SIZE];
         ctx.handle.read_at(0, &mut buffer).unwrap();
 
@@ -304,7 +287,7 @@ mod tests {
         assert!(writer.write_block(block2).is_ok());
         assert!(matches!(
             writer.write_block(block3).unwrap_err(),
-            FsError(SegmentFull)
+            InsufficientSpace
         ));
 
         writer.shutdown();
@@ -502,6 +485,9 @@ mod tests {
         }
 
         let values: Vec<Vec<u8>> = entries.iter().map(|(_, value)| value.clone()).collect();
-        assert!(verify_block_contents(&buffer, &values), "Block contents do not match");
+        assert!(
+            verify_block_contents(&buffer, &values),
+            "Block contents do not match"
+        );
     }
 }

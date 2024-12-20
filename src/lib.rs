@@ -49,6 +49,7 @@ use crate::{
         PutNs,
     },
 };
+use crate::errs::CesiumError::MemtableError;
 
 #[cfg(not(miri))]
 #[global_allocator]
@@ -70,6 +71,7 @@ mod segment_writer;
 pub(crate) mod state;
 mod stats;
 mod utils;
+mod segment_builder;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
@@ -291,7 +293,12 @@ impl DbInner {
         {
             let guard = self.state.lock();
             let mtable = guard.current_memtable();
-            mtable.put_batch(_batch.as_ref())
+            
+            // TODO(@siennathesane): add memtable swap logic here
+            match mtable.put_batch(_batch.as_ref()) {
+                | Ok(_) => Ok(()),
+                | Err(e) => Err(MemtableError(e)),
+            }
         }
     }
 
