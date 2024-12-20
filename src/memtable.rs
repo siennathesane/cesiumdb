@@ -40,11 +40,6 @@ use rand::random;
 use tracing::instrument;
 
 use crate::{
-    errs::CesiumError::{
-        self,
-        DataExceedsMaximum,
-        MemtableIsFrozen,
-    },
     keypair::{
         map_key_bound,
         KeyBytes,
@@ -57,6 +52,8 @@ use crate::{
         Serializer,
     },
 };
+use crate::errs::MemtableError;
+use crate::errs::MemtableError::{DataExceedsMaximum, MemtableIsFrozen};
 
 pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 2 << 28; // 256MiB
 
@@ -136,7 +133,7 @@ impl Memtable {
 
     #[instrument(level = "debug")]
     #[inline]
-    pub fn put(&self, key: KeyBytes, val: ValueBytes) -> Result<(), CesiumError> {
+    pub fn put(&self, key: KeyBytes, val: ValueBytes) -> Result<(), MemtableError> {
         self.put_batch(&[(key, val)])
     }
 
@@ -152,7 +149,7 @@ impl Memtable {
     /// 2.2s on a Macbook M1 Pro. This optimization allows for O(2) lookups.
     #[instrument(level = "debug")]
     #[inline]
-    pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<(), CesiumError> {
+    pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<(), MemtableError> {
         // we don't want to write to a frozen memtable
         if self.frozen.load(Relaxed) {
             return Err(MemtableIsFrozen);

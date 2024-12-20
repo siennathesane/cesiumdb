@@ -7,27 +7,24 @@ use bytes::{
 };
 
 use crate::{
-    errs::{
-        BlockError::{
-            BlockFull,
-            TooLargeForBlock,
-        },
-        CesiumError,
-        CesiumError::BlockError,
-    },
     utils::Deserializer,
 };
+use crate::errs::BlockError;
+use crate::errs::BlockError::{BlockFull, TooLargeForBlock};
 
+const OFFSET_SIZE: usize = size_of::<u16>();
+const MAX_ENTRIES: usize = BLOCK_SIZE / ENTRY_SIZE;
 /// The size of a block in bytes. This is the most common page size for memory
 /// and NVMe devices.
 pub(crate) const BLOCK_SIZE: usize = 4096;
 /// The size of an entry in a block. An entry consists of a 2-byte offset and a
 /// byte flag for the entry type.
 pub(crate) const ENTRY_SIZE: usize = size_of::<u16>() + size_of::<u8>();
-const MAX_ENTRIES: usize = BLOCK_SIZE / ENTRY_SIZE;
 /// The overhead of a block, which is the space taken up by the offsets and
 /// flags.
 pub(crate) const BLOCK_OVERHEAD: usize = BLOCK_SIZE - MAX_ENTRIES;
+/// The maximum entry size that can fit into an empty block.
+pub(crate) const MAX_ENTRY_SIZE: usize = BLOCK_SIZE - OFFSET_SIZE - ENTRY_SIZE;
 
 /// Flags to mark entry types in a block
 #[repr(u8)]
@@ -67,16 +64,16 @@ impl Block {
 
     /// Add an entry to the block. If the block is full, an error will be
     /// returned.
-    pub(crate) fn add_entry(&mut self, entry: &[u8], flag: EntryFlag) -> Result<(), CesiumError> {
+    pub(crate) fn add_entry(&mut self, entry: &[u8], flag: EntryFlag) -> Result<(), BlockError> {
         // entry + offset size + byte flag
         let entry_size = entry.len() + size_of::<u8>();
         if !self.will_fit(entry_size) {
             return if self.is_empty() {
                 // notify the caller to try again with a smaller entry
-                Err(BlockError(TooLargeForBlock))
+                Err(TooLargeForBlock)
             } else {
                 // notify the caller that the block is full
-                Err(BlockError(BlockFull))
+                Err(BlockFull)
             };
         }
 
@@ -166,7 +163,7 @@ impl Block {
     }
 
     /// Add an entry that is part of a single block.
-    pub(crate) fn add_complete_entry(&mut self, entry: &[u8]) -> Result<(), CesiumError> {
+    pub(crate) fn add_complete_entry(&mut self, entry: &[u8]) -> Result<(), BlockError> {
         self.add_entry(entry, EntryFlag::Complete)
     }
 
@@ -358,7 +355,7 @@ mod tests {
         let entry = [0u8; BLOCK_SIZE];
         assert!(matches!(
             block.add_entry(&entry, EntryFlag::Complete),
-            Err(BlockError(TooLargeForBlock))
+            Err(TooLargeForBlock)
         ));
     }
 
@@ -368,7 +365,7 @@ mod tests {
         let entry = vec![0u8; BLOCK_SIZE - size_of::<u16>() + 1];
         assert!(matches!(
             block.add_entry(&entry, EntryFlag::Complete),
-            Err(BlockError(TooLargeForBlock))
+            Err(TooLargeForBlock)
         ));
     }
 

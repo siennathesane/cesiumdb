@@ -54,20 +54,17 @@ use parking_lot::{
 use crate::{
     block::BLOCK_SIZE,
     errs::{
-        CesiumError,
-        CesiumError::{
-            FsError,
-            InvalidHeaderFormat,
-            IoError,
-            NoFreeSpace,
-        },
+        FsError,
         FsError::{
             FRangeAlreadyOpen,
             FRangeNotFound,
             FRangeStillOpen,
             FragmentationLimit,
             InsufficientSpace,
+            InvalidHeaderFormat,
+            IoError,
             NoAdjacentSpace,
+            NoFreeSpace,
             ReadOutOfBounds,
             StorageExhausted,
             WriteOutOfBounds,
@@ -149,7 +146,7 @@ impl FsHeader {
     }
 }
 
-fn deserialize_header(bytes: &[u8]) -> Result<FsHeader, CesiumError> {
+fn deserialize_header(bytes: &[u8]) -> Result<FsHeader, FsError> {
     if bytes.len() < size_of::<FsHeader>() {
         return Err(InvalidHeaderFormat("header too short".into()));
     }
@@ -239,7 +236,7 @@ impl FsMetadata {
         buf.freeze()
     }
 
-    fn deserialize(mut bytes: Bytes) -> Result<Self, CesiumError> {
+    fn deserialize(mut bytes: Bytes) -> Result<Self, FsError> {
         let fs_metadata = Self::new();
 
         // Read franges
@@ -309,7 +306,7 @@ pub struct Fs {
 }
 
 impl Fs {
-    pub(crate) fn new(mmap: MmapMut) -> Result<Arc<Self>, CesiumError> {
+    pub(crate) fn new(mmap: MmapMut) -> Result<Arc<Self>, FsError> {
         match mmap.advise(memmap2::Advice::Random) {
             | Ok(_) => {},
             | Err(e) => return Err(IoError(e)),
@@ -359,7 +356,7 @@ impl Fs {
     }
 
     /// Initialize a new filesystem in the given mmap
-    pub fn init(mut mmap: MmapMut) -> Result<Arc<Self>, CesiumError> {
+    pub fn init(mut mmap: MmapMut) -> Result<Arc<Self>, FsError> {
         let total_size = mmap.len() as u64;
 
         // Calculate sizes
@@ -409,7 +406,7 @@ impl Fs {
         Ok(Arc::new(fs))
     }
 
-    pub fn create_frange(self: &Arc<Self>, size: u64) -> Result<u64, CesiumError> {
+    pub fn create_frange(self: &Arc<Self>, size: u64) -> Result<u64, FsError> {
         // Attempt allocation with a limited lock scope
         let range = {
             let free = self.free_ranges.write();
@@ -422,9 +419,9 @@ impl Fs {
             | Err(NoFreeSpace) => {
                 let total_space = self.total_free_space();
                 return if size > total_space {
-                    Err(FsError(StorageExhausted))
+                    Err(StorageExhausted)
                 } else {
-                    Err(FsError(FragmentationLimit))
+                    Err(FragmentationLimit)
                 };
             },
             | Err(e) => return Err(e),
@@ -460,17 +457,17 @@ impl Fs {
         Ok(id)
     }
 
-    pub fn open_frange(self: &Arc<Self>, id: u64) -> Result<FRangeHandle, CesiumError> {
+    pub fn open_frange(self: &Arc<Self>, id: u64) -> Result<FRangeHandle, FsError> {
         let mut open_franges = self.open_franges.write();
 
         if !open_franges.insert(id) {
-            return Err(FsError(FRangeAlreadyOpen));
+            return Err(FRangeAlreadyOpen);
         }
 
         let franges = self.franges.read();
         let metadata = match franges.get(&id) {
             | None => {
-                return Err(FsError(FRangeNotFound));
+                return Err(FRangeNotFound);
             },
             | Some(v) => v.value().clone(), // Dereference and clone the value
         };
@@ -483,13 +480,13 @@ impl Fs {
         })
     }
 
-    pub fn close_frange(self: &Arc<Self>, handle: FRangeHandle) -> Result<(), CesiumError> {
+    pub fn close_frange(self: &Arc<Self>, handle: FRangeHandle) -> Result<(), FsError> {
         // Update metadata first
         {
             let franges = self.franges.write();
             match franges.get(&handle.metadata.id) {
                 | None => {
-                    return Err(FsError(FRangeNotFound));
+                    return Err(FRangeNotFound);
                 },
                 | Some(entry) => {
                     let updated = entry.value().clone();
@@ -518,9 +515,9 @@ impl Fs {
         self.maybe_flush(true)
     }
 
-    pub fn delete_frange(self: &Arc<Self>, id: u64) -> Result<(), CesiumError> {
+    pub fn delete_frange(self: &Arc<Self>, id: u64) -> Result<(), FsError> {
         if self.open_franges.read().contains(&id) {
-            return Err(FsError(FRangeStillOpen));
+            return Err(FRangeStillOpen);
         }
 
         // Remove the frange from the franges map
@@ -550,12 +547,12 @@ impl Fs {
     }
 
     /// Sync all changes to disk
-    pub fn sync(self: &Arc<Self>) -> Result<(), CesiumError> {
+    pub fn sync(self: &Arc<Self>) -> Result<(), FsError> {
         self.flush_dirty_pages()
     }
 
     /// Persist metadata changes to disk
-    fn persist_metadata(self: &Arc<Self>) -> Result<(), CesiumError> {
+    fn persist_metadata(self: &Arc<Self>) -> Result<(), FsError> {
         let metadata = {
             let metadata = FsMetadata::new();
 
@@ -620,10 +617,10 @@ impl Fs {
                     // Update header with new metadata size
                     header.metadata_size = new_size as u64;
                 } else {
-                    return Err(FsError(InsufficientSpace));
+                    return Err(InsufficientSpace);
                 }
             } else {
-                return Err(FsError(NoAdjacentSpace));
+                return Err(NoAdjacentSpace);
             }
         }
 
@@ -660,7 +657,7 @@ impl Fs {
         self: &Arc<Self>,
         free: &RwLockWriteGuard<SkipSet<OrderedRange>>,
         size: u64,
-    ) -> Result<OrderedRange, CesiumError> {
+    ) -> Result<OrderedRange, FsError> {
         // Find the rightmost suitable range by iterating in reverse
         let suitable_range = match free.iter().rev().find(|r| r.end - r.start >= size) {
             | None => {
@@ -686,7 +683,7 @@ impl Fs {
         })
     }
 
-    fn coalesce_free_ranges(self: &Arc<Self>) -> Result<(), CesiumError> {
+    fn coalesce_free_ranges(self: &Arc<Self>) -> Result<(), FsError> {
         let free = self.free_ranges.write();
         let mut ranges: Vec<OrderedRange> = free.iter().map(|entry| (*entry).clone()).collect();
         ranges.sort();
@@ -710,7 +707,7 @@ impl Fs {
         Ok(())
     }
 
-    pub(crate) fn maybe_flush(self: &Arc<Self>, force: bool) -> Result<(), CesiumError> {
+    pub(crate) fn maybe_flush(self: &Arc<Self>, force: bool) -> Result<(), FsError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -732,7 +729,7 @@ impl Fs {
         self.flush_dirty_pages()
     }
 
-    fn flush_dirty_pages(self: &Arc<Self>) -> Result<(), CesiumError> {
+    fn flush_dirty_pages(self: &Arc<Self>) -> Result<(), FsError> {
         // First collect pages
         let pages = {
             let dirty_pages = self.dirty_pages.write();
@@ -868,7 +865,7 @@ impl Fs {
 
 impl Fs {
     /// Check if compaction is needed and perform it if necessary
-    pub fn maybe_compact(self: &Arc<Self>) -> Result<bool, CesiumError> {
+    pub fn maybe_compact(self: &Arc<Self>) -> Result<bool, FsError> {
         self.maybe_compact_with_config(&CompactionConfig::default())
     }
 
@@ -876,7 +873,7 @@ impl Fs {
     pub fn maybe_compact_with_config(
         self: &Arc<Self>,
         config: &CompactionConfig,
-    ) -> Result<bool, CesiumError> {
+    ) -> Result<bool, FsError> {
         // First check if compaction is needed
         let stats = self.fragmentation_stats();
         let total_space = self.total_free_space() + self.total_used_space();
@@ -910,7 +907,7 @@ impl Fs {
     fn find_compaction_candidates(
         self: &Arc<Self>,
         config: &CompactionConfig,
-    ) -> Result<Vec<(u64, FRangeMetadata)>, CesiumError> {
+    ) -> Result<Vec<(u64, FRangeMetadata)>, FsError> {
         let mut candidates = Vec::new();
 
         // Only consider closed franges
@@ -948,7 +945,7 @@ impl Fs {
         self: &Arc<Self>,
         buffer_size: usize,
         candidates: Vec<(u64, FRangeMetadata)>,
-    ) -> Result<(), CesiumError> {
+    ) -> Result<(), FsError> {
         for (id, metadata) in candidates {
             // Skip if frange was opened while preparing compaction
             if self.open_franges.read().contains(&id) {
@@ -1020,7 +1017,7 @@ impl Fs {
             // Get the new range information
             let new_range = {
                 match self.franges.read().get(&new_id) {
-                    | None => return Err(FsError(FRangeNotFound)),
+                    | None => return Err(FRangeNotFound),
                     | Some(v) => v,
                 }
                 .value()
@@ -1032,7 +1029,7 @@ impl Fs {
             {
                 let mut updated = match self.franges.read().get(&id) {
                     | None => {
-                        return Err(FsError(FRangeNotFound));
+                        return Err(FRangeNotFound);
                     },
                     | Some(v) => v.value().clone(),
                 };
@@ -1056,13 +1053,13 @@ impl Fs {
 
         // Finalize metadata persist and coalesce
         match self.persist_metadata() {
-            Ok(_) => {}
-            Err(e) => return Err(e),
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
         };
-        
+
         match self.coalesce_free_ranges() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
+            | Ok(_) => Ok(()),
+            | Err(e) => Err(e),
         }
     }
 }
@@ -1158,15 +1155,15 @@ impl FRangeHandle {
     /// locations.
     /// - There is pointer arithmetic to calculate the destination pointer.
     /// - There is a `memcpy` with a raw pointer.
-    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), CesiumError> {
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), FsError> {
         if offset as usize + data.len() > (self.range.end - self.range.start) as usize {
-            return Err(FsError(ReadOutOfBounds));
+            return Err(ReadOutOfBounds);
         }
 
         let base = self.range.start as usize + offset as usize;
 
         if base + data.len() > self.range.end as usize {
-            return Err(FsError(WriteOutOfBounds));
+            return Err(WriteOutOfBounds);
         }
 
         // Mark affected pages as dirty
@@ -1215,10 +1212,10 @@ impl FRangeHandle {
     /// memory locations.
     /// - Builds a slice from a raw pointer.
     /// - Performs pointer arithmetic to calculate the source pointer.
-    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), CesiumError> {
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         // First check if the read would be out of bounds of our allocated range
         if offset as usize + buf.len() > (self.range.end - self.range.start) as usize {
-            return Err(FsError(ReadOutOfBounds));
+            return Err(ReadOutOfBounds);
         }
 
         // Then handle EOF case
@@ -1323,7 +1320,7 @@ mod tests {
 
     use crate::{
         block::BLOCK_SIZE,
-        errs::CesiumError::InvalidHeaderFormat,
+        errs::FsError::InvalidHeaderFormat,
         fs::{
             deserialize_header,
             CompactionConfig,
@@ -2321,10 +2318,7 @@ mod e2e_tests {
         let max_id = fs.create_frange(available_space).unwrap();
 
         // Attempt to create another frange should fail
-        assert!(matches!(
-            fs.create_frange(1024),
-            Err(FsError(StorageExhausted))
-        ));
+        assert!(matches!(fs.create_frange(1024), Err(StorageExhausted)));
 
         // Delete the large frange
         fs.delete_frange(max_id).unwrap();
