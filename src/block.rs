@@ -326,6 +326,9 @@ impl<'a> Iterator for BlockIterator<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::question_mark_used)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::*;
 
