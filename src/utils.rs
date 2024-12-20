@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 pub(crate) trait Serializer {
     fn serialize_for_memory(&self) -> Bytes;

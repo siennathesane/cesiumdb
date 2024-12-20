@@ -40,8 +40,10 @@ use crossbeam_skiplist::{
     SkipSet,
 };
 use gxhash::HashSet;
-use memmap2::MmapMut;
-use memmap2::UncheckedAdvice::DontNeed;
+use memmap2::{
+    MmapMut,
+    UncheckedAdvice::DontNeed,
+};
 use parking_lot::{
     RwLock,
     RwLockWriteGuard,
@@ -486,11 +488,16 @@ impl Fs {
                 },
                 | Some(entry) => {
                     let mut updated = entry.value().clone();
-                    updated.modified_at.store( SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(), SeqCst);
-                    updated.length.store( handle.metadata.length.load(SeqCst), SeqCst);
+                    updated.modified_at.store(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        SeqCst,
+                    );
+                    updated
+                        .length
+                        .store(handle.metadata.length.load(SeqCst), SeqCst);
                     franges.insert(handle.metadata.id, updated);
                 },
             };
@@ -923,19 +930,24 @@ impl Fs {
                 continue;
             }
 
-            match self.mmap.advise_range(memmap2::Advice::WillNeed, (metadata.range.end - metadata.range.start) as usize, metadata.range.start as usize) {
+            match self.mmap.advise_range(
+                memmap2::Advice::WillNeed,
+                (metadata.range.end - metadata.range.start) as usize,
+                metadata.range.start as usize,
+            ) {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
-            }
+            };
 
             // Create new frange with exact size needed
             let new_id = self.create_frange(metadata.length.load(SeqCst))?;
             let mut new_handle = self.open_frange(new_id)?;
 
             // Read data from old frange
-            // TODO(@siennathesane): find a more efficient way to copy data. since we are using
-            // the `FRangeHandle` API, realistically we can load the ranges, calculate the offsets,
-            // then directly copy data with a single memcpy from the source to the dest.
+            // TODO(@siennathesane): find a more efficient way to copy data. since we are
+            // using the `FRangeHandle` API, realistically we can load the
+            // ranges, calculate the offsets, then directly copy data with a
+            // single memcpy from the source to the dest.
             let old_handle = self.open_frange(id)?;
             let mut buffer = BytesMut::zeroed(buffer_size); // Use 4KB buffer for copying
 
@@ -1059,7 +1071,7 @@ pub(crate) struct FRangeMetadata {
     range: OrderedRange,
     id: u64,
     length: AtomicU64, // Track actual bytes written
-    size: u64,   // Keep this as allocated size
+    size: u64,         // Keep this as allocated size
     created_at: u64,
     modified_at: AtomicU64,
 }
@@ -1111,12 +1123,15 @@ impl FRangeHandle {
 
         fence(SeqCst);
 
-        self.metadata.length.fetch_add( data.len() as u64, SeqCst);
+        self.metadata.length.fetch_add(data.len() as u64, SeqCst);
 
-        self.metadata.modified_at.store(SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs(), SeqCst);
+        self.metadata.modified_at.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            SeqCst,
+        );
 
         // Maybe flush
         self.fs.maybe_flush(false)?;
@@ -1186,11 +1201,16 @@ impl Drop for FRangeHandle {
                 | None => {},
                 | Some(entry) => {
                     let mut updated = entry.value().clone();
-                    updated.modified_at.store( SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(), SeqCst);
-                    updated.length.store(self.metadata.length.load(SeqCst), SeqCst);
+                    updated.modified_at.store(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        SeqCst,
+                    );
+                    updated
+                        .length
+                        .store(self.metadata.length.load(SeqCst), SeqCst);
                     franges.insert(self.metadata.id, updated);
                 },
             };
@@ -1212,11 +1232,14 @@ mod tests {
         },
         io::Read,
         sync::{
-            atomic::Ordering::Acquire,
+            atomic::Ordering::{
+                Acquire,
+                SeqCst,
+            },
             Arc,
         },
     };
-    use std::sync::atomic::Ordering::SeqCst;
+
     use memmap2::MmapMut;
     use tempfile::tempdir;
 

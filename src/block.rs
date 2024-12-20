@@ -1,4 +1,5 @@
 use std::ptr;
+
 use bytes::{
     BufMut,
     Bytes,
@@ -6,13 +7,37 @@ use bytes::{
 };
 
 use crate::{
-    errs::CesiumError,
+    errs::{
+        BlockError::{
+            BlockFull,
+            TooLargeForBlock,
+        },
+        CesiumError,
+        CesiumError::BlockError,
+    },
     utils::Deserializer,
 };
 
+/// The size of a block in bytes. This is the most common page size for memory
+/// and NVMe devices.
 pub(crate) const BLOCK_SIZE: usize = 4096;
-pub(crate) const ENTRY_SIZE: usize = size_of::<u16>();
+/// The size of an entry in a block. An entry consists of a 2-byte offset and a
+/// byte flag for the entry type.
+pub(crate) const ENTRY_SIZE: usize = size_of::<u16>() + size_of::<u8>();
 const MAX_ENTRIES: usize = BLOCK_SIZE / ENTRY_SIZE;
+/// The overhead of a block, which is the space taken up by the offsets and
+/// flags.
+pub(crate) const BLOCK_OVERHEAD: usize = BLOCK_SIZE - MAX_ENTRIES;
+
+/// Flags to mark entry types in a block
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum EntryFlag {
+    Complete = 0, // Regular complete entry
+    Start    = 1, // Start of a multi-block entry
+    Middle   = 2, // Middle of a multi-block entry
+    End      = 3, // End of a multi-block entry
+}
 
 /// A single block of data in the table. The block is a fixed size and is
 /// divided into two parts:
@@ -24,7 +49,8 @@ pub(crate) struct Block {
     num_entries: u16,
     /// The entry offsets, it's just a [u16].
     offsets: BytesMut,
-    /// The actual entries, it's just a [[Bytes]].
+    /// The actual entries, it's just a single flag byte followed by the
+    /// [[Bytes]].
     entries: BytesMut,
 }
 
@@ -41,20 +67,16 @@ impl Block {
 
     /// Add an entry to the block. If the block is full, an error will be
     /// returned.
-    pub(crate) fn add_entry(&mut self, entry: &[u8]) -> Result<(), CesiumError> {
-        // check if the entry itself is too large to fit in an empty block
-        if entry.len() + size_of::<u16>() > BLOCK_SIZE {
-            return Err(CesiumError::TooLargeForBlock);
-        }
-
-        // check if the block is full
-        if self.is_full() {
-            return Err(CesiumError::BlockFull);
-        }
-
-        // check if the entry can fit in the remaining space of the block
-        if entry.len() + self.entries.len() + self.offsets.len() + size_of::<u16>() > BLOCK_SIZE {
-            return Err(CesiumError::TooLargeForBlock);
+    pub(crate) fn add_entry(&mut self, entry: &[u8], flag: EntryFlag) -> Result<(), CesiumError> {
+        let entry_size = entry.len() + size_of::<u16>() + size_of::<u8>();
+        if !self.will_fit(entry_size) {
+            if self.is_empty() {
+                // notify the caller to try again with a smaller entry
+                return Err(BlockError(TooLargeForBlock));
+            } else {
+                // notify the caller that the block is full
+                return Err(BlockError(BlockFull));
+            }
         }
 
         // calculate the next offset
@@ -63,10 +85,11 @@ impl Block {
             let offset = &self.offsets[self.offsets.len() - 2..];
             current_offset = u16::from_le_bytes([offset[0], offset[1]]);
         }
-        let next_offset = current_offset + (entry.len() as u16);
+        let next_offset = current_offset + (entry_size as u16);
 
         // add the entry and update the offsets
         self.offsets.put_u16_le(next_offset);
+        self.offsets.put_u8(flag as u8); // flag for complete entry
         self.entries.put_slice(entry);
         self.num_entries += 1;
 
@@ -109,7 +132,7 @@ impl Block {
     }
 
     #[inline]
-    pub fn get(&self, index: usize) -> Option<&[u8]> {
+    pub fn get(&self, index: usize) -> Option<(EntryFlag, &[u8])> {
         if index >= self.num_entries as usize {
             return None;
         }
@@ -129,7 +152,21 @@ impl Block {
             self.entries.len()
         };
 
-        Some(&self.entries[start_offset..end_offset])
+        let entry_data = &self.entries[start_offset..end_offset];
+        let flag = match entry_data[0] {
+            | 0 => EntryFlag::Complete,
+            | 1 => EntryFlag::Start,
+            | 2 => EntryFlag::Middle,
+            | 3 => EntryFlag::End,
+            | _ => unreachable!("invalid entry flag"),
+        };
+
+        Some((flag, &entry_data[1..]))
+    }
+
+    /// Add an entry that is part of a single block.
+    pub(crate) fn add_complete_entry(&mut self, entry: &[u8]) -> Result<(), CesiumError> {
+        self.add_entry(entry, EntryFlag::Complete)
     }
 
     /// Returns an iterator over the entries in the block.
@@ -146,10 +183,12 @@ impl Block {
 
 /// Helper methods.
 impl Block {
+    #[inline]
     pub(crate) fn offsets(&self) -> &[u8] {
         self.offsets.as_ref()
     }
 
+    #[inline]
     pub(crate) fn entries(&self) -> &[u8] {
         self.entries.as_ref()
     }
@@ -172,6 +211,26 @@ impl Block {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == size_of::<u16>()
+    }
+
+    #[inline]
+    pub fn num_entries(&self) -> u16 {
+        self.num_entries
+    }
+
+    /// Check if an entry of given size will fit in this block
+    #[inline]
+    pub fn will_fit(&self, entry_size: usize) -> bool {
+        // account for:
+        // 1. the entry data itself
+        // 2. the flag byte
+        // 3. the offset entry (u16)
+        // 4. existing data (offsets + entries + num_entries)
+        let required_space = entry_size + 1 + size_of::<u16>();
+
+        let available = BLOCK_SIZE - self.len();
+
+        available >= required_space
     }
 }
 
@@ -222,7 +281,7 @@ pub struct BlockIterator<'a> {
 }
 
 impl<'a> Iterator for BlockIterator<'a> {
-    type Item = &'a [u8];
+    type Item = (EntryFlag, &'a [u8]);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -246,8 +305,17 @@ impl<'a> Iterator for BlockIterator<'a> {
             self.entries.len()
         };
 
+        let entry_data = &self.entries[start_offset..end_offset];
+        let flag = match entry_data[0] {
+            | 0 => EntryFlag::Complete,
+            | 1 => EntryFlag::Start,
+            | 2 => EntryFlag::Middle,
+            | 3 => EntryFlag::End,
+            | _ => unreachable!("invalid entry flag"),
+        };
+
         self.current += 1;
-        Some(&self.entries[start_offset..end_offset])
+        Some((flag, &entry_data[1..]))
     }
 
     #[inline]
@@ -275,7 +343,7 @@ mod tests {
     fn test_add_entry_success() {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
-        assert!(block.add_entry(&entry).is_ok());
+        assert!(block.add_entry(&entry, EntryFlag::Complete).is_ok());
         assert_eq!(block.num_entries, 1);
         assert_eq!(block.entries(), &entry);
     }
@@ -285,8 +353,8 @@ mod tests {
         let mut block = Block::new();
         let entry = [0u8; BLOCK_SIZE];
         assert!(matches!(
-            block.add_entry(&entry),
-            Err(CesiumError::TooLargeForBlock)
+            block.add_entry(&entry, EntryFlag::Complete),
+            Err(BlockError(TooLargeForBlock))
         ));
     }
 
@@ -295,8 +363,8 @@ mod tests {
         let mut block = Block::new();
         let entry = vec![0u8; BLOCK_SIZE - size_of::<u16>() + 1];
         assert!(matches!(
-            block.add_entry(&entry),
-            Err(CesiumError::TooLargeForBlock)
+            block.add_entry(&entry, EntryFlag::Complete),
+            Err(BlockError(TooLargeForBlock))
         ));
     }
 
@@ -305,8 +373,8 @@ mod tests {
         let mut block = Block::new();
         let entry1 = [1, 2, 3, 4];
         let entry2 = [5, 6, 7, 8];
-        assert!(block.add_entry(&entry1).is_ok());
-        assert!(block.add_entry(&entry2).is_ok());
+        assert!(block.add_entry(&entry1, EntryFlag::Complete).is_ok());
+        assert!(block.add_entry(&entry2, EntryFlag::Complete).is_ok());
         assert_eq!(block.num_entries, 2);
         assert_eq!(block.entries(), &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
@@ -315,7 +383,7 @@ mod tests {
     fn test_add_entry_remaining_space() {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
         let expected_remaining =
             BLOCK_SIZE - (size_of::<u16>() + block.offsets.len() + block.entries.len());
         assert_eq!(block.remaining_space(), expected_remaining);
@@ -325,7 +393,7 @@ mod tests {
     fn test_add_entry_is_full() {
         let mut block = Block::new();
         let entry = [0u8; BLOCK_SIZE - MAX_ENTRIES];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
         assert!(block.is_full());
     }
 
@@ -344,7 +412,7 @@ mod tests {
     fn test_finalize_single_entry() {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
         let mut buffer = vec![0u8; BLOCK_SIZE];
         unsafe {
             block.finalize(buffer.as_mut_ptr());
@@ -361,8 +429,8 @@ mod tests {
         let mut block = Block::new();
         let entry1 = [1, 2, 3, 4];
         let entry2 = [5, 6, 7, 8];
-        block.add_entry(&entry1).unwrap();
-        block.add_entry(&entry2).unwrap();
+        block.add_entry(&entry1, EntryFlag::Complete).unwrap();
+        block.add_entry(&entry2, EntryFlag::Complete).unwrap();
         let mut buffer = vec![0u8; BLOCK_SIZE];
         unsafe {
             block.finalize(buffer.as_mut_ptr());
@@ -380,7 +448,7 @@ mod tests {
     fn test_finalize_full_block() {
         let mut block = Block::new();
         let entry = [0u8; BLOCK_SIZE - MAX_ENTRIES];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
         let mut buffer = vec![0u8; BLOCK_SIZE];
         unsafe {
             block.finalize(buffer.as_mut_ptr());
@@ -398,9 +466,9 @@ mod tests {
     fn test_finalize_partial_block() {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
         let entry2 = [5, 6, 7, 8, 9, 10];
-        block.add_entry(&entry2).unwrap();
+        block.add_entry(&entry2, EntryFlag::Complete).unwrap();
         let mut buffer = vec![0u8; BLOCK_SIZE];
         unsafe {
             block.finalize(buffer.as_mut_ptr());
@@ -425,10 +493,10 @@ mod tests {
     fn test_iterator_single_entry() {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
 
         let mut iter = block.iter();
-        assert_eq!(iter.next(), Some(&entry[..]));
+        assert_eq!(iter.next(), Some((EntryFlag::Complete, &entry[..])));
         assert_eq!(iter.next(), None);
     }
 
@@ -437,20 +505,20 @@ mod tests {
         let mut block = Block::new();
         let entry1 = [1, 2, 3, 4];
         let entry2 = [5, 6, 7, 8];
-        block.add_entry(&entry1).unwrap();
-        block.add_entry(&entry2).unwrap();
+        block.add_entry(&entry1, EntryFlag::Complete).unwrap();
+        block.add_entry(&entry2, EntryFlag::Complete).unwrap();
 
         let mut iter = block.iter();
-        assert_eq!(iter.next(), Some(&entry1[..]));
-        assert_eq!(iter.next(), Some(&entry2[..]));
+        assert_eq!(iter.next(), Some((EntryFlag::Complete, &entry1[..])));
+        assert_eq!(iter.next(), Some((EntryFlag::Complete, &entry2[..])));
         assert_eq!(iter.next(), None);
     }
 
     #[test]
     fn test_iterator_size_hint() {
         let mut block = Block::new();
-        block.add_entry(&[1, 2, 3, 4]).unwrap();
-        block.add_entry(&[5, 6, 7, 8]).unwrap();
+        block.add_entry(&[1, 2, 3, 4], EntryFlag::Complete).unwrap();
+        block.add_entry(&[5, 6, 7, 8], EntryFlag::Complete).unwrap();
 
         let mut iter = block.iter();
         assert_eq!(iter.size_hint(), (2, Some(2)));
@@ -517,9 +585,9 @@ mod tests {
     fn test_get_single_entry() {
         let mut block = Block::new();
         let entry = [1, 2, 3, 4];
-        block.add_entry(&entry).unwrap();
+        block.add_entry(&entry, EntryFlag::Complete).unwrap();
 
-        assert_eq!(block.get(0), Some(&entry[..]));
+        assert_eq!(block.get(0), Some((EntryFlag::Complete, &entry[..])));
         assert_eq!(block.get(1), None);
     }
 
@@ -530,13 +598,13 @@ mod tests {
         let entry2 = [5, 6, 7, 8];
         let entry3 = [9, 10];
 
-        block.add_entry(&entry1).unwrap();
-        block.add_entry(&entry2).unwrap();
-        block.add_entry(&entry3).unwrap();
+        block.add_entry(&entry1, EntryFlag::Complete).unwrap();
+        block.add_entry(&entry2, EntryFlag::Complete).unwrap();
+        block.add_entry(&entry3, EntryFlag::Complete).unwrap();
 
-        assert_eq!(block.get(0), Some(&entry1[..]));
-        assert_eq!(block.get(1), Some(&entry2[..]));
-        assert_eq!(block.get(2), Some(&entry3[..]));
+        assert_eq!(block.get(0), Some((EntryFlag::Complete, &entry1[..])));
+        assert_eq!(block.get(1), Some((EntryFlag::Complete, &entry2[..])));
+        assert_eq!(block.get(2), Some((EntryFlag::Complete, &entry3[..])));
         assert_eq!(block.get(3), None);
     }
 
@@ -547,19 +615,19 @@ mod tests {
         let entry2 = [2, 3, 4, 5, 6];
         let entry3 = [7, 8, 9];
 
-        block.add_entry(&entry1).unwrap();
-        block.add_entry(&entry2).unwrap();
-        block.add_entry(&entry3).unwrap();
+        block.add_entry(&entry1, EntryFlag::Complete).unwrap();
+        block.add_entry(&entry2, EntryFlag::Complete).unwrap();
+        block.add_entry(&entry3, EntryFlag::Complete).unwrap();
 
-        assert_eq!(block.get(0), Some(&entry1[..]));
-        assert_eq!(block.get(1), Some(&entry2[..]));
-        assert_eq!(block.get(2), Some(&entry3[..]));
+        assert_eq!(block.get(0), Some((EntryFlag::Complete, &entry1[..])));
+        assert_eq!(block.get(1), Some((EntryFlag::Complete, &entry2[..])));
+        assert_eq!(block.get(2), Some((EntryFlag::Complete, &entry3[..])));
     }
 
     #[test]
     fn test_get_out_of_bounds() {
         let mut block = Block::new();
-        block.add_entry(&[1, 2, 3]).unwrap();
+        block.add_entry(&[1, 2, 3], EntryFlag::Complete).unwrap();
 
         assert_eq!(block.get(1), None);
         assert_eq!(block.get(usize::MAX), None);
@@ -571,12 +639,12 @@ mod tests {
         let entries = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9]];
 
         for entry in &entries {
-            block.add_entry(entry).unwrap();
+            block.add_entry(entry, EntryFlag::Complete).unwrap();
         }
 
         // Verify get() matches iterator results
         for (i, entry) in entries.iter().enumerate() {
-            assert_eq!(block.get(i), Some(entry.as_slice()));
+            assert_eq!(block.get(i), Some((EntryFlag::Complete, entry.as_slice())));
         }
     }
 }

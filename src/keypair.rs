@@ -164,23 +164,6 @@ impl Deserializer for Key<Bytes> {
     #[instrument(level = "trace")]
     #[inline]
     fn deserialize(slice: Bytes) -> Self {
-        #[cfg(feature = "secure")]
-        {
-            let mut hasher = Hasher::new();
-            hasher.update(&slice[16..slice.len() - 16]);
-            let checksum = hasher.finalize();
-
-            let mut ecc_arr = [0_u8; 4];
-            ecc_arr.copy_from_slice(&slice[0..4]);
-            let existing_checksum = u32::from_le_bytes(ecc_arr);
-
-            assert_eq!(
-                existing_checksum, checksum,
-                "key record has wrong checksum. found: {} computed: {}",
-                existing_checksum, checksum
-            );
-        }
-
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&slice[8..16]);
 
@@ -231,6 +214,22 @@ impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
     }
 }
 
+impl From<Bytes> for Key<Bytes> {
+    fn from(val: Bytes) -> Self {
+        let mut ns_arr = [0u8; 8];
+        ns_arr.copy_from_slice(&val[0..8]);
+
+        let mut ts_arr = [0u8; 16];
+        ts_arr.copy_from_slice(&val[val.len() - 16..]);
+
+        Key {
+            ns: u64::from_le_bytes(ns_arr),
+            key: Bytes::copy_from_slice(&val[16..val.len() - 8]),
+            ts: u128::MAX - u128::from_le_bytes(ts_arr),
+        }
+    }
+}
+
 #[derive(Debug, Eq, Clone, Copy, PartialEq)]
 pub struct Value<T: AsRef<[u8]>> {
     pub ns: u64,
@@ -273,23 +272,6 @@ impl ValueBytes {
     #[instrument(level = "trace")]
     #[inline]
     pub fn deserialize_from_disk(slice: Bytes) -> Self {
-        #[cfg(feature = "secure")]
-        {
-            let mut hasher = Hasher::new();
-            hasher.update(&slice[16..slice.len() - 8]);
-            let checksum = hasher.finalize();
-
-            let mut ecc_arr = [0_u8; 4];
-            ecc_arr.copy_from_slice(&slice[0..4]);
-            let existing_checksum = u32::from_le_bytes(ecc_arr);
-
-            assert_eq!(
-                existing_checksum, checksum,
-                "value record has wrong checksum. found: {} computed: {}",
-                existing_checksum, checksum
-            );
-        }
-
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&slice[8..16]);
 
@@ -360,6 +342,18 @@ impl<T: AsRef<[u8]> + PartialOrd> PartialOrd for Value<T> {
 impl<T: AsRef<[u8]> + Ord> Ord for Value<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         (self.ns, self.value.as_ref()).cmp(&(other.ns, other.value.as_ref()))
+    }
+}
+
+impl From<Bytes> for Value<Bytes> {
+    fn from(val: Bytes) -> Self {
+        let mut ns_arr = [0u8; 8];
+        ns_arr.copy_from_slice(&val[0..8]);
+
+        Value {
+            ns: u64::from_le_bytes(ns_arr),
+            value: Bytes::copy_from_slice(&val[16..val.len() - 8]),
+        }
     }
 }
 

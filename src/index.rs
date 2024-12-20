@@ -3,11 +3,25 @@ use std::{
     sync::Arc,
 };
 
-use bloom2::{Bloom2, BloomFilterBuilder, CompressedBitmap};
-use bloom2::FilterSize::KeyBytes3;
-use bytes::{BufMut, Bytes, BytesMut};
+use bloom2::{
+    Bloom2,
+    BloomFilterBuilder,
+    CompressedBitmap,
+    FilterSize::KeyBytes4,
+};
+use bytes::{
+    BufMut,
+    Bytes,
+    BytesMut,
+};
 use gxhash::gxhash64;
-use crate::utils::{Deserializer, Serializer};
+
+use crate::utils::{
+    Deserializer,
+    Serializer,
+};
+
+// TODO(@siennathesane): this needs to be configurable
 
 pub(crate) struct SegmentIndex {
     // serialized fields
@@ -18,7 +32,7 @@ pub(crate) struct SegmentIndex {
     ns_offset_size: u64,
     block_offset_size: u64,
     block_starting_keys_hash_offsets_size: u64,
-    
+
     // serialized fields
     block_starting_key_hash_offsets: BytesMut,
     block_offsets: BytesMut,
@@ -30,9 +44,9 @@ pub(crate) struct SegmentIndex {
 }
 
 impl SegmentIndex {
-    fn new(idx: u64, seed: i64) -> Arc<Self> {
-        Arc::new(Self {
-            id: idx,
+    pub(crate) fn new(id: u64, seed: i64) -> Self {
+        Self {
+            id,
             bloom_filter_seed: seed,
             bloom_filter_size: 0,
             bloom_filter_offset: 0,
@@ -43,26 +57,28 @@ impl SegmentIndex {
             block_offsets: BytesMut::new(),
             ns_offsets: BytesMut::new(),
             bloom_filter: BytesMut::new(),
-            active_bloom: BloomFilterBuilder::default().size(KeyBytes3).build(),
-        })
+            active_bloom: BloomFilterBuilder::default().size(KeyBytes4).build(),
+        }
     }
 
     /// Add an item to the index.
-    pub(crate) fn add_item(&mut self, item: Bytes) {
-        self.active_bloom.insert(&gxhash64(&item, self.bloom_filter_seed));
+    pub(crate) fn add_item(&mut self, item: &[u8]) {
+        self.active_bloom
+            .insert(&gxhash64(&item, self.bloom_filter_seed));
     }
 
     /// Add a block to the index.
-    pub(crate) fn add_block(&mut self, starting_key: Bytes) {
+    pub(crate) fn add_block(&mut self, starting_key: &[u8]) {
         self.block_offset_size += 1;
-        self.block_offsets.extend_from_slice(&gxhash64(&starting_key, self.bloom_filter_seed).to_le_bytes());
+        self.block_offsets
+            .extend_from_slice(&gxhash64(&starting_key, self.bloom_filter_seed).to_le_bytes());
     }
 
     /// Add a namespace offset to the most recently added block.
-    pub(crate) fn add_ns_offset(&mut self, ns :u64) {
+    pub(crate) fn add_ns_offset(&mut self, ns: u64) {
         self.ns_offset_size += 1;
         let cur_block_offset = self.block_offsets[self.block_offsets.len() - 8..].as_ref();
-        self.ns_offsets.extend_from_slice(u64::from_le_bytes(cur_block_offset.try_into().unwrap()).to_le_bytes().as_ref());
+        self.ns_offsets.extend_from_slice(cur_block_offset);
     }
 }
 
@@ -101,14 +117,32 @@ impl Deserializer for SegmentIndex {
         let bloom_filter_offset = u64::from_le_bytes(payload[24..32].try_into().unwrap());
         let ns_offset_size = u64::from_le_bytes(payload[32..40].try_into().unwrap());
         let block_offset_size = u64::from_le_bytes(payload[40..48].try_into().unwrap());
-        let block_starting_keys_hash_offsets_size = u64::from_le_bytes(payload[48..56].try_into().unwrap());
-        let block_starting_key_hash_offsets = BytesMut::from(&payload[56..56 + block_starting_keys_hash_offsets_size as usize]);
-        let block_offsets = BytesMut::from(&payload[56 + block_starting_keys_hash_offsets_size as usize..56 + block_starting_keys_hash_offsets_size as usize + block_offset_size as usize * 8]);
-        let ns_offsets = BytesMut::from(&payload[56 + block_starting_keys_hash_offsets_size as usize + block_offset_size as usize * 8..56 + block_starting_keys_hash_offsets_size as usize + block_offset_size as usize * 8 + ns_offset_size as usize * 8]);
-        let bloom_filter = BytesMut::from(&payload[56 + block_starting_keys_hash_offsets_size as usize + block_offset_size as usize * 8 + ns_offset_size as usize * 8..]);
-        
-        let active_bloom = BloomFilterBuilder::default().size(KeyBytes3).build();
-        
+        let block_starting_keys_hash_offsets_size =
+            u64::from_le_bytes(payload[48..56].try_into().unwrap());
+        let block_starting_key_hash_offsets =
+            BytesMut::from(&payload[56..56 + block_starting_keys_hash_offsets_size as usize]);
+        let block_offsets = BytesMut::from(
+            &payload[56 + block_starting_keys_hash_offsets_size as usize..
+                56 + block_starting_keys_hash_offsets_size as usize +
+                    block_offset_size as usize * 8],
+        );
+        let ns_offsets = BytesMut::from(
+            &payload[56 +
+                block_starting_keys_hash_offsets_size as usize +
+                block_offset_size as usize * 8..
+                56 + block_starting_keys_hash_offsets_size as usize +
+                    block_offset_size as usize * 8 +
+                    ns_offset_size as usize * 8],
+        );
+        let bloom_filter = BytesMut::from(
+            &payload[56 +
+                block_starting_keys_hash_offsets_size as usize +
+                block_offset_size as usize * 8 +
+                ns_offset_size as usize * 8..],
+        );
+
+        let active_bloom = BloomFilterBuilder::default().size(KeyBytes4).build();
+
         Self {
             id,
             bloom_filter_seed,

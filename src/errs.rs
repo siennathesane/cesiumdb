@@ -13,16 +13,24 @@ pub enum CesiumError {
     DataExceedsMaximum,
     #[error("memtable is frozen")]
     MemtableIsFrozen,
-    #[error("block is full")]
-    BlockFull,
-    #[error("entry is too large for block")]
-    TooLargeForBlock,
     #[error("no free space available")]
     NoFreeSpace,
     #[error("invalid header format")]
     InvalidHeaderFormat(String),
     #[error("fs error")]
     FsError(FsError),
+    #[error("block error")]
+    BlockError(BlockError)
+}
+
+#[derive(Error, Debug)]
+pub enum BlockError {
+    #[error("block is corrupted")]
+    CorruptedBlock,
+    #[error("block is full")]
+    BlockFull,
+    #[error("entry is too large for block")]
+    TooLargeForBlock,
 }
 
 #[derive(Error, Debug)]
@@ -55,6 +63,4 @@ pub enum FsError {
     InsufficientSpace,
     #[error("metadata too large")]
     MetadataTooLarge,
-    #[error("block is corrupted")]
-    CorruptedBlock,
 }

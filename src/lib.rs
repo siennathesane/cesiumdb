@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 #![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
+#![allow(bindings_with_variant_name)]
 #![allow(dead_code)] // TODO(@siennathesane): remove before release
 #![allow(unused)] // TODO(@siennathesane): remove before release
+// #![deny(clippy::question_mark_used)] // for @siennathesane's sanity
 
 #[cfg(not(unix))]
 compile_warn!("cesiumdb is not tested on windows");
@@ -52,7 +54,6 @@ pub mod keypair;
 pub mod memtable;
 pub mod merge;
 pub mod peek;
-mod sbtable;
 mod segment_writer;
 pub(crate) mod state;
 mod stats;
@@ -60,6 +61,7 @@ mod utils;
 mod segment_reader;
 mod block_alloc;
 mod index;
+mod segment;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and

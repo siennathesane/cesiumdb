@@ -1,22 +1,33 @@
-use std::{marker, mem, sync::{
-    atomic::{
-        AtomicBool,
-        AtomicUsize,
-        Ordering::Relaxed,
+use std::{
+    marker,
+    marker::PhantomData,
+    mem,
+    mem::ManuallyDrop,
+    sync::{
+        atomic::{
+            AtomicBool,
+            AtomicUsize,
+            Ordering::Relaxed,
+        },
+        Arc,
     },
-    Arc,
-}, thread};
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::thread::JoinHandle;
-use std::time::Duration;
+    thread,
+    thread::JoinHandle,
+    time::Duration,
+};
+
 use bytes::BytesMut;
 use crossbeam_queue::SegQueue;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{
+    Condvar,
+    Mutex,
+    RwLock,
+};
 
 use crate::{
     block::{
         Block,
+        EntryFlag::Complete,
         BLOCK_SIZE,
     },
     errs::{
@@ -27,10 +38,12 @@ use crate::{
             SegmentSizeInvalid,
         },
     },
-    fs::Fs,
+    fs::{
+        FRangeHandle,
+        Fs,
+    },
     stats::STATS,
 };
-use crate::fs::FRangeHandle;
 
 pub(crate) struct SegmentWriter {
     handle: Arc<FRangeHandle>,
@@ -64,12 +77,12 @@ impl SegmentWriter {
 
         // Spawn the worker thread
         thread::spawn(move || {
-            println!("Worker thread started"); // Debug
             let mut current_offset = 0;
 
             loop {
                 if let Some(block) = queue_clone.pop() {
-                    println!("Processing block at offset {}", current_offset); // Debug
+                    // TODO(@siennathesane): the block should be written directly to the handle
+                    // instead of a buffer.
 
                     // Create a buffer for the block data
                     let mut buffer = BytesMut::with_capacity(BLOCK_SIZE);
@@ -78,24 +91,19 @@ impl SegmentWriter {
                     unsafe {
                         block.finalize(buffer.as_mut_ptr());
                     }
-                    println!("Block finalized, first few bytes: {:?}", &buffer[..20]); // Debug
 
                     // Write the block to the handle
                     if let Err(e) = handle_clone.write_at(current_offset, &buffer) {
-                        println!("Error writing block: {:?}", e); // Debug
                         break;
                     }
-                    println!("Block written successfully"); // Debug
 
                     current_offset += BLOCK_SIZE as u64;
                 } else if done_clone.load(Relaxed) {
-                    println!("Worker thread done signal received"); // Debug
                     break;
                 }
             }
 
             // Notify completion
-            println!("Worker thread completing"); // Debug
             let _guard = completion_mutex_clone.lock();
             completion_condvar_clone.notify_one();
             STATS.current_threads.fetch_sub(1, Relaxed);
@@ -118,47 +126,41 @@ impl SegmentWriter {
             self.segment_full.store(true, Relaxed);
             return Err(FsError(SegmentFull));
         }
-        
+
         self.block_queue.push(block);
         self.blocks_left.fetch_sub(1, Relaxed);
 
         Ok(())
     }
-    
+
     pub(crate) fn write_index(&mut self, index: u64, data: &[u8]) -> Result<(), CesiumError> {
         if data.len() > BLOCK_SIZE {
             return Err(FsError(SegmentSizeInvalid));
         }
 
         let mut block = Block::new();
-        block.add_entry(data)?;
+        block.add_entry(data, Complete)?;
 
         self.write_block(block)
     }
 
     pub(crate) fn shutdown(&self) {
-        println!("Shutting down writer"); // Debug
         self.done.store(true, Relaxed);
     }
 }
 
 impl Drop for SegmentWriter {
     fn drop(&mut self) {
-        println!("SegmentWriter being dropped"); // Debug
         // Signal the worker thread to finish
         self.done.store(true, Relaxed);
 
         {
-            println!("Waiting for worker to complete"); // Debug
             let mut guard = self.completion_mutex.lock();
             // Wait for both queue to be empty AND worker to finish
             while !self.block_queue.is_empty() || !self.done.load(Relaxed) {
                 self.completion_condvar.wait(&mut guard);
-                println!("Woke up from wait, queue empty: {}, done: {}",
-                         self.block_queue.is_empty(), self.done.load(Relaxed)); // Debug
             }
         }
-        println!("SegmentWriter dropped"); // Debug
     }
 }
 
@@ -167,15 +169,15 @@ mod tests {
     use std::{
         fs::OpenOptions,
         path::PathBuf,
+        sync::Arc,
         thread,
         time::Duration,
-        sync::Arc,
     };
 
     use memmap2::MmapMut;
+    use parking_lot::RwLock;
     use rand::Rng;
     use tempfile::tempdir;
-    use parking_lot::RwLock;
 
     use super::*;
 
@@ -220,7 +222,7 @@ mod tests {
         let mut block = Block::new();
         // Only store values, not key-value pairs
         for (_, value) in entries {
-            block.add_entry(value)?;
+            block.add_entry(value, Complete)?;
         }
         Ok(block)
     }
@@ -229,8 +231,11 @@ mod tests {
         let num_entries = u16::from_le_bytes([data[0], data[1]]) as usize;
 
         if num_entries != expected_values.len() {
-            println!("Number of entries mismatch. Found: {}, Expected: {}",
-                     num_entries, expected_values.len());
+            println!(
+                "Number of entries mismatch. Found: {}, Expected: {}",
+                num_entries,
+                expected_values.len()
+            );
             return false;
         }
 
@@ -252,8 +257,10 @@ mod tests {
             let entry_data = &data[entries_start + entry_start..entries_start + entry_end];
 
             if entry_data != expected_value {
-                println!("Entry {} mismatch. Found: {:?}, Expected: {:?}",
-                         i, entry_data, expected_value);
+                println!(
+                    "Entry {} mismatch. Found: {:?}, Expected: {:?}",
+                    i, entry_data, expected_value
+                );
                 return false;
             }
         }
@@ -303,10 +310,11 @@ mod tests {
         println!("Expected values len: {}", values[0].len());
         println!("Expected first 20 bytes: {:?}", &values[0][..20]);
 
-        assert!(verify_block_contents(&buffer, &values),
-                "Block contents verification failed\nBuffer: {:?}\nExpected values: {:?}",
-                &buffer[..20],
-                &values
+        assert!(
+            verify_block_contents(&buffer, &values),
+            "Block contents verification failed\nBuffer: {:?}\nExpected values: {:?}",
+            &buffer[..20],
+            &values
         );
     }
 
@@ -433,7 +441,7 @@ mod tests {
         let mut handles = vec![];
 
         let total_threads = 10;
-        let blocks_per_thread = 5;  // Reduced from 50 to ensure we don't overflow
+        let blocks_per_thread = 5; // Reduced from 50 to ensure we don't overflow
         let total_blocks = total_threads * blocks_per_thread;
 
         // Verify we have enough space
@@ -459,17 +467,17 @@ mod tests {
 
                     let entries = vec![(key, value)];
                     match create_test_block(&entries) {
-                        Ok(block) => {
+                        | Ok(block) => {
                             let mut writer = writer_clone.lock();
                             if writer.write_block(block).is_err() {
                                 error_count.fetch_add(1, Relaxed);
                                 break; // Exit if we hit an error
                             }
                         },
-                        Err(_) => {
+                        | Err(_) => {
                             error_count.fetch_add(1, Relaxed);
                             break;
-                        }
+                        },
                     }
 
                     // Small random sleep to increase concurrency variations
@@ -491,7 +499,11 @@ mod tests {
         writer.shutdown();
 
         // Verify results
-        assert_eq!(error_count.load(Relaxed), 0, "Some threads encountered errors");
+        assert_eq!(
+            error_count.load(Relaxed),
+            0,
+            "Some threads encountered errors"
+        );
         assert_eq!(
             writer.blocks_left.load(Relaxed),
             segment_size as usize / BLOCK_SIZE - total_blocks
