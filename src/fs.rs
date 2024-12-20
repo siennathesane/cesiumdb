@@ -9,6 +9,7 @@ use std::{
     mem::ManuallyDrop,
     ops::Range,
     ptr,
+    slice::from_raw_parts,
     sync::{
         atomic,
         atomic::{
@@ -36,6 +37,7 @@ use bytes::{
     BytesMut,
 };
 use crossbeam_skiplist::{
+    map::Entry,
     SkipMap,
     SkipSet,
 };
@@ -68,6 +70,7 @@ use crate::{
             NoAdjacentSpace,
             ReadOutOfBounds,
             StorageExhausted,
+            WriteOutOfBounds,
         },
     },
 };
@@ -449,8 +452,10 @@ impl Fs {
             ranges.insert(id, metadata);
         }
 
-        // Persist changes
-        self.persist_metadata()?;
+        match self.persist_metadata() {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        };
 
         Ok(id)
     }
@@ -487,7 +492,7 @@ impl Fs {
                     return Err(FsError(FRangeNotFound));
                 },
                 | Some(entry) => {
-                    let mut updated = entry.value().clone();
+                    let updated = entry.value().clone();
                     updated.modified_at.store(
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -576,12 +581,14 @@ impl Fs {
         let mut header = {
             let mut header_bytes = [0u8; size_of::<FsHeader>()];
             header_bytes.copy_from_slice(&self.mmap[..size_of::<FsHeader>()]);
-            deserialize_header(&header_bytes)?
+            match deserialize_header(&header_bytes) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            }
         };
 
         let encoded = metadata.serialize();
 
-        // If we need more space, try to grow metadata region
         // If we need more space, try to grow metadata region
         if encoded.len() > header.metadata_size as usize {
             // Calculate new size with some room for growth
@@ -589,7 +596,7 @@ impl Fs {
 
             // Make sure we have space to grow
             let data_start = header.metadata_offset + header.metadata_size;
-            let mut free_ranges = self.free_ranges.write();
+            let free_ranges = self.free_ranges.write();
 
             // Collect matching ranges first to avoid borrowing conflict
             let matching_ranges: Vec<_> = free_ranges
@@ -632,7 +639,16 @@ impl Fs {
         Ok(())
     }
 
+    /// Write data to the mmap at the given offset.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences a raw pointer.
+    /// - There is pointer arithmetic to calculate the destination pointer.
+    /// - There is a `memcpy` on a raw pointer.
     fn write_to_mmap(self: &Arc<Self>, offset: usize, data: &[u8]) {
+        // TODO(@siennathesane): do some bounds checking or something
+        // SAFETY: yeah this is actually unsafe
         unsafe {
             let ptr = self.mmap.as_ptr().add(offset) as *mut u8;
             ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
@@ -727,7 +743,10 @@ impl Fs {
         };
 
         // Then persist metadata
-        self.persist_metadata()?;
+        match self.persist_metadata() {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        };
 
         // Handle ranges
         let ranges = self.consolidate_pages(&pages);
@@ -870,13 +889,19 @@ impl Fs {
         }
 
         // Identify candidate franges for compaction
-        let candidates = self.find_compaction_candidates(config)?;
+        let candidates = match self.find_compaction_candidates(config) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
         if candidates.is_empty() {
             return Ok(false);
         }
 
         // Perform compaction
-        self.compact_franges(config.block_buffer_size, candidates)?;
+        match self.compact_franges(config.block_buffer_size, candidates) {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        };
 
         Ok(true)
     }
@@ -940,16 +965,25 @@ impl Fs {
             };
 
             // Create new frange with exact size needed
-            let new_id = self.create_frange(metadata.length.load(SeqCst))?;
-            let mut new_handle = self.open_frange(new_id)?;
+            let new_id = match self.create_frange(metadata.length.load(SeqCst)) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            };
+            let new_handle = match self.open_frange(new_id) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            };
 
             // Read data from old frange
             // TODO(@siennathesane): find a more efficient way to copy data. since we are
             // using the `FRangeHandle` API, realistically we can load the
             // ranges, calculate the offsets, then directly copy data with a
             // single memcpy from the source to the dest.
-            let old_handle = self.open_frange(id)?;
-            let mut buffer = BytesMut::zeroed(buffer_size); // Use 4KB buffer for copying
+            let old_handle = match self.open_frange(id) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            };
+            let mut buffer = BytesMut::zeroed(buffer_size); // use 4KB buffer for copying
 
             let mut remaining = metadata.length.load(SeqCst);
             let mut offset = 0;
@@ -958,26 +992,40 @@ impl Fs {
                 let chunk_size = remaining.min(buffer.len() as u64) as usize;
                 buffer.resize(chunk_size, 0);
 
-                old_handle.read_at(offset, &mut buffer)?;
-                new_handle.write_at(offset, &buffer)?;
+                match old_handle.read_at(offset, &mut buffer) {
+                    | Ok(_) => {},
+                    | Err(e) => return Err(e),
+                };
+
+                match new_handle.write_at(offset, &buffer) {
+                    | Ok(_) => {},
+                    | Err(e) => return Err(e),
+                };
 
                 offset += chunk_size as u64;
                 remaining -= chunk_size as u64;
             }
 
-            // Close both handles
-            self.close_frange(old_handle)?;
-            self.close_frange(new_handle)?;
+            // close both handles
+            match self.close_frange(old_handle) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+
+            match self.close_frange(new_handle) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
 
             // Get the new range information
             let new_range = {
-                self.franges
-                    .read()
-                    .get(&new_id)
-                    .ok_or_else(|| IoError(Error::new(InvalidInput, "new frange not found")))?
-                    .value()
-                    .range
-                    .clone()
+                match self.franges.read().get(&new_id) {
+                    | None => return Err(FsError(FRangeNotFound)),
+                    | Some(v) => v,
+                }
+                .value()
+                .range
+                .clone()
             };
 
             // Update the original frange's metadata to point to the new location
@@ -995,22 +1043,27 @@ impl Fs {
 
             // Remove the temporary frange's metadata
             {
-                let mut franges = self.franges.write();
+                let franges = self.franges.write();
                 franges.remove(&new_id);
             }
 
             // Add the old range back to free ranges
             {
-                let mut free_ranges = self.free_ranges.write();
+                let free_ranges = self.free_ranges.write();
                 free_ranges.insert(metadata.range);
             }
         }
 
         // Finalize metadata persist and coalesce
-        self.persist_metadata()?;
-        self.coalesce_free_ranges()?;
-
-        Ok(())
+        match self.persist_metadata() {
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        };
+        
+        match self.coalesce_free_ranges() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1097,12 +1150,24 @@ pub struct FRangeHandle {
 }
 
 impl FRangeHandle {
+    /// Write data at the given offset.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it allows writing to "arbitrary" memory
+    /// locations.
+    /// - There is pointer arithmetic to calculate the destination pointer.
+    /// - There is a `memcpy` with a raw pointer.
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), CesiumError> {
         if offset as usize + data.len() > (self.range.end - self.range.start) as usize {
             return Err(FsError(ReadOutOfBounds));
         }
 
         let base = self.range.start as usize + offset as usize;
+
+        if base + data.len() > self.range.end as usize {
+            return Err(FsError(WriteOutOfBounds));
+        }
 
         // Mark affected pages as dirty
         let start_page = base / self.fs.page_size;
@@ -1115,6 +1180,7 @@ impl FRangeHandle {
             }
         }
 
+        // SAFETY: we have already checked that the write is within bounds
         unsafe {
             // Get mutable pointer for destination
             let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
@@ -1133,12 +1199,22 @@ impl FRangeHandle {
             SeqCst,
         );
 
-        // Maybe flush
-        self.fs.maybe_flush(false)?;
+        match self.fs.maybe_flush(false) {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        };
 
         Ok(())
     }
 
+    /// Read data at the given offset.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it allows reading from "arbitrary"
+    /// memory locations.
+    /// - Builds a slice from a raw pointer.
+    /// - Performs pointer arithmetic to calculate the source pointer.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), CesiumError> {
         // First check if the read would be out of bounds of our allocated range
         if offset as usize + buf.len() > (self.range.end - self.range.start) as usize {
@@ -1156,7 +1232,7 @@ impl FRangeHandle {
 
         let base = self.range.start as usize + offset as usize;
 
-        // Mark affected pages as dirty
+        // mark affected pages as dirty
         let start_page = base / self.fs.page_size;
         let end_page = (base + buf.len()).div_ceil(self.fs.page_size);
 
@@ -1166,12 +1242,11 @@ impl FRangeHandle {
             }
         }
 
+        // SAFETY: we have already checked that the read is within bounds
         unsafe {
             // Only copy the actually written bytes
-            buf[..bytes_to_read].copy_from_slice(std::slice::from_raw_parts(
-                self.mmap.as_ptr().add(base),
-                bytes_to_read,
-            ));
+            buf[..bytes_to_read]
+                .copy_from_slice(from_raw_parts(self.mmap.as_ptr().add(base), bytes_to_read));
         }
 
         fence(SeqCst);
@@ -1200,7 +1275,7 @@ impl Drop for FRangeHandle {
             match franges.get(&self.metadata.id) {
                 | None => {},
                 | Some(entry) => {
-                    let mut updated = entry.value().clone();
+                    let updated = entry.value().clone();
                     updated.modified_at.store(
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -1224,6 +1299,9 @@ impl Drop for FRangeHandle {
 }
 
 #[cfg(test)]
+#[allow(clippy::question_mark_used)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::{
         fs::{
@@ -1342,7 +1420,7 @@ mod tests {
 
         // Create and open a frange
         let id = fs.create_frange(1024).unwrap();
-        let mut handle = fs.open_frange(id).unwrap();
+        let handle = fs.open_frange(id).unwrap();
 
         // Write some data
         let data = b"Hello, World!";
@@ -1387,7 +1465,7 @@ mod tests {
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         let id = fs.create_frange(1024).unwrap();
-        let mut handle = fs.open_frange(id).unwrap();
+        let handle = fs.open_frange(id).unwrap();
 
         // Try to write beyond range
         let data = vec![1u8; 2048];
@@ -1416,9 +1494,9 @@ mod tests {
         let id3 = fs.create_frange(1024).unwrap();
 
         // Write to each
-        let mut handle1 = fs.open_frange(id1).unwrap();
-        let mut handle2 = fs.open_frange(id2).unwrap();
-        let mut handle3 = fs.open_frange(id3).unwrap();
+        let handle1 = fs.open_frange(id1).unwrap();
+        let handle2 = fs.open_frange(id2).unwrap();
+        let handle3 = fs.open_frange(id3).unwrap();
 
         handle1.write_at(0, b"first").unwrap();
         handle2.write_at(0, b"second").unwrap();
@@ -1452,9 +1530,9 @@ mod tests {
         let id4 = fs.create_frange(512).unwrap();
 
         // Verify we can still use all franges
-        let mut handle1 = fs.open_frange(id1).unwrap();
-        let mut handle3 = fs.open_frange(id3).unwrap();
-        let mut handle4 = fs.open_frange(id4).unwrap();
+        let handle1 = fs.open_frange(id1).unwrap();
+        let handle3 = fs.open_frange(id3).unwrap();
+        let handle4 = fs.open_frange(id4).unwrap();
 
         handle1.write_at(0, b"data1").unwrap();
         handle3.write_at(0, b"data3").unwrap();
@@ -1466,7 +1544,7 @@ mod tests {
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         let id = fs.create_frange(1024).unwrap();
-        let mut handle = fs.open_frange(id).unwrap();
+        let handle = fs.open_frange(id).unwrap();
 
         // Write data
         handle.write_at(0, b"test data").unwrap();
@@ -1595,11 +1673,11 @@ mod tests {
         let id2 = fs.create_frange(2048).unwrap();
 
         // Write some data to create metadata
-        let mut handle1 = fs.open_frange(id1).unwrap();
+        let handle1 = fs.open_frange(id1).unwrap();
         handle1.write_at(0, b"test data 1").unwrap();
         fs.close_frange(handle1).unwrap();
 
-        let mut handle2 = fs.open_frange(id2).unwrap();
+        let handle2 = fs.open_frange(id2).unwrap();
         handle2.write_at(0, b"test data 2").unwrap();
         fs.close_frange(handle2).unwrap();
 
@@ -1676,7 +1754,7 @@ mod tests {
 
         // Create a frange and write data
         let id = fs.create_frange(1024).unwrap();
-        let mut handle = fs.open_frange(id).unwrap();
+        let handle = fs.open_frange(id).unwrap();
         handle.write_at(0, b"persistent data test").unwrap();
         fs.close_frange(handle).unwrap();
 
@@ -1746,7 +1824,7 @@ mod tests {
 
         // Create a frange and write data without flushing
         let id = fs.create_frange(1024).unwrap();
-        let mut handle = fs.open_frange(id).unwrap();
+        let handle = fs.open_frange(id).unwrap();
         handle.write_at(0, b"unflushed data").unwrap();
 
         // Verify dirty pages exist
@@ -1787,7 +1865,7 @@ mod tests {
             let id = fs.create_frange(size).unwrap();
 
             // Write less data than allocated to create fragmentation
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
             let data = vec![1u8; size as usize / 2];
             handle.write_at(0, &data).unwrap();
             fs.close_frange(handle).unwrap();
@@ -1823,7 +1901,7 @@ mod tests {
 
         // Create a frange with known data but fragmented
         let id = fs.create_frange(8192).unwrap();
-        let mut handle = fs.open_frange(id).unwrap();
+        let handle = fs.open_frange(id).unwrap();
 
         let data = b"Hello, World!";
         handle.write_at(0, data).unwrap();
@@ -1848,6 +1926,9 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::question_mark_used)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod e2e_tests {
     use std::{
         fs::OpenOptions,
@@ -1923,7 +2004,7 @@ mod e2e_tests {
                             let pos = write_positions[rng.gen_range(0..write_positions.len())] % max_size;
                             let size = write_sizes[rng.gen_range(0..write_sizes.len())].min(max_size - pos);
 
-                            let mut handle = fs.open_frange(id).unwrap();
+                            let handle = fs.open_frange(id).unwrap();
                             let data = vec![rng.gen::<u8>(); size as usize];
                             handle.write_at(pos, &data).unwrap();
                             fs.close_frange(handle).unwrap();
@@ -1965,7 +2046,7 @@ mod e2e_tests {
 
                 // Try to create a frange of the given size
                 if let Ok(id) = fs.create_frange(size) {
-                    let mut handle = fs.open_frange(id).unwrap();
+                    let handle = fs.open_frange(id).unwrap();
 
                     // Test operations at boundaries
                     let data = vec![1u8; 1024];
@@ -2015,7 +2096,7 @@ mod e2e_tests {
                         frange_ids.push(id);
 
                         // Write some data
-                        let mut handle = fs_clone.open_frange(id).unwrap();
+                        let handle = fs_clone.open_frange(id).unwrap();
                         let data = vec![thread_rng().gen::<u8>(); (size / 2) as usize];
                         handle.write_at(0, &data).unwrap();
                         fs_clone.close_frange(handle).unwrap();
@@ -2047,7 +2128,7 @@ mod e2e_tests {
         // Create some initial state
         for size in [1024, 2048, 4096] {
             let id = fs.create_frange(size).unwrap();
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
 
             let data = vec![thread_rng().gen::<u8>(); size as usize];
             handle.write_at(0, &data).unwrap();
@@ -2096,7 +2177,7 @@ mod e2e_tests {
                 let id = fs_clone.create_frange(1024 * 1024).unwrap(); // 1MB each
 
                 // Open it
-                let mut handle = fs_clone.open_frange(id).unwrap();
+                let handle = fs_clone.open_frange(id).unwrap();
 
                 // Write random data
                 let mut rng = thread_rng();
@@ -2148,7 +2229,7 @@ mod e2e_tests {
         let large_id = fs.create_frange(1024 * 1024 * 2).unwrap(); // 2MB
 
         // Verify the large frange is usable
-        let mut handle = fs.open_frange(large_id).unwrap();
+        let handle = fs.open_frange(large_id).unwrap();
         let data = vec![42u8; 1024 * 1024 * 2];
         handle.write_at(0, &data).unwrap();
         fs.close_frange(handle).unwrap();
@@ -2167,7 +2248,7 @@ mod e2e_tests {
                 let id = fs_clone.create_frange(1024).unwrap(); // 1KB each
 
                 // Write small amounts of data repeatedly
-                let mut handle = fs_clone.open_frange(id).unwrap();
+                let handle = fs_clone.open_frange(id).unwrap();
                 let data = vec![1u8; 128]; // 128 bytes
                 for i in 0..8 {
                     handle.write_at(i * 128, &data).unwrap();
@@ -2197,7 +2278,7 @@ mod e2e_tests {
         let id1 = fs.create_frange(1024 * 1024).unwrap();
         let id2 = fs.create_frange(1024 * 512).unwrap();
 
-        let mut handle1 = fs.open_frange(id1).unwrap();
+        let handle1 = fs.open_frange(id1).unwrap();
         let data1 = vec![1u8; 1024 * 1024];
         handle1.write_at(0, &data1).unwrap();
         fs.close_frange(handle1).unwrap();
@@ -2252,7 +2333,7 @@ mod e2e_tests {
         let small_id = fs.create_frange(1024).unwrap();
 
         // Test reading/writing at frange boundaries
-        let mut handle = fs.open_frange(small_id).unwrap();
+        let handle = fs.open_frange(small_id).unwrap();
         let data = vec![255u8; 1024];
         handle.write_at(0, &data).unwrap();
 

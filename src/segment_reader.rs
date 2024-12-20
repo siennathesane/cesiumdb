@@ -92,15 +92,24 @@ impl<'a> SegmentReader {
             for b in keep_blocks {
                 let _ = self.cache.push(b);
             }
-            self.fill_cache(block_index + 1)?;
+            match self.fill_cache(block_index + 1) {
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            };
             return Ok(block);
         }
 
         // Read the requested block
-        let block = self.read_block_at(block_index)?;
+        let block = match self.read_block_at(block_index) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
 
         // Fill read-ahead cache
-        self.fill_cache(block_index + 1)?;
+        match self.fill_cache(block_index + 1) {
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        };
 
         Ok(block)
     }
@@ -128,7 +137,10 @@ impl<'a> SegmentReader {
         let offset = block_index * BLOCK_SIZE;
         let mut buffer = BytesMut::zeroed(BLOCK_SIZE);
 
-        self.frange.read_at(offset as u64, &mut buffer)?;
+        match self.frange.read_at(offset as u64, &mut buffer) {
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        };
 
         let block = Block::deserialize(buffer.freeze());
 
@@ -254,6 +266,9 @@ impl<'a> Iterator for SeekingBlockIterator<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::question_mark_used)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::{
         fs::{
@@ -300,7 +315,7 @@ mod tests {
     fn create_test_segment(fs: &Arc<Fs>, num_blocks: u64) -> FRangeHandle {
         let segment_size = num_blocks * BLOCK_SIZE as u64;
         let frange_id = fs.create_frange(segment_size).unwrap();
-        let mut frange = fs.open_frange(frange_id).unwrap();
+        let frange = fs.open_frange(frange_id).unwrap();
 
         // Write test data
         for i in 0..num_blocks {

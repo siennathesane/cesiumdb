@@ -64,14 +64,14 @@ impl SegmentIndex {
     /// Add an item to the index.
     pub(crate) fn add_item(&mut self, item: &[u8]) {
         self.active_bloom
-            .insert(&gxhash64(&item, self.bloom_filter_seed));
+            .insert(&gxhash64(item, self.bloom_filter_seed));
     }
 
     /// Add a block to the index.
     pub(crate) fn add_block(&mut self, starting_key: &[u8]) {
         self.block_offset_size += 1;
         self.block_offsets
-            .extend_from_slice(&gxhash64(&starting_key, self.bloom_filter_seed).to_le_bytes());
+            .extend_from_slice(&gxhash64(starting_key, self.bloom_filter_seed).to_le_bytes());
     }
 
     /// Add a namespace offset to the most recently added block.

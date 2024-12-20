@@ -68,15 +68,16 @@ impl Block {
     /// Add an entry to the block. If the block is full, an error will be
     /// returned.
     pub(crate) fn add_entry(&mut self, entry: &[u8], flag: EntryFlag) -> Result<(), CesiumError> {
-        let entry_size = entry.len() + size_of::<u16>() + size_of::<u8>();
+        // entry + offset size + byte flag
+        let entry_size = entry.len() + size_of::<u8>();
         if !self.will_fit(entry_size) {
-            if self.is_empty() {
+            return if self.is_empty() {
                 // notify the caller to try again with a smaller entry
-                return Err(BlockError(TooLargeForBlock));
+                Err(BlockError(TooLargeForBlock))
             } else {
                 // notify the caller that the block is full
-                return Err(BlockError(BlockFull));
-            }
+                Err(BlockError(BlockFull))
+            };
         }
 
         // calculate the next offset
@@ -89,7 +90,7 @@ impl Block {
 
         // add the entry and update the offsets
         self.offsets.put_u16_le(next_offset);
-        self.offsets.put_u8(flag as u8); // flag for complete entry
+        self.entries.put_u8(flag as u8); // flag for complete entry
         self.entries.put_slice(entry);
         self.num_entries += 1;
 
@@ -326,6 +327,9 @@ impl<'a> Iterator for BlockIterator<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::question_mark_used)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use super::*;
 
@@ -345,7 +349,7 @@ mod tests {
         let entry = [1, 2, 3, 4];
         assert!(block.add_entry(&entry, EntryFlag::Complete).is_ok());
         assert_eq!(block.num_entries, 1);
-        assert_eq!(block.entries(), &entry);
+        assert_eq!(block.entries(), [0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -376,7 +380,7 @@ mod tests {
         assert!(block.add_entry(&entry1, EntryFlag::Complete).is_ok());
         assert!(block.add_entry(&entry2, EntryFlag::Complete).is_ok());
         assert_eq!(block.num_entries, 2);
-        assert_eq!(block.entries(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(block.entries(), &[0, 1, 2, 3, 4, 0, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -419,9 +423,9 @@ mod tests {
         }
         assert_eq!(buffer.len(), BLOCK_SIZE);
         assert_eq!(buffer[0..2], (1u16).to_le_bytes());
-        assert_eq!(buffer[2..4], (4u16).to_le_bytes());
-        assert_eq!(buffer[4..8], entry);
-        assert_eq!(&buffer[8..], &[0u8; BLOCK_SIZE - 8]);
+        assert_eq!(buffer[2..4], (5u16).to_le_bytes());
+        assert_eq!(buffer[5..9], entry); // skip the entry byte
+        assert_eq!(&buffer[9..], &[0u8; BLOCK_SIZE - 9]);
     }
 
     #[test]
@@ -435,30 +439,40 @@ mod tests {
         unsafe {
             block.finalize(buffer.as_mut_ptr());
         }
+
         assert_eq!(buffer.len(), BLOCK_SIZE);
         assert_eq!(buffer[0..2], (2u16).to_le_bytes());
-        assert_eq!(buffer[2..4], (4u16).to_le_bytes());
-        assert_eq!(buffer[4..6], (8u16).to_le_bytes());
-        assert_eq!(buffer[6..10], entry1);
-        assert_eq!(buffer[10..14], entry2);
-        assert_eq!(&buffer[14..], &[0u8; BLOCK_SIZE - 14]);
+        assert_eq!(buffer[2..4], (5u16).to_le_bytes());
+        assert_eq!(buffer[4..6], (10u16).to_le_bytes());
+        assert_eq!(buffer[7..11], entry1);
+        assert_eq!(buffer[12..16], entry2);
+        assert_eq!(&buffer[16..], &[0u8; BLOCK_SIZE - 16]);
     }
 
     #[test]
     fn test_finalize_full_block() {
         let mut block = Block::new();
-        let entry = [0u8; BLOCK_SIZE - MAX_ENTRIES];
+
+        // account for the offsets and entry bytes
+        let entry = vec![0u8; block.remaining_space() - 4];
         block.add_entry(&entry, EntryFlag::Complete).unwrap();
+
         let mut buffer = vec![0u8; BLOCK_SIZE];
         unsafe {
             block.finalize(buffer.as_mut_ptr());
         }
+
         assert_eq!(buffer.len(), BLOCK_SIZE);
         assert_eq!(buffer[0..2], (1u16).to_le_bytes());
+
+        // entry plus the entry byte
         assert_eq!(
-            buffer[2..4],
-            ((BLOCK_SIZE - MAX_ENTRIES) as u16).to_le_bytes()
+            u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
+            1 + entry.len() as u16
         );
+
+        //
+        assert_eq!(buffer[5], EntryFlag::Complete as u8);
         // assert_eq!(buffer[4..BLOCK_SIZE], entry);
     }
 
@@ -475,11 +489,11 @@ mod tests {
         }
         assert_eq!(buffer.len(), BLOCK_SIZE);
         assert_eq!(buffer[0..2], (2u16).to_le_bytes());
-        assert_eq!(buffer[2..4], (4u16).to_le_bytes());
-        assert_eq!(buffer[4..6], (10u16).to_le_bytes());
-        assert_eq!(buffer[6..10], entry);
-        assert_eq!(buffer[10..16], entry2);
-        assert_eq!(&buffer[16..], &[0u8; BLOCK_SIZE - 16]);
+        assert_eq!(buffer[2..4], (5u16).to_le_bytes());
+        assert_eq!(buffer[4..6], (12u16).to_le_bytes());
+        assert_eq!(buffer[7..11], entry);
+        assert_eq!(buffer[12..18], entry2);
+        assert_eq!(&buffer[18..], vec![0u8; 4078]);
     }
 
     #[test]

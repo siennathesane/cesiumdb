@@ -51,6 +51,8 @@ pub enum FsError {
     FRangeStillOpen,
     #[error("read out of bounds")]
     ReadOutOfBounds,
+    #[error("write out of bounds")]
+    WriteOutOfBounds,
     #[error("block index out of bounds")]
     BlockIndexOutOfBounds,
     #[error("segment is full")]
