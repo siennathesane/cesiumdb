@@ -36,7 +36,7 @@ I'm glad you asked! Here are some benchmarks:
 Add this to your `Cargo.toml`:
 
 ```toml
-    
+
 [dependencies]
 cesiumdb = "1.0"
 ```
@@ -47,7 +47,7 @@ And use:
 use cesiumdb::CesiumDB;
 
 // use a temp file, most useful for testing
-let db = CesiumDB::default();
+let db = CesiumDB::default ();
 
 // no namespace
 db.put(b"key", b"value");
@@ -137,10 +137,12 @@ An alphabetical list of things I'd like to actually do for the long-term safety 
 - [ ] Add some kind of `fsck` and block checksums
 - [ ] Bloom filter size is currently hardcoded. I'd like to make it configurable.
 - [ ] Determine how to expose the untrustworthiness of the bloom filter.
+- [ ] Expand the `CesiumError` tree to cover all possible use cases
 - [ ] Figure out how hard it would be to support `no_std` for the embedded workloads. I suspect it would require a
   custom variation of `std::collections::BinaryHeap`, which would be... difficult lol
 - [ ] Investigate the point at which we can no longer `mmap` a physical device. Theoretically, even without swap space,
-  I can `mmap` a 1TiB physical device to the filesystem implementation. But I feel like shit gets real weird.
+  I can `mmap` a 1TiB physical device to the filesystem implementation. But I feel like shit gets real weird. Idk, it's
+  a Linux-ism I want to investigate.
 - [ ] Remove the question mark operator.
 - [ ] Revisit the merge iterator. The benchmarks have it at ~115ms for a full scan of 8 memtables with 100,000 keys
   each. I have no idea if this is a mismatch of my expectations or a gross inability of mine to optimize it further.

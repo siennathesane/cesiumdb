@@ -87,7 +87,9 @@ impl SegmentWriter {
                     // Create a buffer for the block data
                     let mut buffer = BytesMut::with_capacity(BLOCK_SIZE);
                     buffer.resize(BLOCK_SIZE, 0); // Important: resize buffer to full block size
-
+                    
+                    #[allow(clippy::missing_safety_doc)]
+                    #[allow(clippy::undocumented_unsafe_blocks)]
                     unsafe {
                         block.finalize(buffer.as_mut_ptr());
                     }
@@ -139,7 +141,10 @@ impl SegmentWriter {
         }
 
         let mut block = Block::new();
-        block.add_entry(data, Complete)?;
+        match block.add_entry(data, Complete) {
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        };
 
         self.write_block(block)
     }
@@ -165,6 +170,9 @@ impl Drop for SegmentWriter {
 }
 
 #[cfg(test)]
+#[allow(clippy::question_mark_used)]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
     use std::{
         fs::OpenOptions,
