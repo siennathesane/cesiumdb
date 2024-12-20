@@ -185,14 +185,16 @@ impl Memtable {
 
         Ok(())
     }
-
+    
     #[instrument(level = "debug")]
     #[inline]
     pub fn scan(&self, lower: Bound<KeyBytes>, upper: Bound<KeyBytes>) -> MemtableIterator {
         let (_lower, _upper) = (map_key_bound(lower), map_key_bound(upper));
         let ranger = self.map.range((_lower, _upper));
 
-        // we need to extend the lifetime of `range` to 'static
+        // TODO(@siennathesane): this is actually really unsafe because we might flush the data
+        // while the scan is happening
+        // SAFETY: we need to extend the lifetime of `range` to 'static
         // so the user can hold onto it. as self.map is Arc'd,
         // this won't be deallocated while the iterator exists
         let range = unsafe { transmute(ranger) };
