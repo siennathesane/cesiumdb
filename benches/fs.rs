@@ -392,7 +392,7 @@ fn benchmark_fragmentation_impact(c: &mut Criterion) {
                         (fs, dir, id)
                     },
                     |(fs, _dir, id)| {
-                        let mut handle = fs.open_frange(id).unwrap();
+                        let  handle = fs.open_frange(id).unwrap();
                         let data = vec![0u8; 4096];
                         // Perform mixed operations
                         for i in 0..10 {
@@ -516,7 +516,7 @@ fn benchmark_compaction(c: &mut Criterion) {
                     |(fs, _dir)| {
                         // Measure allocation and operation performance after compaction
                         let id = fs.create_frange(1024 * 1024).unwrap();
-                        let mut handle = fs.open_frange(id).unwrap();
+                        let handle = fs.open_frange(id).unwrap();
                         let data = vec![0u8; 4096];
                         for i in 0..10 {
                             handle.write_at(i * 4096, &data).unwrap();

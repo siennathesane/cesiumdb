@@ -40,7 +40,7 @@ fn generate_kvp(db: &Db, batch_size: usize, payload_size: usize) {
         batches.push(Put(key.clone(), value.clone(), db.time()));
     }
 
-    db.batch(batches.as_slice());
+    db.batch(batches.as_slice()).expect("cannot add batches");
 }
 
 pub fn db_put(c: &mut Criterion) {
