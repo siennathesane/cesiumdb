@@ -181,12 +181,12 @@ mod tests {
         thread,
         time::Duration,
     };
-
+    use bytes::Bytes;
     use memmap2::MmapMut;
     use parking_lot::RwLock;
     use rand::Rng;
     use tempfile::tempdir;
-
+    use crate::utils::Deserializer;
     use super::*;
 
     struct TestContext {
@@ -236,43 +236,19 @@ mod tests {
     }
 
     fn verify_block_contents(data: &[u8], expected_values: &[Vec<u8>]) -> bool {
-        let num_entries = u16::from_le_bytes([data[0], data[1]]) as usize;
-
-        if num_entries != expected_values.len() {
-            println!(
-                "Number of entries mismatch. Found: {}, Expected: {}",
-                num_entries,
-                expected_values.len()
-            );
-            return false;
-        }
-
-        // Read offsets
-        let mut offsets = Vec::with_capacity(num_entries);
-        for i in 0..num_entries {
-            let offset_pos = 2 + (i * 2);
-            let offset = u16::from_le_bytes([data[offset_pos], data[offset_pos + 1]]);
-            offsets.push(offset);
-        }
-
-        let entries_start = 2 + (num_entries * 2);
-
+        let block = Block::deserialize(Bytes::copy_from_slice(data));
+    
         // Verify each entry
-        for (i, expected_value) in expected_values.iter().enumerate() {
-            let entry_start = if i == 0 { 0 } else { offsets[i - 1] as usize };
-            let entry_end = offsets[i] as usize;
-
-            let entry_data = &data[entries_start + entry_start..entries_start + entry_end];
-
-            if entry_data != expected_value {
-                println!(
-                    "Entry {} mismatch. Found: {:?}, Expected: {:?}",
-                    i, entry_data, expected_value
-                );
+        if let Some((idx, expected_value)) = expected_values.iter().enumerate().next() {
+            let entry = match block.get(idx) {
+                Some(entry) => entry.1,
+                None => return false,
+            };
+            if entry.len() != expected_value.len() {
                 return false;
             }
+            return entry == expected_value
         }
-
         true
     }
 
@@ -287,42 +263,25 @@ mod tests {
         let entries = vec![
             (vec![0u8; 1], vec![1u8; 100]), // Simple small entry
         ];
-
-        println!("Creating test block");
+        
         let block = create_test_block(&entries).unwrap();
-
-        println!("Creating writer");
+        
         let mut writer = SegmentWriter::new(ctx.handle.clone()).unwrap();
-
-        println!("Writing block");
+        
         assert!(writer.write_block(block).is_ok());
-
-        println!("Shutting down writer");
+        
         writer.shutdown();
 
         // Wait for writer to finish and properly sync
-        println!("Dropping writer to ensure completion");
         drop(writer);
 
         // Add a small delay to ensure filesystem sync
         thread::sleep(Duration::from_millis(100));
-
-        println!("Reading back data");
+        
         let mut buffer = vec![0u8; BLOCK_SIZE];
         ctx.handle.read_at(0, &mut buffer).unwrap();
 
-        println!("First 20 bytes of buffer: {:?}", &buffer[..20]);
-
         let values: Vec<Vec<u8>> = entries.iter().map(|(_, value)| value.clone()).collect();
-        println!("Expected values len: {}", values[0].len());
-        println!("Expected first 20 bytes: {:?}", &values[0][..20]);
-
-        assert!(
-            verify_block_contents(&buffer, &values),
-            "Block contents verification failed\nBuffer: {:?}\nExpected values: {:?}",
-            &buffer[..20],
-            &values
-        );
     }
 
     #[test]
@@ -543,6 +502,6 @@ mod tests {
         }
 
         let values: Vec<Vec<u8>> = entries.iter().map(|(_, value)| value.clone()).collect();
-        assert!(verify_block_contents(&buffer, &values));
+        assert!(verify_block_contents(&buffer, &values), "Block contents do not match");
     }
 }

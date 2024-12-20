@@ -127,7 +127,7 @@ fn benchmark_sequential_write(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let (fs, _dir) = setup_benchmark_fs();
             let id = fs.create_frange(size as u64 * 100).unwrap(); // Create frange with room for multiple writes
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
             let data = vec![0u8; size as usize];
 
             b.iter(|| {
@@ -150,7 +150,7 @@ fn benchmark_random_write(c: &mut Criterion) {
             let (fs, _dir) = setup_benchmark_fs();
             let frange_size = 1024 * 1024 * 10; // 10MB frange
             let id = fs.create_frange(frange_size).unwrap();
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
             let data = vec![0u8; size as usize];
 
             b.iter(|| {
@@ -172,7 +172,7 @@ fn benchmark_sequential_read(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let (fs, _dir) = setup_benchmark_fs();
             let id = fs.create_frange(size as u64 * 100).unwrap();
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
 
             // Pre-write data
             let write_data = vec![0u8; size as usize];
@@ -199,7 +199,7 @@ fn benchmark_random_read(c: &mut Criterion) {
             let (fs, _dir) = setup_benchmark_fs();
             let frange_size = 1024 * 1024 * 10; // 10MB frange
             let id = fs.create_frange(frange_size).unwrap();
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
 
             // Pre-write data
             let write_data = vec![0u8; frange_size as usize];
@@ -226,7 +226,7 @@ fn benchmark_mixed_workload(c: &mut Criterion) {
             let (fs, _dir) = setup_benchmark_fs();
             let frange_size = 1024 * 1024; // 1MB frange
             let id = fs.create_frange(frange_size).unwrap();
-            let mut handle = fs.open_frange(id).unwrap();
+            let handle = fs.open_frange(id).unwrap();
 
             // Pre-write some data
             let write_data = vec![0u8; 4096];
@@ -325,7 +325,7 @@ fn benchmark_concurrent_access(c: &mut Criterion) {
                 };
 
                 b.iter_batched(
-                    || setup_benchmark_fs(),
+                    setup_benchmark_fs,
                     |(fs, _dir)| {
                         let fs = Arc::new(fs);
                         let mut handles = Vec::new();
@@ -334,7 +334,7 @@ fn benchmark_concurrent_access(c: &mut Criterion) {
                             let fs_clone = fs.clone();
                             handles.push(thread::spawn(move || {
                                 let id = fs_clone.create_frange(1024 * 1024).unwrap();
-                                let mut handle = fs_clone.open_frange(id).unwrap();
+                                let handle = fs_clone.open_frange(id).unwrap();
                                 let data = vec![0u8; 4096];
                                 for i in 0..10 {
                                     handle.write_at(i * 4096, &data).unwrap();

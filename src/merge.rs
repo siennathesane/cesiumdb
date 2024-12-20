@@ -56,9 +56,8 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // TODO(@siennathesane): figure out what this logic should be
             let smallest = match self.iters.pop() {
-                None => continue,
+                None => return None,
                 Some(v) => v,
             };
 
