@@ -41,6 +41,7 @@ use crossbeam_skiplist::{
     SkipMap,
     SkipSet,
 };
+use getset::{CopyGetters, Getters};
 use gxhash::HashSet;
 use memmap2::{
     MmapMut,
@@ -70,43 +71,16 @@ use crate::{
             WriteOutOfBounds,
         },
     },
+    fs::handle::{
+        FRangeHandle,
+        FRangeMetadata,
+        OrderedRange,
+    },
 };
+use crate::fs::compaction::FragmentationStats;
 
 // TODO(@siennathesane): make this configurable
 const FLUSH_INTERVAL_SECS: u64 = 5;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OrderedRange {
-    start: u64,
-    end: u64,
-}
-
-impl From<Range<u64>> for OrderedRange {
-    fn from(r: Range<u64>) -> Self {
-        Self {
-            start: r.start,
-            end: r.end,
-        }
-    }
-}
-
-impl From<OrderedRange> for Range<u64> {
-    fn from(r: OrderedRange) -> Self {
-        r.start..r.end
-    }
-}
-
-impl Ord for OrderedRange {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.start.cmp(&other.start).then(self.end.cmp(&other.end))
-    }
-}
-
-impl PartialOrd for OrderedRange {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -215,13 +189,13 @@ impl FsMetadata {
 
             // Write FRangeMetadata
             let metadata = entry.value();
-            buf.put_u64_le(metadata.range.start);
-            buf.put_u64_le(metadata.range.end);
-            buf.put_u64_le(metadata.id);
-            buf.put_u64_le(metadata.length.load(SeqCst));
-            buf.put_u64_le(metadata.size);
-            buf.put_u64_le(metadata.created_at);
-            buf.put_u64_le(metadata.modified_at.load(SeqCst));
+            buf.put_u64_le(metadata.range().start());
+            buf.put_u64_le(metadata.range().end());
+            buf.put_u64_le(metadata.id());
+            buf.put_u64_le(metadata.length().load(SeqCst));
+            buf.put_u64_le(metadata.size());
+            buf.put_u64_le(metadata.created_at());
+            buf.put_u64_le(metadata.modified_at().load(SeqCst));
         }
 
         // Write free ranges count
@@ -229,8 +203,8 @@ impl FsMetadata {
 
         // Write each free range
         for range in self.free_ranges.iter() {
-            buf.put_u64_le(range.start);
-            buf.put_u64_le(range.end);
+            buf.put_u64_le(range.start());
+            buf.put_u64_le(range.end());
         }
 
         buf.freeze()
@@ -244,20 +218,17 @@ impl FsMetadata {
         for _ in 0..frange_count {
             let key = bytes.get_u64_le();
 
-            // Read FRangeMetadata
-            let range = OrderedRange {
-                start: bytes.get_u64_le(),
-                end: bytes.get_u64_le(),
-            };
+            // // Read FRangeMetadata
+            let range = OrderedRange::new(bytes.get_u64_le(), bytes.get_u64_le());
 
-            let metadata = FRangeMetadata {
+            let metadata = FRangeMetadata::new(
                 range,
-                id: bytes.get_u64_le(),
-                length: AtomicU64::new(bytes.get_u64_le()),
-                size: bytes.get_u64_le(),
-                created_at: bytes.get_u64_le(),
-                modified_at: AtomicU64::new(bytes.get_u64_le()),
-            };
+                bytes.get_u64_le(),
+                bytes.get_u64_le(),
+                bytes.get_u64_le(),
+                bytes.get_u64_le(),
+                bytes.get_u64_le(),
+            );
 
             fs_metadata.franges.insert(key, metadata);
         }
@@ -265,10 +236,7 @@ impl FsMetadata {
         // Read free ranges
         let free_range_count = bytes.get_u64_le() as usize;
         for _ in 0..free_range_count {
-            let range = OrderedRange {
-                start: bytes.get_u64_le(),
-                end: bytes.get_u64_le(),
-            };
+            let range = OrderedRange::new(bytes.get_u64_le(), bytes.get_u64_le());
             fs_metadata.free_ranges.insert(range);
         }
 
@@ -292,17 +260,17 @@ const INITIAL_METADATA_SIZE: usize = 4096; // Or calculate based on expected ini
 /// physical storage devices or `fallocate`d files and uses memory-mapped files
 /// to provide fast access to the data.
 pub struct Fs {
-    mmap: Arc<MmapMut>,
-    franges: RwLock<SkipMap<u64, FRangeMetadata>>,
+    pub(crate) mmap: Arc<MmapMut>,
+    pub(crate) franges: RwLock<SkipMap<u64, FRangeMetadata>>,
 
-    free_ranges: RwLock<SkipSet<OrderedRange>>,
-    open_franges: RwLock<HashSet<u64>>,
-    next_frange_id: AtomicU64,
+    pub(crate) free_ranges: RwLock<SkipSet<OrderedRange>>,
+    pub(crate) open_franges: RwLock<HashSet<u64>>,
+    pub(crate) next_frange_id: AtomicU64,
 
     // flushing
-    last_flush: AtomicU64,
-    dirty_pages: RwLock<SkipSet<usize>>,
-    page_size: usize,
+    pub(crate) last_flush: AtomicU64,
+    pub(crate) dirty_pages: RwLock<SkipSet<usize>>,
+    pub(crate) page_size: usize,
 }
 
 impl Fs {
@@ -434,14 +402,7 @@ impl Fs {
             .unwrap()
             .as_secs();
 
-        let metadata = FRangeMetadata {
-            range: range.clone(),
-            id,
-            size,
-            length: AtomicU64::new(0),
-            created_at: now,
-            modified_at: AtomicU64::new(now),
-        };
+        let metadata = FRangeMetadata::new(range, id, size, 0, now, now);
 
         // Insert metadata with minimal lock duration
         {
@@ -472,25 +433,25 @@ impl Fs {
             | Some(v) => v.value().clone(), // Dereference and clone the value
         };
 
-        Ok(FRangeHandle {
-            mmap: self.mmap.clone(),
-            range: metadata.range.clone(),
-            metadata, // Now metadata is owned
-            fs: self.clone(),
-        })
+        Ok(FRangeHandle::new(
+            self.mmap.clone(),
+            metadata.range().clone(),
+            metadata,
+            self.clone(),
+        ))
     }
 
     pub fn close_frange(self: &Arc<Self>, handle: FRangeHandle) -> Result<(), FsError> {
         // Update metadata first
         {
             let franges = self.franges.write();
-            match franges.get(&handle.metadata.id) {
+            match franges.get(&handle.metadata().id()) {
                 | None => {
                     return Err(FRangeNotFound);
                 },
                 | Some(entry) => {
                     let updated = entry.value().clone();
-                    updated.modified_at.store(
+                    updated.modified_at().store(
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -498,9 +459,9 @@ impl Fs {
                         SeqCst,
                     );
                     updated
-                        .length
-                        .store(handle.metadata.length.load(SeqCst), SeqCst);
-                    franges.insert(handle.metadata.id, updated);
+                        .length()
+                        .store(handle.metadata().length().load(SeqCst), SeqCst);
+                    franges.insert(handle.metadata().id(), updated);
                 },
             };
         }
@@ -508,7 +469,7 @@ impl Fs {
         // Then handle open_franges
         {
             let mut open_franges = self.open_franges.write();
-            open_franges.remove(&handle.metadata.id);
+            open_franges.remove(&handle.metadata().id());
         } // Release open_franges lock
 
         // Finally flush
@@ -524,7 +485,7 @@ impl Fs {
         let range = {
             let franges = self.franges.write();
             let x = if let Some(entry) = franges.remove(&id) {
-                entry.value().range.clone()
+                entry.value().range().clone()
             } else {
                 return Ok(());
             };
@@ -552,7 +513,7 @@ impl Fs {
     }
 
     /// Persist metadata changes to disk
-    fn persist_metadata(self: &Arc<Self>) -> Result<(), FsError> {
+    pub(in crate::fs) fn persist_metadata(self: &Arc<Self>) -> Result<(), FsError> {
         let metadata = {
             let metadata = FsMetadata::new();
 
@@ -598,20 +559,18 @@ impl Fs {
             // Collect matching ranges first to avoid borrowing conflict
             let matching_ranges: Vec<_> = free_ranges
                 .iter()
-                .filter(|r| r.start == data_start)
+                .filter(|r| r.start() == data_start)
                 .collect();
 
             // Now we can safely modify free_ranges if we found a match
             if let Some(range) = matching_ranges.first() {
                 let growth_needed = new_size as u64 - header.metadata_size;
-                if range.end - range.start >= growth_needed {
+                if range.end() - range.start() >= growth_needed {
                     // Update the free range
                     free_ranges.remove(range);
-                    if range.end - range.start > growth_needed {
-                        free_ranges.insert(OrderedRange {
-                            start: data_start + growth_needed,
-                            end: range.end,
-                        });
+                    if range.end() - range.start() > growth_needed {
+                        free_ranges
+                            .insert(OrderedRange::new(data_start + growth_needed, range.end()));
                     }
 
                     // Update header with new metadata size
@@ -659,7 +618,7 @@ impl Fs {
         size: u64,
     ) -> Result<OrderedRange, FsError> {
         // Find the rightmost suitable range by iterating in reverse
-        let suitable_range = match free.iter().rev().find(|r| r.end - r.start >= size) {
+        let suitable_range = match free.iter().rev().find(|r| r.end() - r.start() >= size) {
             | None => {
                 return Err(NoFreeSpace);
             },
@@ -669,32 +628,26 @@ impl Fs {
         free.remove(&suitable_range);
 
         // When splitting a range, keep the left part free and allocate from the right
-        if suitable_range.end - suitable_range.start > size {
-            let new_free = OrderedRange {
-                start: suitable_range.start,
-                end: suitable_range.end - size,
-            };
+        if suitable_range.end() - suitable_range.start() > size {
+            let new_free = OrderedRange::new(suitable_range.start(), suitable_range.end() - size);
             free.insert(new_free);
         }
 
-        Ok(OrderedRange {
-            start: suitable_range.end - size,
-            end: suitable_range.end,
-        })
+        Ok(OrderedRange::new(
+            suitable_range.end() - size,
+            suitable_range.end(),
+        ))
     }
 
-    fn coalesce_free_ranges(self: &Arc<Self>) -> Result<(), FsError> {
+    pub(in crate::fs) fn coalesce_free_ranges(self: &Arc<Self>) -> Result<(), FsError> {
         let free = self.free_ranges.write();
         let mut ranges: Vec<OrderedRange> = free.iter().map(|entry| (*entry).clone()).collect();
         ranges.sort();
 
         let mut i = 0;
         while i < ranges.len() - 1 {
-            if ranges[i].end == ranges[i + 1].start {
-                let merged = OrderedRange {
-                    start: ranges[i].start,
-                    end: ranges[i + 1].end,
-                };
+            if ranges[i].end() == ranges[i + 1].start() {
+                let merged = OrderedRange::new(ranges[i].start(), ranges[i + 1].end());
                 free.remove(&ranges[i]);
                 free.remove(&ranges[i + 1]);
                 free.insert(merged);
@@ -749,10 +702,10 @@ impl Fs {
         let ranges = self.consolidate_pages(&pages);
 
         for range in ranges {
-            match self
-                .mmap
-                .flush_range(range.start as usize, (range.end - range.start) as usize)
-            {
+            match self.mmap.flush_range(
+                range.start() as usize,
+                (range.end() - range.start()) as usize,
+            ) {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
             };
@@ -778,21 +731,18 @@ impl Fs {
             let end = start + self.page_size;
 
             match &mut current_range {
-                | Some(range) if range.end as usize == start => {
-                    range.end = end as u64;
+                | Some(range) if range.end() as usize == start => {
+                    range.set_end(end as u64);
                 },
                 | Some(range) => {
                     ranges.push(range.clone());
-                    current_range = Some(OrderedRange {
-                        start: start as u64,
-                        end: end as u64,
-                    });
+                    current_range = Some(OrderedRange::new(start as u64, end as u64));
                 },
                 | None => {
-                    current_range = Some(OrderedRange {
-                        start: start as u64,
-                        end: end as u64,
-                    });
+                    current_range = Some(OrderedRange::new(
+                        start as u64,
+                        end as u64,
+                    ));
                 },
             }
         }
@@ -805,298 +755,6 @@ impl Fs {
     }
 }
 
-impl Fs {
-    /// Calculate total free space available in the filesystem
-    pub fn total_free_space(self: &Arc<Self>) -> u64 {
-        let free_ranges = self.free_ranges.read();
-        let sum = free_ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum();
-        sum
-    }
-
-    /// Calculate total space used by allocated franges
-    pub fn total_used_space(self: &Arc<Self>) -> u64 {
-        let franges = self.franges.read();
-        let sum = franges.iter().map(|entry| entry.value().size).sum();
-        sum
-    }
-
-    /// Check if a given size can be allocated contiguously
-    pub fn can_allocate_contiguous(self: &Arc<Self>, size: u64) -> bool {
-        let free_ranges = self.free_ranges.read();
-        let can_allocate = free_ranges
-            .iter()
-            .any(|range| range.end - range.start >= size);
-        can_allocate
-    }
-
-    /// Get fragmentation statistics
-    pub fn fragmentation_stats(self: &Arc<Self>) -> FragmentationStats {
-        let free_ranges = self.free_ranges.read();
-        let mut stats = FragmentationStats::default();
-
-        if free_ranges.is_empty() {
-            return stats;
-        }
-
-        // Collect the ranges to avoid iterator lifetime issues
-        let ranges: Vec<_> = free_ranges.iter().collect();
-
-        for range in ranges {
-            let size = range.end - range.start;
-            stats.total_free_space += size;
-            stats.free_range_count += 1;
-            stats.largest_free_block = stats.largest_free_block.max(size);
-
-            if size < self.page_size as u64 {
-                stats.small_fragments += 1;
-            }
-        }
-
-        if stats.free_range_count > 0 {
-            stats.average_fragment_size = stats.total_free_space / stats.free_range_count;
-        }
-
-        stats
-    }
-}
-
-impl Fs {
-    /// Check if compaction is needed and perform it if necessary
-    pub fn maybe_compact(self: &Arc<Self>) -> Result<bool, FsError> {
-        self.maybe_compact_with_config(&CompactionConfig::default())
-    }
-
-    /// Check if compaction is needed and perform it with custom config
-    pub fn maybe_compact_with_config(
-        self: &Arc<Self>,
-        config: &CompactionConfig,
-    ) -> Result<bool, FsError> {
-        // First check if compaction is needed
-        let stats = self.fragmentation_stats();
-        let total_space = self.total_free_space() + self.total_used_space();
-
-        let fragmentation_ratio =
-            stats.free_range_count as f64 * stats.average_fragment_size as f64 / total_space as f64;
-
-        if fragmentation_ratio < config.fragmentation_threshold {
-            return Ok(false);
-        }
-
-        // Identify candidate franges for compaction
-        let candidates = match self.find_compaction_candidates(config) {
-            | Ok(v) => v,
-            | Err(e) => return Err(e),
-        };
-        if candidates.is_empty() {
-            return Ok(false);
-        }
-
-        // Perform compaction
-        match self.compact_franges(config.block_buffer_size, candidates) {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
-        };
-
-        Ok(true)
-    }
-
-    /// Find candidate franges for compaction
-    fn find_compaction_candidates(
-        self: &Arc<Self>,
-        config: &CompactionConfig,
-    ) -> Result<Vec<(u64, FRangeMetadata)>, FsError> {
-        let mut candidates = Vec::new();
-
-        // Only consider closed franges
-        let open_franges = self.open_franges.read();
-        let franges = self.franges.read();
-
-        for entry in franges.iter() {
-            let id = entry.key();
-            let metadata = entry.value();
-
-            // Skip open franges
-            if open_franges.contains(id) {
-                continue;
-            }
-
-            // Consider franges that might benefit from compaction
-            let allocated_size = metadata.range.end - metadata.range.start;
-            let used_size = metadata.length.load(SeqCst);
-
-            // Check if frange is significantly fragmented
-            if allocated_size - used_size >= config.min_fragment_size {
-                candidates.push((*id, metadata.clone()));
-            }
-
-            if candidates.len() >= config.max_compact_batch {
-                break;
-            }
-        }
-
-        Ok(candidates)
-    }
-
-    /// Perform compaction on selected franges
-    fn compact_franges(
-        self: &Arc<Self>,
-        buffer_size: usize,
-        candidates: Vec<(u64, FRangeMetadata)>,
-    ) -> Result<(), FsError> {
-        for (id, metadata) in candidates {
-            // Skip if frange was opened while preparing compaction
-            if self.open_franges.read().contains(&id) {
-                continue;
-            }
-
-            match self.mmap.advise_range(
-                memmap2::Advice::WillNeed,
-                (metadata.range.end - metadata.range.start) as usize,
-                metadata.range.start as usize,
-            ) {
-                | Ok(_) => {},
-                | Err(e) => return Err(IoError(e)),
-            };
-
-            // Create new frange with exact size needed
-            let new_id = match self.create_frange(metadata.length.load(SeqCst)) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
-            };
-            let new_handle = match self.open_frange(new_id) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
-            };
-
-            // Read data from old frange
-            // TODO(@siennathesane): find a more efficient way to copy data. since we are
-            // using the `FRangeHandle` API, realistically we can load the
-            // ranges, calculate the offsets, then directly copy data with a
-            // single memcpy from the source to the dest.
-            let old_handle = match self.open_frange(id) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
-            };
-            let mut buffer = BytesMut::zeroed(buffer_size); // use 4KB buffer for copying
-
-            let mut remaining = metadata.length.load(SeqCst);
-            let mut offset = 0;
-
-            while remaining > 0 {
-                let chunk_size = remaining.min(buffer.len() as u64) as usize;
-                buffer.resize(chunk_size, 0);
-
-                match old_handle.read_at(offset, &mut buffer) {
-                    | Ok(_) => {},
-                    | Err(e) => return Err(e),
-                };
-
-                match new_handle.write_at(offset, &buffer) {
-                    | Ok(_) => {},
-                    | Err(e) => return Err(e),
-                };
-
-                offset += chunk_size as u64;
-                remaining -= chunk_size as u64;
-            }
-
-            // close both handles
-            match self.close_frange(old_handle) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
-            };
-
-            match self.close_frange(new_handle) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
-            };
-
-            // Get the new range information
-            let new_range = {
-                match self.franges.read().get(&new_id) {
-                    | None => return Err(FRangeNotFound),
-                    | Some(v) => v,
-                }
-                .value()
-                .range
-                .clone()
-            };
-
-            // Update the original frange's metadata to point to the new location
-            {
-                let mut updated = match self.franges.read().get(&id) {
-                    | None => {
-                        return Err(FRangeNotFound);
-                    },
-                    | Some(v) => v.value().clone(),
-                };
-
-                updated.range = new_range;
-                self.franges.write().insert(updated.id, updated);
-            }
-
-            // Remove the temporary frange's metadata
-            {
-                let franges = self.franges.write();
-                franges.remove(&new_id);
-            }
-
-            // Add the old range back to free ranges
-            {
-                let free_ranges = self.free_ranges.write();
-                free_ranges.insert(metadata.range);
-            }
-        }
-
-        // Finalize metadata persist and coalesce
-        match self.persist_metadata() {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
-        };
-
-        match self.coalesce_free_ranges() {
-            | Ok(_) => Ok(()),
-            | Err(e) => Err(e),
-        }
-    }
-}
-
-/// Configuration for fragmentation detection and compaction
-#[derive(Debug, Clone)]
-pub struct CompactionConfig {
-    /// Threshold ratio of fragmented space to trigger compaction (0.0 to 1.0)
-    pub fragmentation_threshold: f64,
-    /// Minimum size in bytes for a fragment to be considered for compaction
-    pub min_fragment_size: u64,
-    /// Maximum number of franges to compact in one operation
-    pub max_compact_batch: usize,
-
-    pub block_buffer_size: usize,
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            fragmentation_threshold: 0.3, // 30% fragmentation triggers compaction
-            min_fragment_size: 4096,      // Ignore fragments smaller than 4KB
-            max_compact_batch: 10,        // Compact up to 10 franges at once
-            block_buffer_size: 4096,      // 4KiB
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct FragmentationStats {
-    pub total_free_space: u64,
-    pub free_range_count: u64,
-    pub largest_free_block: u64,
-    pub average_fragment_size: u64,
-    pub small_fragments: u64, // Fragments smaller than page size
-}
-
 #[derive(Debug)]
 pub struct MetadataSpaceInfo {
     pub total_capacity: u64,
@@ -1104,195 +762,17 @@ pub struct MetadataSpaceInfo {
     pub available_space: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Getters)]
+#[get = "pub"]
 pub struct FsHealth {
-    pub space_accounting_valid: bool,
-    pub metadata_healthy: bool,
-    pub fragmentation_percent: f64,
-    pub total_size: u64,
-    pub used_space: u64,
-    pub free_space: u64,
-    pub metadata_space: MetadataSpaceInfo,
-    pub fragmentation_stats: FragmentationStats,
-}
-
-#[derive(Debug)]
-pub(crate) struct FRangeMetadata {
-    range: OrderedRange,
-    id: u64,
-    length: AtomicU64, // Track actual bytes written
-    size: u64,         // Keep this as allocated size
-    created_at: u64,
-    modified_at: AtomicU64,
-}
-
-impl Clone for FRangeMetadata {
-    fn clone(&self) -> Self {
-        Self {
-            range: self.range.clone(),
-            id: self.id,
-            length: AtomicU64::new(self.length.load(SeqCst)),
-            size: self.size,
-            created_at: self.created_at,
-            modified_at: AtomicU64::new(self.modified_at.load(SeqCst)),
-        }
-    }
-}
-
-pub struct FRangeHandle {
-    mmap: Arc<MmapMut>,
-    range: OrderedRange,
-    metadata: FRangeMetadata,
-    fs: Arc<Fs>,
-}
-
-impl FRangeHandle {
-    /// Write data at the given offset.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it allows writing to "arbitrary" memory
-    /// locations.
-    /// - There is pointer arithmetic to calculate the destination pointer.
-    /// - There is a `memcpy` with a raw pointer.
-    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), FsError> {
-        if offset as usize + data.len() > (self.range.end - self.range.start) as usize {
-            return Err(ReadOutOfBounds);
-        }
-
-        let base = self.range.start as usize + offset as usize;
-
-        if base + data.len() > self.range.end as usize {
-            return Err(WriteOutOfBounds);
-        }
-
-        // Mark affected pages as dirty
-        let start_page = base / self.fs.page_size;
-        let end_page = (base + data.len()).div_ceil(self.fs.page_size);
-
-        {
-            let dirty = self.fs.dirty_pages.write();
-            for page in start_page..end_page {
-                dirty.insert(page);
-            }
-        }
-
-        // SAFETY: we have already checked that the write is within bounds
-        unsafe {
-            // Get mutable pointer for destination
-            let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
-            ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
-        }
-
-        fence(SeqCst);
-
-        self.metadata.length.fetch_add(data.len() as u64, SeqCst);
-
-        self.metadata.modified_at.store(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            SeqCst,
-        );
-
-        match self.fs.maybe_flush(false) {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
-        };
-
-        Ok(())
-    }
-
-    /// Read data at the given offset.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it allows reading from "arbitrary"
-    /// memory locations.
-    /// - Builds a slice from a raw pointer.
-    /// - Performs pointer arithmetic to calculate the source pointer.
-    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        // First check if the read would be out of bounds of our allocated range
-        if offset as usize + buf.len() > (self.range.end - self.range.start) as usize {
-            return Err(ReadOutOfBounds);
-        }
-
-        // Then handle EOF case
-        if offset >= self.metadata.size {
-            return Ok(());
-        }
-
-        // Calculate how many bytes we can actually read based on written data
-        let available_bytes = (self.metadata.size - offset) as usize;
-        let bytes_to_read = buf.len().min(available_bytes);
-
-        let base = self.range.start as usize + offset as usize;
-
-        // mark affected pages as dirty
-        let start_page = base / self.fs.page_size;
-        let end_page = (base + buf.len()).div_ceil(self.fs.page_size);
-
-        {
-            for page in start_page..end_page {
-                self.fs.dirty_pages.write().insert(page);
-            }
-        }
-
-        // SAFETY: we have already checked that the read is within bounds
-        unsafe {
-            // Only copy the actually written bytes
-            buf[..bytes_to_read]
-                .copy_from_slice(from_raw_parts(self.mmap.as_ptr().add(base), bytes_to_read));
-        }
-
-        fence(SeqCst);
-        Ok(())
-    }
-
-    pub(crate) fn capacity(&self) -> u64 {
-        self.range.end - self.range.start
-    }
-
-    pub(crate) fn len(&self) -> u64 {
-        self.metadata.length.load(SeqCst)
-    }
-
-    pub(crate) fn metadata(&self) -> &FRangeMetadata {
-        &self.metadata
-    }
-}
-
-impl Drop for FRangeHandle {
-    fn drop(&mut self) {
-        // we basically remove ourselves from the open ranges so that when this
-        // is dropped you can theoretically delete the frange
-        {
-            let franges = self.fs.franges.write();
-            match franges.get(&self.metadata.id) {
-                | None => {},
-                | Some(entry) => {
-                    let updated = entry.value().clone();
-                    updated.modified_at.store(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        SeqCst,
-                    );
-                    updated
-                        .length
-                        .store(self.metadata.length.load(SeqCst), SeqCst);
-                    franges.insert(self.metadata.id, updated);
-                },
-            };
-        }
-
-        {
-            let mut open_franges = self.fs.open_franges.write();
-            open_franges.remove(&self.metadata.id);
-        }
-    }
+    space_accounting_valid: bool,
+    metadata_healthy: bool,
+    fragmentation_percent: f64,
+    total_size: u64,
+    used_space: u64,
+    free_space: u64,
+    metadata_space: MetadataSpaceInfo,
+    fragmentation_stats: FragmentationStats,
 }
 
 #[cfg(test)]
@@ -1321,14 +801,9 @@ mod tests {
     use crate::{
         block::BLOCK_SIZE,
         errs::FsError::InvalidHeaderFormat,
-        fs::{
-            deserialize_header,
-            CompactionConfig,
-            Fs,
-            FsHeader,
-            INITIAL_METADATA_SIZE,
-        },
     };
+    use crate::fs::compaction::CompactionConfig;
+    use crate::fs::core::{deserialize_header, Fs, FsHeader, INITIAL_METADATA_SIZE};
 
     const TEST_FILE_SIZE: u64 = 1024 * 1024 * 10; // 10MB
 
@@ -1389,8 +864,8 @@ mod tests {
         // Verify metadata
         let franges = fs.franges.read();
         let metadata = franges.get(&id).unwrap();
-        assert_eq!(metadata.value().size, 1024);
-        assert_eq!(metadata.value().id, 0);
+        assert_eq!(metadata.value().size(), 1024);
+        assert_eq!(metadata.value().id(), 0);
     }
 
     #[test]
@@ -1433,7 +908,7 @@ mod tests {
 
         // If we want to verify allocation size:
         assert_eq!(
-            handle.metadata().range.end - handle.metadata().range.start,
+            handle.metadata().range().end() - handle.metadata().range().start(),
             1024
         );
     }
@@ -1597,8 +1072,8 @@ mod tests {
         {
             let free_range = fs.free_ranges.read();
             let free_range = free_range.iter().next().unwrap();
-            assert!(free_range.end > free_range.start); // Ensure valid range
-            assert!(free_range.start >= (size_of::<FsHeader>() + INITIAL_METADATA_SIZE) as u64);
+            assert!(free_range.end() > free_range.start()); // Ensure valid range
+            assert!(free_range.start() >= (size_of::<FsHeader>() + INITIAL_METADATA_SIZE) as u64);
             // After header and metadata
         }
 
@@ -1695,12 +1170,12 @@ mod tests {
         let franges = reopened_fs.franges.read();
 
         let metadata1 = franges.get(&id1).unwrap();
-        assert_eq!(metadata1.value().size, 1024);
-        assert_eq!(metadata1.value().length.load(SeqCst), 11); // "test data 1" length
+        assert_eq!(metadata1.value().size(), 1024);
+        assert_eq!(metadata1.value().length().load(SeqCst), 11); // "test data 1" length
 
         let metadata2 = franges.get(&id2).unwrap();
-        assert_eq!(metadata2.value().size, 2048);
-        assert_eq!(metadata2.value().length.load(SeqCst), 11); // "test data 2" length
+        assert_eq!(metadata2.value().size(), 2048);
+        assert_eq!(metadata2.value().length().load(SeqCst), 11); // "test data 2" length
 
         dir.close().unwrap();
     }

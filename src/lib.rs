@@ -57,21 +57,21 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod block;
 mod block_alloc;
+mod index;
+mod segment;
+mod segment_builder;
+mod segment_reader;
+mod segment_writer;
+mod stats;
+mod utils;
 pub mod errs;
 pub mod fs;
 pub mod hlc;
-mod index;
 pub mod keypair;
 pub mod memtable;
 pub mod merge;
 pub mod peek;
-mod segment;
-mod segment_reader;
-mod segment_writer;
 pub(crate) mod state;
-mod stats;
-mod utils;
-mod segment_builder;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and

@@ -6,14 +6,18 @@ edition = "2021"
 
 [features]
 default_features = []
+# you have to enable benchmarks to run them. this is due to criterion only being able to access the public API, but i
+# don't want to expose most of the API to the public.
+benchmarks = []
 
 [dependencies]
-bloom2 = { version = "0.4.3", features = ["serde"] }
+bloom2 = { version = "0.5.0", features = ["serde"] }
 bytes = "1.7.2"
 crc32fast = "1.4.2"
 crossbeam-channel = "0.5.13"
 crossbeam-queue = "0.3.11"
 crossbeam-skiplist = "0.1.3"
+getset = "0.1.3"
 gxhash = "3.4.1"
 memmap2 = "0.9.5"
 mimalloc = { version = "0.1.43" }
