@@ -42,6 +42,7 @@ use crate::{
     },
     segment_writer::SegmentWriter,
 };
+use crate::segment_reader::SegmentReader;
 
 #[derive(Debug)]
 pub enum BlockType {
@@ -173,6 +174,10 @@ impl Segment {
 
         Ok(())
     }
+    
+    // pub(crate) fn new_reader(&self) -> SegmentReader {
+    //     SegmentReader::new(self)
+    // }
 
     /// Split a payload across multiple blocks.
     fn split_across_blocks(&mut self, data: &[u8], r#type: &BlockType) -> Result<(), SegmentError> {

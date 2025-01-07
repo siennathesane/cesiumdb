@@ -16,6 +16,8 @@ pub enum CesiumError {
     BlockError(BlockError),
     #[error("segment error")]
     SegmentError(SegmentError),
+    #[error("journal error")]
+    JournalError(JournalError),
 }
 
 #[derive(Error, Debug)]
@@ -34,6 +36,14 @@ pub enum BlockError {
     BlockFull,
     #[error("entry is too large for block")]
     TooLargeForBlock,
+}
+
+#[derive(Error, Debug)]
+pub enum JournalError {
+    #[error("journal entry too short")]
+    EntryTooShort,
+    #[error("invalid journal entry type")]
+    InvalidEntryType,
 }
 
 #[derive(Error, Debug)]

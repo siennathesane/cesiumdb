@@ -1,16 +1,43 @@
-use std::ops::Range;
-use std::ptr;
-use std::slice::from_raw_parts;
-use std::sync::Arc;
-use std::sync::atomic::{fence, AtomicU64};
-use std::sync::atomic::Ordering::SeqCst;
-use std::time::{SystemTime, UNIX_EPOCH};
-use getset::{CopyGetters, Getters, Setters};
+use std::{ops::Range, ptr, slice, slice::from_raw_parts, sync::{
+    atomic::{
+        fence,
+        AtomicU64,
+        Ordering::SeqCst,
+    },
+    Arc,
+}, time::{
+    SystemTime,
+    UNIX_EPOCH,
+}};
+
+use getset::{
+    CopyGetters,
+    Getters,
+    Setters,
+};
 use memmap2::MmapMut;
-use crate::errs::FsError;
-use crate::errs::FsError::{ReadOutOfBounds, WriteOutOfBounds};
-use crate::fs::core::Fs;
-use crate::utils::Deserializer;
+
+use crate::{
+    errs::{
+        FsError,
+        FsError::{
+            ReadOutOfBounds,
+            WriteOutOfBounds,
+        },
+    },
+    fs::{
+        core::{
+            Fs,
+            FsHeader,
+        },
+        journal::{
+            JournalEntry,
+            JournalEntryType::UpdateFRange,
+            JOURNAL_SIZE,
+        },
+    },
+    utils::Deserializer,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, CopyGetters, Setters)]
 #[getset(get_copy = "pub(crate)")]
@@ -69,7 +96,7 @@ pub(crate) struct FRangeMetadata {
     #[getset(get = "pub(crate)")]
     length: AtomicU64, // Track actual bytes written
     #[getset(get_copy = "pub(crate)")]
-    size: u64,         // Keep this as allocated size
+    size: u64, // Keep this as allocated size
     #[getset(get_copy = "pub(crate)")]
     created_at: u64,
     #[getset(get = "pub(crate)")]
@@ -77,7 +104,14 @@ pub(crate) struct FRangeMetadata {
 }
 
 impl FRangeMetadata {
-    pub(crate) fn new(range: OrderedRange, id: u64, length: u64, size: u64, created_at: u64, modified_at: u64) -> Self {
+    pub(crate) fn new(
+        range: OrderedRange,
+        id: u64,
+        length: u64,
+        size: u64,
+        created_at: u64,
+        modified_at: u64,
+    ) -> Self {
         let mut now = 0;
         if created_at == 0 {
             now = SystemTime::now()
@@ -127,7 +161,12 @@ pub struct FRangeHandle {
 }
 
 impl FRangeHandle {
-    pub(crate) fn new(mmap: Arc<MmapMut>, range: OrderedRange, metadata: FRangeMetadata, fs: Arc<Fs>) -> Self {
+    pub(crate) fn new(
+        mmap: Arc<MmapMut>,
+        range: OrderedRange,
+        metadata: FRangeMetadata,
+        fs: Arc<Fs>,
+    ) -> Self {
         Self {
             mmap,
             range,
@@ -135,8 +174,7 @@ impl FRangeHandle {
             fs,
         }
     }
-    
-    
+
     /// Write data at the given offset.
     ///
     /// # Safety
@@ -152,43 +190,51 @@ impl FRangeHandle {
 
         let base = self.range.start as usize + offset as usize;
 
-        if base + data.len() > self.range.end as usize {
-            return Err(WriteOutOfBounds);
-        }
+        // Calculate page-aligned boundaries for the write
+        let start_page = (base / self.fs.page_size) * self.fs.page_size;
+        let end_page = (base + data.len()).div_ceil(self.fs.page_size) * self.fs.page_size;
 
-        // Mark affected pages as dirty
-        let start_page = base / self.fs.page_size;
-        let end_page = (base + data.len()).div_ceil(self.fs.page_size);
+        println!("Write details:");
+        println!("  Range start: {}, Range end: {}", self.range.start, self.range.end);
+        println!("  Base address: {}", base);
+        println!("  Start page: {}, End page: {}", start_page, end_page);
+        println!("  Page size: {}", self.fs.page_size);
+        println!("  Write region: {} to {}", base, base + data.len());
 
+        // Mark pages as dirty before writing
         {
             let dirty = self.fs.dirty_pages.write();
-            for page in start_page..end_page {
-                dirty.insert(page);
+            for page in (start_page..end_page).step_by(self.fs.page_size) {
+                let page_num = page / self.fs.page_size;
+                println!("  Marking page {} as dirty", page_num);
+                dirty.insert(page_num);
             }
         }
 
-        // SAFETY: we have already checked that the write is within bounds
+        // SAFETY: Already checked bounds
         unsafe {
-            // Get mutable pointer for destination
             let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
+            println!("  Writing to dst ptr: {:?}", dst);
             ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+
+            // Verify write
+            let written = from_raw_parts(dst, data.len());
+            println!("  Verification read immediately after write: {:?}", written);
         }
 
         fence(SeqCst);
 
-        self.metadata.length.fetch_add(data.len() as u64, SeqCst);
-
-        self.metadata.modified_at.store(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            SeqCst,
+        println!("  Updating length from {} to {}",
+                 self.metadata.length.load(SeqCst),
+                 offset + data.len() as u64
         );
+        self.metadata.length.store(offset + data.len() as u64, SeqCst);
 
+        // Force flush
+        println!("  Forcing flush");
         match self.fs.maybe_flush(false) {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
+            Ok(_) => println!("  Flush completed successfully"),
+            Err(e) => println!("  Flush failed with error: {:?}", e)
         };
 
         Ok(())
@@ -208,32 +254,18 @@ impl FRangeHandle {
             return Err(ReadOutOfBounds);
         }
 
-        // Then handle EOF case
-        if offset >= self.metadata.size {
-            return Ok(());
-        }
-
-        // Calculate how many bytes we can actually read based on written data
-        let available_bytes = (self.metadata.size - offset) as usize;
-        let bytes_to_read = buf.len().min(available_bytes);
-
+        // Calculate base offset
         let base = self.range.start as usize + offset as usize;
+        println!("read_at: base={}, len={}", base, buf.len());
 
-        // mark affected pages as dirty
-        let start_page = base / self.fs.page_size;
-        let end_page = (base + buf.len()).div_ceil(self.fs.page_size);
-
-        {
-            for page in start_page..end_page {
-                self.fs.dirty_pages.write().insert(page);
-            }
-        }
-
-        // SAFETY: we have already checked that the read is within bounds
+        // SAFETY: see docstring
         unsafe {
-            // Only copy the actually written bytes
-            buf[..bytes_to_read]
-                .copy_from_slice(from_raw_parts(self.mmap.as_ptr().add(base), bytes_to_read));
+            let src = self.mmap.as_ptr().add(base);
+            // Add verification before actual read
+            let verify = slice::from_raw_parts(src, buf.len());
+            println!("read_at verification: {:?}", verify);
+
+            buf.copy_from_slice(from_raw_parts(src, buf.len()));
         }
 
         fence(SeqCst);

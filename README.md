@@ -14,6 +14,7 @@ This project was heavily inspired and influenced by (in no particular order):
 * CockroachDB's `pebble`
 * Ben Johnson's `boltdb`
 * Google's `leveldb`
+* Giorgos Xanthakis et al's `parallax`
 * A burning desire to have a rust-native LSM-tree that has column family/namespace support
 
 ## Interesting Features
@@ -128,18 +129,18 @@ thread.
 
 ## To Do's
 
-An alphabetical list of things I'd like to actually do for the long-term safety and stability of the project:
+An alphabetical list of things I'd like to actually do for the long-term safety and stability of the project.
 
 - [ ] Add `loom` integration tests.
 - [ ] Add `miri` integration tests.
 - [ ] Add more granular `madvise` commands to the filesystem to give the kernel some hints.
 - [ ] Add some kind of `fallocate` automation or growth strategy for the filesystem when it's not a block device.
-- [ ] Add some kind of `fsck` and block checksums
+- [ ] Add some kind of `fsck` and block checksums since journaling is already present. There are basic unit tests for
+  this but no supported tool for it.
 - [ ] Bloom filter size is currently hardcoded. I'd like to make it configurable.
 - [ ] Determine how to expose the untrustworthiness of the bloom filter.
-- [ ] Expand the `CesiumError` tree to cover all possible use cases
-- [ ] Figure out how hard it would be to support `no_std` for the embedded workloads. I suspect it would require a
-  custom variation of `std::collections::BinaryHeap`, which would be... difficult lol
+- [ ] Figure out how hard it would be to support `no_std` for the embedded workloads. I suspect it would be... difficult
+  lol
 - [ ] Investigate the point at which we can no longer `mmap` a physical device. Theoretically, even without swap space,
   I can `mmap` a 1TiB physical device to the filesystem implementation. But I feel like shit gets real weird. Idk, it's
   a Linux-ism I want to investigate.
@@ -148,7 +149,6 @@ An alphabetical list of things I'd like to actually do for the long-term safety 
   each. I have no idea if this is a mismatch of my expectations or a gross inability of mine to optimize it further.
   Every optimization I've tried is 5-20% slower (including my own cache-optimized min heap) than this.
 - [ ] Write some kind of auto-configuration for the generalized configs.
-- [ ] Add `grow` API to the filesystem. This will result in fragmentation
 
 ## License
 

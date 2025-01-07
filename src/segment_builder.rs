@@ -4,7 +4,6 @@ use crate::{
     errs::{
     },
     fs::{
-        FRangeHandle,
         Fs,
     },
     segment::{

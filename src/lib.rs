@@ -381,12 +381,6 @@ mod tests {
                 let guard = db.inner.state.lock();
                 assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
             }
-
-            println!(
-                "batch size: {}, keypair_size: {}",
-                batch.len(),
-                keypair_size
-            );
         }
     }
 }

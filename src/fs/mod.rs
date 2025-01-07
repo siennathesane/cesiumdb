@@ -1,12 +1,9 @@
 mod core;
 mod compaction;
 mod handle;
+mod test;
+mod journal;
 
-macro_rules! bench {
-    () => {
-        #[cfg(feature = "benchmarks")]
-        pub
-        #[cfg(not(feature = "benchmarks"))]
-        pub(in crate::fs)
-    }
-}
+pub use core::*;
+pub use compaction::{CompactionConfig};
+pub use handle::{FRangeHandle};
