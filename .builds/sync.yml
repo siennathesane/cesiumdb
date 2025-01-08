@@ -1,0 +1,15 @@
+image: ubuntu/lts
+packages:
+  - git
+sources:
+  - https://git.sr.ht/~siennathesane/cesiumdb
+secrets:
+  - 9743b05a-8afc-4ab0-8c4e-7e995447fc25
+tasks:
+  - sync: |
+      ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+
+      cd cesiumdb
+      git config core.sshCommand 'ssh -i ~/.ssh/9743b05a-8afc-4ab0-8c4e-7e995447fc25'
+      git remote add github git@github.com:siennathesane/cesiumdb.git
+      git push github --mirror

@@ -1,4 +1,4 @@
-[![Build & Test](https://github.com/siennathesane/cesiumdb/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/siennathesane/cesiumdb/actions/workflows/build-and-test.yml)
+[![builds.sr.ht status](https://builds.sr.ht/~siennathesane/cesiumdb/commits/feat/builds/amd64.yml.svg)](https://builds.sr.ht/~siennathesane/cesiumdb/commits/feat/builds/amd64.yml?)
 [![codecov](https://codecov.io/gh/siennathesane/cesiumdb/graph/badge.svg?token=D7RBD3OX2U)](https://codecov.io/gh/siennathesane/cesiumdb)
 
 # CesiumDB
