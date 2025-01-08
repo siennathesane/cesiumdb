@@ -19,7 +19,7 @@ crossbeam-queue = "0.3.11"# no_std support, i think
 crossbeam-skiplist = "0.1.3" # no_std support, i think
 getset = "0.1.3" # this is compile time only, shouldn't be a problem
 gxhash = "3.4.1"# no_std support
-memmap2 = "0.9.5" # this would need to be ported to no_std
+memmap2 = "0.9.5" # there would need to be a functional replacement of the filesystem library, but it might be possible
 mimalloc = { version = "0.1.43" } # maybe there's no_std support? big question mark
 parking_lot = "0.12.3" # we would need to find a replacement for this, maybe lock_api?
 rand = "0.8.5" # has no_std support

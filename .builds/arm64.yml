@@ -1,0 +1,26 @@
+image: ubuntu/lts
+packages:
+  - rustup
+  - python3
+sources:
+  - https://git.sr.ht/~siennathesane/cesiumdb
+environment:
+  CARGO_TERM_COLOR: always
+secrets:
+  - dcf70a02-463f-4c8d-96b5-718477398a6b
+tasks:
+  - setup: |
+      rustup self-update
+      rustup toolchain install
+      cargo install nextest cargo-llvm-cov
+      pip install codecov-cli
+  - build: |
+      cargo build --release
+  - test: |
+      cargo llvm-cov --no-report nextest --profile ci
+      cargo llvm-cov report --lcov --output-path lcov.info
+  - upload: |
+      set +x
+      export CODECOV_TOKEN=$(cat ~/.codecov-token)
+      codecovcli do-upload -t $CODECOV_TOKEN -f lcov.info --git-service srht
+      codecovcli do-upload -t $CODECOV_TOKEN -f target/nextest/ci/junit.xml
