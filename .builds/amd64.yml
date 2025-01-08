@@ -1,29 +1,19 @@
 image: ubuntu/lts
 packages:
   - rustup
-  - pipx
 sources:
   - https://git.sr.ht/~siennathesane/cesiumdb
 environment:
   CARGO_TERM_COLOR: always
-secrets:
-  - dcf70a02-463f-4c8d-96b5-718477398a6b
 tasks:
   - setup: |
       # rust tools
       rustup toolchain install nightly --profile default
       cargo install cargo-llvm-cov
       curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      # codecov
-      pipx install codecov-cli
   - build: |
+      cd cesiumdb
       cargo build --release
   - test: |
-      cargo llvm-cov --no-report nextest --profile ci
-      cargo llvm-cov report --lcov --output-path lcov.info
-  - upload: |
-      set +x
-      export CODECOV_TOKEN=$(cat ~/.codecov-token)
-      codecovcli do-upload -t $CODECOV_TOKEN -f lcov.info --git-service srht
-      codecovcli do-upload -t $CODECOV_TOKEN -f target/nextest/ci/junit.xml
+      cd cesiumdb
+      cargo nextest run --profile ci
