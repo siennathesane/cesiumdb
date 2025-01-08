@@ -1,7 +1,7 @@
 image: ubuntu/lts
 packages:
   - rustup
-  - python3
+  - python3-pip
 sources:
   - https://git.sr.ht/~siennathesane/cesiumdb
 environment:
