@@ -1,7 +1,7 @@
 image: ubuntu/lts
 packages:
   - rustup
-  - python3-codecov-cli
+  - pipx
 sources:
   - https://git.sr.ht/~siennathesane/cesiumdb
 environment:
@@ -16,7 +16,7 @@ tasks:
       curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # codecov
-      # pip install codecov-cli
+      pipx install codecov-cli
   - build: |
       cargo build --release
   - test: |
