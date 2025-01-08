@@ -10,9 +10,12 @@ secrets:
   - dcf70a02-463f-4c8d-96b5-718477398a6b
 tasks:
   - setup: |
-      rustup self-update
-      rustup toolchain install
-      cargo install nextest cargo-llvm-cov
+      # rust tools
+      rustup toolchain install nightly --profile complete
+      cargo install cargo-llvm-cov
+      curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      # codecov
       pip install codecov-cli
   - build: |
       cargo build --release
