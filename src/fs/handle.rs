@@ -194,19 +194,11 @@ impl FRangeHandle {
         let start_page = (base / self.fs.page_size) * self.fs.page_size;
         let end_page = (base + data.len()).div_ceil(self.fs.page_size) * self.fs.page_size;
 
-        println!("Write details:");
-        println!("  Range start: {}, Range end: {}", self.range.start, self.range.end);
-        println!("  Base address: {}", base);
-        println!("  Start page: {}, End page: {}", start_page, end_page);
-        println!("  Page size: {}", self.fs.page_size);
-        println!("  Write region: {} to {}", base, base + data.len());
-
         // Mark pages as dirty before writing
         {
             let dirty = self.fs.dirty_pages.write();
             for page in (start_page..end_page).step_by(self.fs.page_size) {
                 let page_num = page / self.fs.page_size;
-                println!("  Marking page {} as dirty", page_num);
                 dirty.insert(page_num);
             }
         }
@@ -214,28 +206,18 @@ impl FRangeHandle {
         // SAFETY: Already checked bounds
         unsafe {
             let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
-            println!("  Writing to dst ptr: {:?}", dst);
             ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
-
-            // Verify write
-            let written = from_raw_parts(dst, data.len());
-            println!("  Verification read immediately after write: {:?}", written);
         }
 
         fence(SeqCst);
-
-        println!("  Updating length from {} to {}",
-                 self.metadata.length.load(SeqCst),
-                 offset + data.len() as u64
-        );
         self.metadata.length.store(offset + data.len() as u64, SeqCst);
-
-        // Force flush
-        println!("  Forcing flush");
+        
         match self.fs.maybe_flush(false) {
-            Ok(_) => println!("  Flush completed successfully"),
-            Err(e) => println!("  Flush failed with error: {:?}", e)
+            Ok(_) => { },
+            Err(e) => return Err(e),
         };
+        
+        self.fs.metadata_changes.write().mark_frange_modified(self.metadata.id);
 
         Ok(())
     }
@@ -256,14 +238,12 @@ impl FRangeHandle {
 
         // Calculate base offset
         let base = self.range.start as usize + offset as usize;
-        println!("read_at: base={}, len={}", base, buf.len());
 
         // SAFETY: see docstring
         unsafe {
             let src = self.mmap.as_ptr().add(base);
             // Add verification before actual read
-            let verify = slice::from_raw_parts(src, buf.len());
-            println!("read_at verification: {:?}", verify);
+            let verify = from_raw_parts(src, buf.len());
 
             buf.copy_from_slice(from_raw_parts(src, buf.len()));
         }

@@ -21,7 +21,7 @@ use rand::{
 use tempfile::tempdir;
 
 const BENCH_FILE_SIZE: u64 = 1024 * 1024 * 256; // 256MB for benchmarking
-const FRAG_BENCH_SIZE: u64 = 1024 * 1024 * 1024 * 1; // 1GB for fragmentation tests
+const FRAG_BENCH_SIZE: u64 = 1024 * 1024 * 1024; // 1GB for fragmentation tests
 
 fn setup_benchmark_fs() -> (Arc<Fs>, tempfile::TempDir) {
     let dir = tempdir().unwrap();

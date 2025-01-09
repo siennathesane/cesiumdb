@@ -9,7 +9,7 @@ use std::{
         Arc,
     },
 };
-
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
 use bytes::{
     Buf,
     BufMut,
@@ -210,31 +210,38 @@ impl Journal {
         }
 
         // Keep trying until we successfully claim space and write
-        let mut head = self.head.load(SeqCst);
+        let mut head = self.head.load(Relaxed);
         loop {
-
-            let tail = self.tail.load(SeqCst);
+            let tail = self.tail.load(Relaxed);
             let new_head = (head + len) % self.capacity;
 
-            // Check if we need to move tail
+            // Move tail if the new entry would overwrite it
             let mut new_tail = tail;
-            if new_head < head {
-                if tail < new_head {
+            let would_wrap = new_head < head;
+
+            if would_wrap {
+                // Writing will wrap around buffer end
+                // Move tail if it's within the wrap region: from head to end, or start to new_head
+                if tail >= head || tail < new_head {
                     new_tail = new_head;
                 }
-            } else if new_head > head && tail > head && tail <= new_head {
-                new_tail = new_head;
+            } else {
+                // Linear write
+                // Move tail if it's within the write region
+                if tail > head && tail <= new_head {
+                    new_tail = new_head;
+                }
             }
 
             // Try to atomically update head (and tail if needed)
-            match self.head.compare_exchange(head, new_head, SeqCst, SeqCst) {
-                | Ok(_) => {
+            match self.head.compare_exchange(head, new_head, SeqCst, Acquire) {
+                Ok(_) => {
                     // We claimed the space, now write
                     if new_tail != tail {
-                        self.tail.store(new_tail, SeqCst);
+                        self.tail.store(new_tail, Relaxed);
                     }
 
-                    if new_head < head {
+                    if would_wrap {
                         let first_part = self.capacity - head;
                         // SAFETY:
                         unsafe {
@@ -261,7 +268,7 @@ impl Journal {
                     }
                     return Ok(());
                 },
-                | Err(current) => {
+                Err(current) => {
                     // Someone else wrote, try again with new head
                     head = current;
                 },
@@ -321,7 +328,6 @@ impl<'a> Iterator for JournalIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let head = self.journal.head.load(SeqCst);
         if self.current == head {
-            println!("Iterator: reached head, stopping");
             return None;
         }
 
@@ -335,11 +341,6 @@ impl<'a> Iterator for JournalIterator<'a> {
             let first_part = self.journal.capacity - self.current;
             let second_part = entry_size - first_part;
 
-            println!(
-                "Reading wrapped entry: first_part={}, second_part={}",
-                first_part, second_part
-            );
-
             // Read first part from current to end
             entry_bytes.extend_from_slice(
                 &self.journal.mmap[(self.journal.offset + self.current) as usize..]
@@ -351,11 +352,6 @@ impl<'a> Iterator for JournalIterator<'a> {
                 &self.journal.mmap[self.journal.offset as usize..][..second_part as usize],
             );
         } else {
-            println!(
-                "Reading linear entry from {} to {}",
-                self.current,
-                self.current + entry_size
-            );
             entry_bytes.extend_from_slice(
                 &self.journal.mmap[(self.journal.offset + self.current) as usize..]
                     [..entry_size as usize],
@@ -364,10 +360,6 @@ impl<'a> Iterator for JournalIterator<'a> {
 
         match JournalEntry::deserialize(entry_bytes.freeze()) {
             | Ok(entry) => {
-                println!(
-                    "Deserialized entry: type={:?}, id={}",
-                    entry.r#type, entry.frange_id
-                );
                 // Update current position, wrapping around if needed
                 self.current = (self.current + entry_size) % self.journal.capacity;
                 Some(Ok(entry))

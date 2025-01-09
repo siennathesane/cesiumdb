@@ -1,26 +1,36 @@
-use std::{io::{
-    Error,
-    ErrorKind::{
-        AlreadyExists,
-        InvalidInput,
-    },
-}, mem::ManuallyDrop, ops::Range, ptr, slice, slice::from_raw_parts, sync::{
-    atomic,
-    atomic::{
-        fence,
-        AtomicU64,
-        Ordering::{
-            AcqRel,
-            Acquire,
-            Relaxed,
-            SeqCst,
+use std::{
+    io::{
+        Error,
+        ErrorKind::{
+            AlreadyExists,
+            InvalidInput,
         },
     },
-    Arc,
-}, time::{
-    SystemTime,
-    UNIX_EPOCH,
-}};
+    mem::ManuallyDrop,
+    ops::Range,
+    ptr,
+    slice,
+    slice::from_raw_parts,
+    sync::{
+        atomic,
+        atomic::{
+            fence,
+            AtomicBool,
+            AtomicU64,
+            Ordering::{
+                AcqRel,
+                Acquire,
+                Relaxed,
+                SeqCst,
+            },
+        },
+        Arc,
+    },
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
 
 use bytes::{
     Buf,
@@ -276,7 +286,36 @@ impl FsMetadata {
     }
 }
 
+#[derive(Default)]
+pub(in crate::fs) struct MetadataChanges {
+    modified_franges: SkipSet<u64>,         // IDs of modified franges
+    modified_ranges: SkipSet<OrderedRange>, // Modified free ranges
+    header_modified: AtomicBool,
+}
+
+impl MetadataChanges {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    pub(in crate::fs) fn mark_frange_modified(&self, id: u64) {
+        self.modified_franges.insert(id);
+        self.header_modified.store(true, SeqCst);
+    }
+
+    pub(in crate::fs) fn mark_range_modified(&self, range: OrderedRange) {
+        self.modified_ranges.insert(range);
+    }
+
+    pub(in crate::fs) fn clear(&self) {
+        self.modified_franges.clear();
+        self.modified_ranges.clear();
+        self.header_modified.store(false, SeqCst);
+    }
+}
+
 // For calculating size during filesystem init
+// TODO(@siennathesane): this isn't valid, i'm not sure why it's here
 pub(in crate::fs) const INITIAL_METADATA_SIZE: usize = 4096; // Or calculate based on expected initial capacity
 
 /// A custom filesystem implementation for CesiumDB. It is designed to work with
@@ -297,6 +336,7 @@ pub struct Fs {
 
     // journaling
     pub(in crate::fs) journal: Arc<Journal>,
+    pub(in crate::fs) metadata_changes: RwLock<MetadataChanges>,
 }
 
 impl Fs {
@@ -338,7 +378,11 @@ impl Fs {
         }
 
         let mmap = Arc::new(mmap);
-        let journal = Journal::new(Arc::clone(&mmap), header.journal_offset, header.journal_size);
+        let journal = Journal::new(
+            Arc::clone(&mmap),
+            header.journal_offset,
+            header.journal_size,
+        );
 
         let fs = Arc::new(Self {
             mmap,
@@ -350,6 +394,7 @@ impl Fs {
             dirty_pages: RwLock::new(SkipSet::new()),
             page_size: header.page_size as usize,
             journal: Arc::new(journal),
+            metadata_changes: RwLock::new(MetadataChanges::default()),
         });
 
         // replay the journal
@@ -395,7 +440,8 @@ impl Fs {
             metadata_size as u64,
             journal_offset, // journal starts after metadata
             JOURNAL_SIZE,
-        ).serialize();
+        )
+        .serialize();
 
         // Write header using actual serialized size
         mmap[..header_size].copy_from_slice(&header_bytes);
@@ -410,7 +456,6 @@ impl Fs {
 
         // zero journal region
         let journal_end = (journal_offset + JOURNAL_SIZE) as usize;
-        println!("Init - Journal region: {} to {}", journal_offset as usize, journal_end);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -431,6 +476,7 @@ impl Fs {
             dirty_pages: RwLock::new(SkipSet::new()),
             page_size: BLOCK_SIZE,
             journal: Arc::new(journal),
+            metadata_changes: RwLock::new(MetadataChanges::default()),
         };
 
         // add initial free range (excluding header, metadata, and journal)
@@ -442,13 +488,11 @@ impl Fs {
     }
 
     pub fn create_frange(self: &Arc<Self>, size: u64) -> Result<u64, FsError> {
-        // Attempt allocation with a limited lock scope
         let range = {
             let free = self.free_ranges.write();
             self.find_free_range(&free, size)
         };
 
-        // Now lock is released, handle the result
         let range = match range {
             | Ok(range) => range,
             | Err(NoFreeSpace) => {
@@ -469,7 +513,7 @@ impl Fs {
             .unwrap()
             .as_secs();
 
-        let metadata = FRangeMetadata::new(range, id, 0, size, now, now);
+        let metadata = FRangeMetadata::new(range.clone(), id, 0, size, now, now);
 
         let entry = JournalEntry::new(CreateFRange, now, id, Some(metadata.clone()), None);
         match self.journal.append(entry) {
@@ -482,6 +526,10 @@ impl Fs {
             let ranges = self.franges.write();
             ranges.insert(id, metadata);
         }
+
+        let changes = self.metadata_changes.write();
+        changes.mark_frange_modified(id);
+        changes.mark_range_modified(range);
 
         match self.persist_metadata() {
             | Ok(_) => {},
@@ -581,7 +629,7 @@ impl Fs {
 
         {
             let free_ranges = self.free_ranges.write();
-            free_ranges.insert(range);
+            free_ranges.insert(range.clone());
         }
 
         // Coalesce free ranges
@@ -589,6 +637,10 @@ impl Fs {
             | Ok(_) => {},
             | Err(e) => return Err(e),
         };
+
+        let changes = self.metadata_changes.write();
+        changes.mark_frange_modified(id);
+        changes.mark_range_modified(range);
 
         // Persist changes
         self.persist_metadata()
@@ -603,8 +655,7 @@ impl Fs {
     pub(in crate::fs) fn persist_metadata(self: &Arc<Self>) -> Result<(), FsError> {
         let metadata = {
             let metadata = FsMetadata::new();
-
-            // Take one lock at a time and immediately release
+            
             {
                 let franges = self.franges.read();
                 for entry in franges.iter() {
@@ -683,6 +734,19 @@ impl Fs {
         let header_bytes = header.serialize();
         self.write_to_mmap(0, &header_bytes);
 
+        Ok(())
+    }
+    
+    fn grow_metadata_region(&self, header: &mut FsHeader, new_size: usize) -> Result<(), FsError> {
+        let metadata_end = header.metadata_offset + header.metadata_size;
+        let journal_start = header.journal_offset;
+        let growth_needed = new_size as u64 - header.metadata_size;
+        
+        if metadata_end + growth_needed > journal_start {
+            return Err(InsufficientSpace);
+        }
+        
+        header.metadata_size = new_size as u64;
         Ok(())
     }
 
@@ -889,55 +953,28 @@ impl Fs {
         // First collect pages
         let pages = {
             let dirty_pages = self.dirty_pages.write();
-            let p = dirty_pages
+            dirty_pages
                 .iter()
                 .map(|entry| *entry)
-                .collect::<Vec<usize>>();
-            println!("Flush details:");
-            println!("  Dirty pages to flush: {:?}", &p);
-            p
+                .collect::<Vec<usize>>()
         };
 
         // Then persist metadata
         match self.persist_metadata() {
-            Ok(_) => println!("  Metadata persisted successfully"),
-            Err(e) => println!("  Error persisting metadata: {:?}", e)
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
         };
-
-        let write_offset = 10484736; // Hardcoding for debugging
-        // SAFETY: none
-        unsafe {
-            let data = slice::from_raw_parts(
-                self.mmap.as_ptr().add(write_offset),
-                13
-            );
-            println!("  Data check after collecting pages: {:?}", data);
-        }
 
         // Handle ranges
         let ranges = self.consolidate_pages(&pages);
-        println!("  Consolidated ranges: {:?}", &ranges);
 
         for range in ranges {
-            println!("  Flushing range:");
-            println!("    Start: {}", range.start() as usize);
-            println!("    Length: {}", (range.end() - range.start()) as usize);
-
-            // SAFETY: none
-            unsafe {
-                let data = slice::from_raw_parts(
-                    self.mmap.as_ptr().add(write_offset),
-                    13
-                );
-                println!("    Pre-flush verification read: {:?}", data);
-            }
-
             match self.mmap.flush_range(
                 range.start() as usize,
                 (range.end() - range.start()) as usize,
             ) {
-                Ok(_) => println!("    Range flushed successfully"),
-                Err(e) => println!("    Error flushing range: {:?}", e)
+                | Ok(_) => {},
+                | Err(e) => return Err(IoError(e)),
             };
         }
 
