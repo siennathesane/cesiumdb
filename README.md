@@ -5,6 +5,14 @@
 
 A key-value store focused on performance.
 
+# Work In Progress
+
+This project is an active work-in-progress.
+
+It will likely compile, and most tests will likely pass, but it is not feature complete yet. The current state of work
+is stabilizing the embedded filesystem implementation so the front end memtables can rely on the backend embedded
+filesystem. Once that work is done, then it's just implementing levels (relatively easy) and compaction (easy enough).
+
 ## Inspiration
 
 This project was heavily inspired and influenced by (in no particular order):
