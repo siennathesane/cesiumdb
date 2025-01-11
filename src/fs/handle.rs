@@ -1,15 +1,29 @@
-use std::{ops::Range, ptr, slice, slice::from_raw_parts, sync::{
-    atomic::{
-        fence,
-        AtomicU64,
-        Ordering::SeqCst,
+use std::{
+    ops::Range,
+    ptr,
+    slice,
+    slice::from_raw_parts,
+    sync::{
+        atomic::{
+            fence,
+            AtomicU64,
+            Ordering::SeqCst,
+        },
+        Arc,
     },
-    Arc,
-}, time::{
-    SystemTime,
-    UNIX_EPOCH,
-}};
-
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
+use std::cmp::{max, min};
+use bytes::{
+    Buf,
+    BufMut,
+    Bytes,
+    BytesMut,
+};
+use crossbeam_skiplist::SkipSet;
 use getset::{
     CopyGetters,
     Getters,
@@ -30,21 +44,14 @@ use crate::{
             Fs,
             FsHeader,
         },
-        journal::{
-            JournalEntry,
-            JournalEntryType::UpdateFRange,
-            JOURNAL_SIZE,
-        },
     },
     utils::Deserializer,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, CopyGetters, Setters)]
-#[getset(get_copy = "pub(crate)")]
-pub(crate) struct OrderedRange {
-    start: u64,
-    #[getset(set = "pub(crate)")]
-    end: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::fs) struct OrderedRange {
+    pub(in crate::fs) start: u64,
+    pub(in crate::fs) end: u64,
 }
 
 impl OrderedRange {
@@ -87,20 +94,17 @@ impl PartialOrd for OrderedRange {
     }
 }
 
-#[derive(Debug, Getters, CopyGetters, Setters)]
+// TODO(@siennathesane): when this supports extension beyond the current range
+// we have to make sure it can't grow past 4000 extensions since it's size
+// is defined
+#[derive(Debug)]
 pub(crate) struct FRangeMetadata {
-    #[getset(get = "pub(crate)", set = "pub(crate)")]
-    range: OrderedRange,
-    #[getset(get_copy = "pub(crate)")]
-    id: u64,
-    #[getset(get = "pub(crate)")]
-    length: AtomicU64, // Track actual bytes written
-    #[getset(get_copy = "pub(crate)")]
-    size: u64, // Keep this as allocated size
-    #[getset(get_copy = "pub(crate)")]
-    created_at: u64,
-    #[getset(get = "pub(crate)")]
-    modified_at: AtomicU64,
+    pub(in crate::fs) ranges: Vec<OrderedRange>,
+    pub(in crate::fs) id: u64,
+    pub(in crate::fs) length: AtomicU64, // Track actual bytes written
+    pub(in crate::fs) size: u64, // Keep this as allocated size
+    pub(in crate::fs) created_at: u64,
+    pub(in crate::fs) modified_at: AtomicU64,
 }
 
 impl FRangeMetadata {
@@ -129,8 +133,11 @@ impl FRangeMetadata {
             mod_time = modified_at;
         }
 
+        let mut ranges = Vec::new();
+        ranges.push(range);
+
         Self {
-            range,
+            ranges,
             id,
             length: AtomicU64::new(length),
             size,
@@ -138,12 +145,53 @@ impl FRangeMetadata {
             modified_at: AtomicU64::new(mod_time),
         }
     }
+
+    pub(in crate::fs) fn serialize(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(size_of_val(self));
+        buf.put_u64_le(self.id);
+        buf.put_u64_le(self.length.load(SeqCst));
+        buf.put_u64_le(self.size);
+        buf.put_u64_le(self.created_at);
+        buf.put_u64_le(self.modified_at.load(SeqCst));
+        buf.put_u16_le(self.ranges.len() as u16);
+        for range in self.ranges.iter() {
+            buf.put_u64_le(range.start);
+            buf.put_u64_le(range.end);
+        }
+        buf.freeze()
+    }
+
+    pub(in crate::fs) fn deserialize(bytes: Bytes) -> Self {
+        let mut buf = Bytes::from(bytes);
+        let id = buf.get_u64_le();
+        let length = buf.get_u64_le();
+        let size = buf.get_u64_le();
+        let created_at = buf.get_u64_le();
+        let modified_at = buf.get_u64_le();
+        let num_ranges = buf.get_u16_le();
+        let mut ranges = Vec::with_capacity(num_ranges as usize);
+
+        for _ in 0..num_ranges {
+            let start = buf.get_u64_le();
+            let end = buf.get_u64_le();
+            ranges.push(OrderedRange::new(start, end));
+        }
+
+        Self {
+            ranges,
+            id,
+            length: AtomicU64::new(length),
+            size,
+            created_at,
+            modified_at: AtomicU64::new(modified_at),
+        }
+    }
 }
 
 impl Clone for FRangeMetadata {
     fn clone(&self) -> Self {
         Self {
-            range: self.range.clone(),
+            ranges: self.ranges.clone(),
             id: self.id,
             length: AtomicU64::new(self.length.load(SeqCst)),
             size: self.size,
@@ -153,9 +201,11 @@ impl Clone for FRangeMetadata {
     }
 }
 
+// TODO(@siennathesane): change `OrderedRange` to `Vec<OrderedRange>` to support
+// multiple ranges
 pub struct FRangeHandle {
     mmap: Arc<MmapMut>,
-    range: OrderedRange,
+    pub(in crate::fs) ranges: Vec<OrderedRange>,
     metadata: FRangeMetadata,
     fs: Arc<Fs>,
 }
@@ -163,16 +213,22 @@ pub struct FRangeHandle {
 impl FRangeHandle {
     pub(crate) fn new(
         mmap: Arc<MmapMut>,
-        range: OrderedRange,
+        ranges: Vec<OrderedRange>,
         metadata: FRangeMetadata,
         fs: Arc<Fs>,
     ) -> Self {
         Self {
             mmap,
-            range,
+            ranges,
             metadata,
             fs,
         }
+    }
+
+    /// Add a new range to this handle
+    pub(crate) fn add_range(&mut self, range: OrderedRange) {
+        self.ranges.push(range);
+        self.ranges.sort_by_key(|r| r.start);
     }
 
     /// Write data at the given offset.
@@ -184,40 +240,70 @@ impl FRangeHandle {
     /// - There is pointer arithmetic to calculate the destination pointer.
     /// - There is a `memcpy` with a raw pointer.
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), FsError> {
-        if offset as usize + data.len() > (self.range.end - self.range.start) as usize {
+        // Check if the write would exceed total capacity
+        if offset as u64 + data.len() as u64 > self.capacity() {
             return Err(ReadOutOfBounds);
         }
 
-        let base = self.range.start as usize + offset as usize;
+        let mut data_written = 0;
+        let mut current_logical_offset = offset;
 
-        // Calculate page-aligned boundaries for the write
-        let start_page = (base / self.fs.page_size) * self.fs.page_size;
-        let end_page = (base + data.len()).div_ceil(self.fs.page_size) * self.fs.page_size;
+        while data_written < data.len() {
+            let (range_idx, physical_offset) = match self.map_offset(current_logical_offset)
+                .ok_or(ReadOutOfBounds) {
+                    | Ok(v) => (v.0, v.1),
+                    | Err(_) => return Err(ReadOutOfBounds),
+            };
+            let range = &self.ranges[range_idx];
 
-        // Mark pages as dirty before writing
-        {
-            let dirty = self.fs.dirty_pages.write();
-            for page in (start_page..end_page).step_by(self.fs.page_size) {
-                let page_num = page / self.fs.page_size;
-                dirty.insert(page_num);
+            // calculate how much we can write in this range
+            let range_remaining = (range.end - range.start - physical_offset) as usize;
+            let write_size = min(range_remaining, data.len() - data_written);
+
+            let base = range.start as usize + physical_offset as usize;
+
+            // calculate page-aligned boundaries for this chunk
+            let start_page = (base / self.fs.page_size) * self.fs.page_size;
+            let end_page = (base + write_size).div_ceil(self.fs.page_size) * self.fs.page_size;
+
+            // ,ark affected pages as dirty
+            {
+                let dirty = self.fs.dirty_pages.write();
+                for page in (start_page..end_page).step_by(self.fs.page_size) {
+                    let page_num = page / self.fs.page_size;
+                    dirty.insert(page_num);
+                }
             }
-        }
 
-        // SAFETY: Already checked bounds
-        unsafe {
-            let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
-            ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+            // SAFETY: bounds already checked
+            unsafe {
+                let dst = self.mmap.as_ptr().add(base).cast::<u8>() as *mut u8;
+                ptr::copy_nonoverlapping(
+                    data[data_written..].as_ptr(),
+                    dst,
+                    write_size
+                );
+            }
+
+            data_written += write_size;
+            current_logical_offset += write_size as u64;
         }
 
         fence(SeqCst);
-        self.metadata.length.store(offset + data.len() as u64, SeqCst);
         
+        self.metadata
+            .length
+            .store(max(offset + data.len() as u64, self.len()), SeqCst);
+
         match self.fs.maybe_flush(false) {
-            Ok(_) => { },
+            Ok(_) => {},
             Err(e) => return Err(e),
         };
-        
-        self.fs.metadata_changes.write().mark_frange_modified(self.metadata.id);
+
+        self.fs
+            .metadata_changes
+            .write()
+            .mark_frange_modified(self.metadata.id);
 
         Ok(())
     }
@@ -231,29 +317,60 @@ impl FRangeHandle {
     /// - Builds a slice from a raw pointer.
     /// - Performs pointer arithmetic to calculate the source pointer.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        // First check if the read would be out of bounds of our allocated range
-        if offset as usize + buf.len() > (self.range.end - self.range.start) as usize {
+        if offset + buf.len() as u64 > self.capacity() {
             return Err(ReadOutOfBounds);
         }
 
-        // Calculate base offset
-        let base = self.range.start as usize + offset as usize;
+        let mut bytes_read = 0;
+        let mut current_logical_offset = offset;
 
-        // SAFETY: see docstring
-        unsafe {
-            let src = self.mmap.as_ptr().add(base);
-            // Add verification before actual read
-            let verify = from_raw_parts(src, buf.len());
+        while bytes_read < buf.len() {
+            let (range_idx, physical_offset) = match self.map_offset(current_logical_offset)
+                .ok_or(ReadOutOfBounds) {
+                    | Ok(v) => (v.0, v.1),
+                    | Err(_) => return Err(ReadOutOfBounds),
+            };
+            let range = &self.ranges[range_idx];
 
-            buf.copy_from_slice(from_raw_parts(src, buf.len()));
+            // calculate how much we can read from this range
+            let range_remaining = (range.end - range.start - physical_offset) as usize;
+            let read_size = min(range_remaining, buf.len() - bytes_read);
+
+            let base = range.start as usize + physical_offset as usize;
+
+            // SAFETY: Bounds already checked
+            unsafe {
+                let src = self.mmap.as_ptr().add(base);
+                let verify = from_raw_parts(src, read_size);
+
+                buf[bytes_read..bytes_read + read_size]
+                    .copy_from_slice(from_raw_parts(src, read_size));
+            }
+
+            bytes_read += read_size;
+            current_logical_offset += read_size as u64;
         }
 
         fence(SeqCst);
         Ok(())
     }
 
+    /// Maps a logical offset to the corresponding physical range and offset
+    fn map_offset(&self, logical_offset: u64) -> Option<(usize, u64)> {
+        let mut current_offset = 0;
+
+        for (idx, range) in self.ranges.iter().enumerate() {
+            let range_size = range.end - range.start;
+            if logical_offset >= current_offset && logical_offset < current_offset + range_size {
+                return Some((idx, logical_offset - current_offset));
+            }
+            current_offset += range_size;
+        }
+        None
+    }
+
     pub(crate) fn capacity(&self) -> u64 {
-        self.range.end - self.range.start
+        self.ranges.iter().map(|r| r.end - r.start).sum()
     }
 
     pub(crate) fn len(&self) -> u64 {

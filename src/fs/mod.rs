@@ -2,7 +2,7 @@ mod core;
 mod compaction;
 mod handle;
 mod test;
-mod journal;
+mod metadata;
 
 pub use core::*;
 pub use compaction::{CompactionConfig};

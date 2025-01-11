@@ -4,7 +4,9 @@ use std::sync::{
 };
 
 use bytes::BytesMut;
-
+use crossbeam_skiplist::SkipSet;
+use memmap2::Advice::WillNeed;
+use parking_lot::{RawRwLock, RwLockWriteGuard};
 use crate::{
     errs::{
         FsError,
@@ -18,6 +20,7 @@ use crate::{
         handle::FRangeMetadata,
     },
 };
+use crate::fs::handle::OrderedRange;
 
 /// Configuration for fragmentation detection and compaction
 #[derive(Debug, Clone)]
@@ -112,9 +115,12 @@ impl Fs {
                 continue;
             }
 
-            // Consider franges that might benefit from compaction
-            let allocated_size = metadata.range().end() - metadata.range().start();
-            let used_size = metadata.length().load(SeqCst);
+            // Calculate total allocated size across all ranges
+            let allocated_size: u64 = metadata.ranges
+                .iter()
+                .map(|r| r.end - r.start)
+                .sum();
+            let used_size = metadata.length.load(SeqCst);
 
             // Check if frange is significantly fragmented
             if allocated_size - used_size >= config.min_fragment_size {
@@ -141,90 +147,86 @@ impl Fs {
                 continue;
             }
 
-            match self.mmap.advise_range(
-                memmap2::Advice::WillNeed,
-                ((metadata.range().end()) - metadata.range().start()) as usize,
-                metadata.range().start() as usize,
-            ) {
-                | Ok(_) => {},
-                | Err(e) => return Err(IoError(e)),
-            };
+            // warn the kernel about all ranges coming up
+            for range in &metadata.ranges {
+                match self.mmap.advise_range(
+                    WillNeed,
+                    (range.end - range.start) as usize,
+                    range.start as usize,
+                ) {
+                    Ok(_) => {},
+                    Err(e) => return Err(IoError(e)),
+                };
+            }
 
             // Create new frange with exact size needed
-            let new_id = match self.create_frange(metadata.length().load(SeqCst)) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
+            let new_id = match self.create_frange(metadata.length.load(SeqCst)) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
             };
             let new_handle = match self.open_frange(new_id) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
+                Ok(v) => v,
+                Err(e) => return Err(e),
             };
 
-            // Read data from old frange
-            // TODO(@siennathesane): find a more efficient way to copy data. since we are
-            // using the `FRangeHandle` API, realistically we can load the
-            // ranges, calculate the offsets, then directly copy data with a
-            // single memcpy from the source to the dest.
+            // Open old frange and copy data
             let old_handle = match self.open_frange(id) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
+                Ok(v) => v,
+                Err(e) => return Err(e),
             };
-            let mut buffer = BytesMut::zeroed(buffer_size); // use 4KB buffer for copying
+            let mut buffer = BytesMut::zeroed(buffer_size);
 
-            let mut remaining = metadata.length().load(SeqCst);
+            let mut remaining = metadata.length.load(SeqCst);
             let mut offset = 0;
 
+            // Copy data using the handle's read/write methods which already handle
+            // multiple ranges
             while remaining > 0 {
                 let chunk_size = remaining.min(buffer.len() as u64) as usize;
                 buffer.resize(chunk_size, 0);
 
                 match old_handle.read_at(offset, &mut buffer) {
-                    | Ok(_) => {},
-                    | Err(e) => return Err(e),
+                    Ok(_) => {},
+                    Err(e) => return Err(e),
                 };
 
                 match new_handle.write_at(offset, &buffer) {
-                    | Ok(_) => {},
-                    | Err(e) => return Err(e),
+                    Ok(_) => {},
+                    Err(e) => return Err(e),
                 };
 
                 offset += chunk_size as u64;
                 remaining -= chunk_size as u64;
             }
 
-            // close both handles
+            // Close both handles
             match self.close_frange(old_handle) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
+                Ok(_) => {},
+                Err(e) => return Err(e),
             };
 
             match self.close_frange(new_handle) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
+                Ok(_) => {},
+                Err(e) => return Err(e),
             };
 
             // Get the new range information
-            let new_range = {
+            let new_ranges = {
                 match self.franges.read().get(&new_id) {
-                    | None => return Err(FRangeNotFound),
-                    | Some(v) => v,
+                    None => return Err(FRangeNotFound),
+                    Some(v) => v.value().ranges.clone(),
                 }
-                .value()
-                .range()
-                .clone()
             };
 
-            // Update the original frange's metadata to point to the new location
+            // Update the original frange's metadata to point to the new locations
             {
                 let mut updated = match self.franges.read().get(&id) {
-                    | None => {
-                        return Err(FRangeNotFound);
-                    },
-                    | Some(v) => v.value().clone(),
+                    None => return Err(FRangeNotFound),
+                    Some(v) => v.value().clone(),
                 };
 
-                updated.set_range(new_range);
-                self.franges.write().insert(updated.id(), updated);
+                updated.ranges = new_ranges;
+                self.franges.write().insert(updated.id, updated);
             }
 
             // Remove the temporary frange's metadata
@@ -233,22 +235,24 @@ impl Fs {
                 franges.remove(&new_id);
             }
 
-            // Add the old range back to free ranges
+            // Add all old ranges back to free ranges
             {
                 let free_ranges = self.free_ranges.write();
-                free_ranges.insert(metadata.range().clone());
+                for range in metadata.ranges {
+                    free_ranges.insert(range);
+                }
             }
         }
 
         // Finalize metadata persist and coalesce
         match self.persist_metadata() {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
+            Ok(_) => {},
+            Err(e) => return Err(e),
         };
 
         match self.coalesce_free_ranges() {
-            | Ok(_) => Ok(()),
-            | Err(e) => Err(e),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 }
@@ -258,18 +262,30 @@ impl Fs {
     /// Calculate total free space available in the filesystem
     pub fn total_free_space(self: &Arc<Self>) -> u64 {
         let free_ranges = self.free_ranges.read();
+        println!("Number of free ranges: {}", free_ranges.len());
+        for range in free_ranges.iter() {
+            println!(
+                "Free range: start={}, end={}, size={}",
+                range.start,
+                range.end,
+                range.end - range.start
+            );
+        }
         let sum = free_ranges
             .iter()
-            .map(|range| range.end() - range.start())
+            .map(|range| range.end - range.start)
             .sum();
+        println!("Total free space: {}", sum);
         sum
     }
 
     /// Calculate total space used by allocated franges
     pub fn total_used_space(self: &Arc<Self>) -> u64 {
         let franges = self.franges.read();
-        let sum = franges.iter().map(|entry| entry.value().size()).sum();
-        sum
+        franges
+            .iter()
+            .map(|entry| entry.value().ranges.iter().map(|r| r.end - r.start).sum::<u64>())
+            .sum()
     }
 
     /// Check if a given size can be allocated contiguously
@@ -277,7 +293,7 @@ impl Fs {
         let free_ranges = self.free_ranges.read();
         let can_allocate = free_ranges
             .iter()
-            .any(|range| range.end() - range.start() >= size);
+            .any(|range| range.end - range.start >= size);
         can_allocate
     }
 
@@ -294,7 +310,7 @@ impl Fs {
         let ranges: Vec<_> = free_ranges.iter().collect();
 
         for range in ranges {
-            let size = range.end() - range.start();
+            let size = range.end - range.start;
             stats.total_free_space += size;
             stats.free_range_count += 1;
             stats.largest_free_block = stats.largest_free_block.max(size);

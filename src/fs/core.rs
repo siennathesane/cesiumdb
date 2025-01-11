@@ -1,4 +1,5 @@
 use std::{
+    collections::BinaryHeap,
     io::{
         Error,
         ErrorKind::{
@@ -47,12 +48,18 @@ use getset::{
     CopyGetters,
     Getters,
 };
-use gxhash::HashSet;
+use gxhash::{
+    HashSet,
+    HashSetExt,
+};
 use memmap2::{
+    Advice::WillNeed,
     MmapMut,
     UncheckedAdvice::DontNeed,
 };
 use parking_lot::{
+    Mutex,
+    RawRwLock,
     RwLock,
     RwLockWriteGuard,
 };
@@ -83,17 +90,9 @@ use crate::{
             FRangeMetadata,
             OrderedRange,
         },
-        journal::{
-            Journal,
-            JournalEntry,
-            JournalEntryType,
-            JournalEntryType::{
-                CoalesceFreeRanges,
-                CreateFRange,
-                DeleteFRange,
-                UpdateFRange,
-            },
-            JOURNAL_SIZE,
+        metadata::{
+            FsMetadata,
+            MetadataChanges,
         },
     },
 };
@@ -110,8 +109,6 @@ pub(in crate::fs) struct FsHeader {
     next_frange_id: u64,  // Next available frange ID
     metadata_offset: u64, // Offset to the metadata region
     metadata_size: u64,   // Size of the metadata region
-    journal_offset: u64,  // Offset to the journal region
-    journal_size: u64,    // Size of the journal region
 }
 
 impl FsHeader {
@@ -122,8 +119,6 @@ impl FsHeader {
         page_size: u32,
         metadata_offset: u64,
         metadata_size: u64,
-        journal_offset: u64,
-        journal_size: u64,
     ) -> Self {
         Self {
             magic: *Self::MAGIC,
@@ -132,8 +127,6 @@ impl FsHeader {
             next_frange_id: 0,
             metadata_offset,
             metadata_size,
-            journal_offset,
-            journal_size,
         }
     }
 
@@ -145,8 +138,6 @@ impl FsHeader {
         buf.extend_from_slice(&self.next_frange_id.to_le_bytes());
         buf.extend_from_slice(&self.metadata_offset.to_le_bytes());
         buf.extend_from_slice(&self.metadata_size.to_le_bytes());
-        buf.extend_from_slice(&self.journal_offset.to_le_bytes());
-        buf.extend_from_slice(&self.journal_size.to_le_bytes());
         buf.freeze()
     }
 }
@@ -170,153 +161,11 @@ fn deserialize_header(bytes: &[u8]) -> Result<FsHeader, FsError> {
         next_frange_id: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
         metadata_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
         metadata_size: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-        journal_offset: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
-        journal_size: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
     })
 }
 
-#[derive(Debug)]
-struct FsMetadata {
-    franges: SkipMap<u64, FRangeMetadata>,
-    free_ranges: SkipSet<OrderedRange>,
-}
-
-impl FsMetadata {
-    fn new() -> Self {
-        Self {
-            franges: SkipMap::new(),
-            free_ranges: SkipSet::new(),
-        }
-    }
-
-    fn from_fs(fs: &Fs) -> Self {
-        let metadata = Self::new();
-
-        {
-            let franges = fs.franges.read();
-            for entry in franges.iter() {
-                metadata.franges.insert(*entry.key(), entry.value().clone());
-            }
-        }
-
-        {
-            let free_ranges = fs.free_ranges.read();
-            for range in free_ranges.iter() {
-                metadata.free_ranges.insert(range.value().clone());
-            }
-        }
-
-        metadata
-    }
-
-    fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::new();
-
-        // Write franges count
-        buf.put_u64_le(self.franges.len() as u64);
-
-        // Write each frange entry
-        for entry in self.franges.iter() {
-            // Write key
-            buf.put_u64_le(*entry.key());
-
-            // Write FRangeMetadata
-            let metadata = entry.value();
-            buf.put_u64_le(metadata.range().start());
-            buf.put_u64_le(metadata.range().end());
-            buf.put_u64_le(metadata.id());
-            buf.put_u64_le(metadata.length().load(SeqCst));
-            buf.put_u64_le(metadata.size());
-            buf.put_u64_le(metadata.created_at());
-            buf.put_u64_le(metadata.modified_at().load(SeqCst));
-        }
-
-        // Write free ranges count
-        buf.put_u64_le(self.free_ranges.len() as u64);
-
-        // Write each free range
-        for range in self.free_ranges.iter() {
-            buf.put_u64_le(range.start());
-            buf.put_u64_le(range.end());
-        }
-
-        buf.freeze()
-    }
-
-    fn deserialize(mut bytes: Bytes) -> Result<Self, FsError> {
-        let fs_metadata = Self::new();
-
-        // Read franges
-        let frange_count = bytes.get_u64_le() as usize;
-        for _ in 0..frange_count {
-            let key = bytes.get_u64_le();
-
-            // // Read FRangeMetadata
-            let range = OrderedRange::new(bytes.get_u64_le(), bytes.get_u64_le());
-
-            let metadata = FRangeMetadata::new(
-                range,
-                bytes.get_u64_le(),
-                bytes.get_u64_le(),
-                bytes.get_u64_le(),
-                bytes.get_u64_le(),
-                bytes.get_u64_le(),
-            );
-
-            fs_metadata.franges.insert(key, metadata);
-        }
-
-        // Read free ranges
-        let free_range_count = bytes.get_u64_le() as usize;
-        for _ in 0..free_range_count {
-            let range = OrderedRange::new(bytes.get_u64_le(), bytes.get_u64_le());
-            fs_metadata.free_ranges.insert(range);
-        }
-
-        Ok(fs_metadata)
-    }
-
-    // Calculate total serialized size for pre-allocation
-    fn serialized_size(&self) -> usize {
-        // 8 bytes for franges count
-        // For each frange: 8 (key) + 7*8 (metadata fields)
-        // 8 bytes for free ranges count
-        // For each free range: 2*8 (start/end)
-        8 + (self.franges.len() * (8 + 56)) + 8 + (self.free_ranges.len() * 16)
-    }
-}
-
-#[derive(Default)]
-pub(in crate::fs) struct MetadataChanges {
-    modified_franges: SkipSet<u64>,         // IDs of modified franges
-    modified_ranges: SkipSet<OrderedRange>, // Modified free ranges
-    header_modified: AtomicBool,
-}
-
-impl MetadataChanges {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    pub(in crate::fs) fn mark_frange_modified(&self, id: u64) {
-        self.modified_franges.insert(id);
-        self.header_modified.store(true, SeqCst);
-    }
-
-    pub(in crate::fs) fn mark_range_modified(&self, range: OrderedRange) {
-        self.modified_ranges.insert(range);
-    }
-
-    pub(in crate::fs) fn clear(&self) {
-        self.modified_franges.clear();
-        self.modified_ranges.clear();
-        self.header_modified.store(false, SeqCst);
-    }
-}
-
-// For calculating size during filesystem init
 // TODO(@siennathesane): this isn't valid, i'm not sure why it's here
-pub(in crate::fs) const INITIAL_METADATA_SIZE: usize = 4096; // Or calculate based on expected initial capacity
+pub(in crate::fs) const INITIAL_METADATA_SIZE: usize = 4096;
 
 /// A custom filesystem implementation for CesiumDB. It is designed to work with
 /// physical storage devices or `fallocate`d files and uses memory-mapped files
@@ -335,7 +184,6 @@ pub struct Fs {
     pub(in crate::fs) page_size: usize,
 
     // journaling
-    pub(in crate::fs) journal: Arc<Journal>,
     pub(in crate::fs) metadata_changes: RwLock<MetadataChanges>,
 }
 
@@ -356,20 +204,30 @@ impl Fs {
             }
         };
 
+        println!("Reading header from new(): {:?}", header);
+
         // Read metadata
         let metadata: FsMetadata = {
             let start = header.metadata_offset as usize;
             let end = start + header.metadata_size as usize;
-            match FsMetadata::deserialize(Bytes::copy_from_slice(&mmap[start..end])) {
-                | Ok(v) => v,
+            println!("Reading metadata from offset {} to {}", start, end);
+            let metadata_bytes = &mmap[start..end];
+            println!("First few bytes of metadata: {:?}", &metadata_bytes[..20]);
+
+            match FsMetadata::deserialize(Bytes::copy_from_slice(metadata_bytes)) {
+                | Ok(v) => {
+                    println!("Deserialized metadata. Franges count: {}", v.franges.len());
+                    v
+                },
                 | Err(_) => return Err(InvalidHeaderFormat("invalid metadata region".into())),
             }
         };
 
         // Initialize state from metadata
         let franges = SkipMap::new();
-        for (id, frange) in metadata.franges {
-            franges.insert(id, frange);
+        for entry in metadata.franges.iter() {
+            println!("Adding frange {} to new fs", entry.key());
+            franges.insert(*entry.key(), entry.value().clone());
         }
 
         let free_ranges = SkipSet::new();
@@ -377,15 +235,8 @@ impl Fs {
             free_ranges.insert(range);
         }
 
-        let mmap = Arc::new(mmap);
-        let journal = Journal::new(
-            Arc::clone(&mmap),
-            header.journal_offset,
-            header.journal_size,
-        );
-
         let fs = Arc::new(Self {
-            mmap,
+            mmap: Arc::new(mmap),
             franges: RwLock::new(franges),
             free_ranges: RwLock::new(free_ranges),
             open_franges: RwLock::new(HashSet::default()),
@@ -393,27 +244,14 @@ impl Fs {
             last_flush: AtomicU64::new(0),
             dirty_pages: RwLock::new(SkipSet::new()),
             page_size: header.page_size as usize,
-            journal: Arc::new(journal),
             metadata_changes: RwLock::new(MetadataChanges::default()),
         });
 
-        // replay the journal
-        // match Self::replay_journal(&fs) {
-        //     | Ok(_) => {},
-        //     | Err(e) => return Err(e),
-        // };
-
-        // persist the recovered metadata
-        // match fs.persist_metadata() {
-        //     | Ok(_) => {},
-        //     | Err(e) => return Err(e),
-        // };
-
         // flush to ensure it's written
-        // match fs.sync() {
-        //     | Ok(_) => {},
-        //     | Err(e) => return Err(e),
-        // };
+        match fs.sync() {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        };
 
         Ok(fs)
     }
@@ -425,11 +263,17 @@ impl Fs {
         // Calculate sizes including journal
         let header_size = size_of::<FsHeader>();
         let metadata_size = INITIAL_METADATA_SIZE;
-        let journal_offset = (header_size + metadata_size) as u64;
-        let data_start = journal_offset + JOURNAL_SIZE;
+        let data_start = (header_size + metadata_size) as u64;
+
+        println!("Filesystem initialization:");
+        println!("  Total size: {}", total_size);
+        println!("  Header size: {}", header_size);
+        println!("  Metadata size: {}", metadata_size);
+        println!("  Data start: {}", data_start);
+        println!("  Available space: {}", total_size - data_start);
 
         // Verify we have enough space
-        if total_size < data_start as u64 {
+        if total_size < data_start {
             return Err(InsufficientSpace);
         }
 
@@ -438,8 +282,6 @@ impl Fs {
             BLOCK_SIZE as u32,
             header_size as u64, // metadata starts after header
             metadata_size as u64,
-            journal_offset, // journal starts after metadata
-            JOURNAL_SIZE,
         )
         .serialize();
 
@@ -454,16 +296,12 @@ impl Fs {
         mmap[header_size..metadata_size + header_size].fill(0);
         mmap[header_size..header_size + encoded.len()].copy_from_slice(&encoded);
 
-        // zero journal region
-        let journal_end = (journal_offset + JOURNAL_SIZE) as usize;
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
         let mmap = Arc::new(mmap);
-        let journal = Journal::new(Arc::clone(&mmap), journal_offset, JOURNAL_SIZE);
 
         // create filesystem with single free range
         let fs = Self {
@@ -475,16 +313,23 @@ impl Fs {
             last_flush: AtomicU64::new(now),
             dirty_pages: RwLock::new(SkipSet::new()),
             page_size: BLOCK_SIZE,
-            journal: Arc::new(journal),
             metadata_changes: RwLock::new(MetadataChanges::default()),
         };
 
-        // add initial free range (excluding header, metadata, and journal)
-        fs.free_ranges
+        // add initial range and add to tracking
+        let initial_range = OrderedRange::from(data_start..total_size);
+        fs.free_ranges.write().insert(initial_range.clone());
+        fs.metadata_changes
             .write()
-            .insert(OrderedRange::from(data_start as u64..total_size));
+            .mark_range_modified(initial_range);
 
-        Ok(Arc::new(fs))
+        let fs = Arc::new(fs);
+        match fs.persist_metadata() {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        }
+
+        Ok(fs)
     }
 
     pub fn create_frange(self: &Arc<Self>, size: u64) -> Result<u64, FsError> {
@@ -506,7 +351,7 @@ impl Fs {
             | Err(e) => return Err(e),
         };
 
-        // Get the ID and create metadata
+        // get the id and create metadata
         let id = self.next_frange_id.fetch_add(1, SeqCst);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -515,21 +360,17 @@ impl Fs {
 
         let metadata = FRangeMetadata::new(range.clone(), id, 0, size, now, now);
 
-        let entry = JournalEntry::new(CreateFRange, now, id, Some(metadata.clone()), None);
-        match self.journal.append(entry) {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
-        };
-
-        // Insert metadata with minimal lock duration
         {
-            let ranges = self.franges.write();
-            ranges.insert(id, metadata);
+            self.franges.write().insert(id, metadata);
         }
 
-        let changes = self.metadata_changes.write();
-        changes.mark_frange_modified(id);
-        changes.mark_range_modified(range);
+        {
+            self.metadata_changes.write().mark_frange_modified(id);
+        }
+
+        {
+            self.metadata_changes.write().mark_range_modified(range);
+        }
 
         match self.persist_metadata() {
             | Ok(_) => {},
@@ -556,42 +397,55 @@ impl Fs {
 
         Ok(FRangeHandle::new(
             self.mmap.clone(),
-            metadata.range().clone(),
+            metadata.ranges.clone(),
             metadata,
             self.clone(),
         ))
     }
 
     pub fn close_frange(self: &Arc<Self>, handle: FRangeHandle) -> Result<(), FsError> {
+        let frange_id = handle.metadata().id;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let length = handle.metadata().length.load(SeqCst);
+
         // Update metadata first
         {
-            let franges = self.franges.write();
-            match franges.get(&handle.metadata().id()) {
-                | None => {
-                    return Err(FRangeNotFound);
-                },
-                | Some(entry) => {
-                    let updated = entry.value().clone();
-                    updated.modified_at().store(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        SeqCst,
-                    );
-                    updated
-                        .length()
-                        .store(handle.metadata().length().load(SeqCst), SeqCst);
-                    franges.insert(handle.metadata().id(), updated);
-                },
+            let updated = {
+                match self.franges.read().get(&frange_id) {
+                    | None => return Err(FRangeNotFound),
+                    | Some(entry) => {
+                        let updated = entry.value().clone();
+                        updated.modified_at.store(now, SeqCst);
+                        updated.length.store(length, SeqCst);
+                        updated
+                    },
+                }
             };
+
+            {
+                self.franges.write().insert(frange_id, updated);
+            }
         }
 
-        // Then handle open_franges
+        // Mark changes
         {
-            let mut open_franges = self.open_franges.write();
-            open_franges.remove(&handle.metadata().id());
-        } // Release open_franges lock
+            self.metadata_changes
+                .write()
+                .mark_frange_modified(frange_id);
+        }
+
+        // Remove from open_franges
+        {
+            self.open_franges.write().remove(&frange_id);
+        }
+
+        match self.persist_metadata() {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        };
 
         // Finally flush
         self.maybe_flush(true)
@@ -606,43 +460,36 @@ impl Fs {
         let range = {
             let franges = self.franges.write();
             let x = if let Some(entry) = franges.remove(&id) {
-                let jentry = JournalEntry::new(
-                    DeleteFRange,
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    id,
-                    None,
-                    None,
-                );
-                match self.journal.append(jentry) {
-                    | Ok(_) => {},
-                    | Err(e) => return Err(e),
-                };
-                entry.value().range().clone()
+                entry.value().ranges.clone()
             } else {
                 return Ok(());
             };
             x
         };
 
+        // update the free ranges
         {
             let free_ranges = self.free_ranges.write();
-            free_ranges.insert(range.clone());
+            for range in range.clone() {
+                free_ranges.insert(range.clone());
+            }
         }
 
-        // Coalesce free ranges
+        {
+            self.metadata_changes.write().mark_frange_modified(id);
+        }
+
+        {
+            let metadata = self.metadata_changes.write();
+            for range in range {
+                metadata.mark_range_modified(range);
+            }
+        }
+
         match self.coalesce_free_ranges() {
             | Ok(_) => {},
             | Err(e) => return Err(e),
         };
-
-        let changes = self.metadata_changes.write();
-        changes.mark_frange_modified(id);
-        changes.mark_range_modified(range);
-
-        // Persist changes
         self.persist_metadata()
     }
 
@@ -653,27 +500,28 @@ impl Fs {
 
     /// Persist metadata changes to disk
     pub(in crate::fs) fn persist_metadata(self: &Arc<Self>) -> Result<(), FsError> {
-        let metadata = {
-            let metadata = FsMetadata::new();
-            
-            {
-                let franges = self.franges.read();
-                for entry in franges.iter() {
-                    metadata.franges.insert(*entry.key(), entry.value().clone());
-                }
-            }
-
-            {
-                let free_ranges = self.free_ranges.read();
-                for range in free_ranges.iter() {
-                    metadata.free_ranges.insert(range.value().clone());
-                }
-            }
-
-            metadata
+        // take a single lock to fetch the info
+        let (has_changes, mut modified_franges, free_ranges_modified) = {
+            let changes = self.metadata_changes.read();
+            (
+                !changes.modified_franges.is_empty() ||
+                    !changes.modified_ranges.is_empty() ||
+                    changes.header_modified.load(SeqCst),
+                changes
+                    .modified_franges
+                    .iter()
+                    .map(|id| *id.value())
+                    .collect::<Vec<_>>(),
+                !changes.modified_ranges.is_empty(),
+            )
         };
 
-        // Then handle header and serialization without holding locks
+        // if we don't have any changes, just return
+        if !has_changes {
+            return Ok(());
+        }
+
+        // get the current header
         let mut header = {
             let mut header_bytes = [0u8; size_of::<FsHeader>()];
             header_bytes.copy_from_slice(&self.mmap[..size_of::<FsHeader>()]);
@@ -683,152 +531,154 @@ impl Fs {
             }
         };
 
-        let encoded = metadata.serialize();
+        let metadata_start = header.metadata_offset as usize;
+        let metadata_end = metadata_start + header.metadata_size as usize;
 
-        // If we need more space, try to grow metadata region
-        if encoded.len() > header.metadata_size as usize {
-            // Calculate new size with some room for growth
-            let new_size = encoded.len() * 2;
+        // sort the modified franges so we can do this in a single iteration
+        modified_franges.sort();
 
-            // Make sure we have space to grow
-            let metadata_end = header.metadata_offset + header.metadata_size;
-            let journal_start = metadata_end;
-            let journal_end = journal_start + header.journal_size;
-            let data_start = journal_end;
+        // pre-calculate the space needed for the metadata
+        let mut total_space_needed = 0;
 
-            let free_ranges = self.free_ranges.write();
-
-            // Collect matching ranges first to avoid borrowing conflict
-            let matching_ranges: Vec<_> = free_ranges
-                .iter()
-                .filter(|r| r.start() == data_start)
-                .collect();
-
-            // Now we can safely modify free_ranges if we found a match
-            if let Some(range) = matching_ranges.first() {
-                let growth_needed = new_size as u64 - header.metadata_size;
-                if range.end() - range.start() >= growth_needed {
-                    // Update the free range
-                    free_ranges.remove(range);
-                    if range.end() - range.start() > growth_needed {
-                        free_ranges
-                            .insert(OrderedRange::new(data_start + growth_needed, range.end()));
-                    }
-
-                    // Update header with new metadata size
-                    header.metadata_size = new_size as u64;
-                } else {
-                    return Err(InsufficientSpace);
-                }
-            } else {
-                return Err(NoAdjacentSpace);
+        for &id in &modified_franges {
+            if let Some(frange) = self.franges.read().get(&id) {
+                total_space_needed += size_of_val(frange.value()) + 2; // +2 for
+                                                                       // size prefix
             }
         }
 
-        // Write metadata using our safe wrapper
-        let start = header.metadata_offset as usize;
-        self.write_to_mmap(start, &encoded);
-
-        // Update header with new metadata size and next_frange_id
-        header.next_frange_id = self.next_frange_id.load(SeqCst);
-        let header_bytes = header.serialize();
-        self.write_to_mmap(0, &header_bytes);
-
-        Ok(())
-    }
-    
-    fn grow_metadata_region(&self, header: &mut FsHeader, new_size: usize) -> Result<(), FsError> {
-        let metadata_end = header.metadata_offset + header.metadata_size;
-        let journal_start = header.journal_offset;
-        let growth_needed = new_size as u64 - header.metadata_size;
-        
-        if metadata_end + growth_needed > journal_start {
-            return Err(InsufficientSpace);
-        }
-        
-        header.metadata_size = new_size as u64;
-        Ok(())
-    }
-
-    /// Replay the journal to recover the filesystem state
-    fn replay_journal(fs: &Arc<Self>) -> Result<(), FsError> {
-        let journal = Arc::clone(&fs.journal);
-
-        // Iterate through journal entries in order
-        for entry_result in journal.iter() {
-            let entry = match entry_result {
-                | Ok(v) => v,
+        // see if we need to grow the metadata region
+        if total_space_needed > (metadata_end - metadata_start) {
+            let new_size = total_space_needed * 2; // double for future growth
+            match self.grow_metadata_region(&mut header, new_size) {
+                | Ok(_) => {},
                 | Err(e) => return Err(e),
             };
+        }
 
-            match entry.r#type() {
-                | CreateFRange => {
-                    if let Some(metadata) = entry.metadata() {
-                        // Skip if frange already exists (idempotency)
-                        if fs.franges.read().contains_key(entry.frange_id()) {
-                            continue;
-                        }
+        // warn the kernel to read the new metadata region
+        // with enough time for it to load the relevant pages
+        // that should make this fast enough to not be a problem.
+        // if the metadata grew, this will encompass those changes.
+        match self
+            .mmap
+            .advise_range(WillNeed, metadata_start, metadata_end - metadata_start)
+        {
+            | Ok(_) => {},
+            | Err(e) => return Err(IoError(e)),
+        };
 
-                        // Add frange metadata
-                        fs.franges
-                            .write()
-                            .insert(*entry.frange_id(), metadata.clone());
+        let mut current_pos = metadata_start;
+        let mut frange_idx = 0;
+        
+        let mut_ptr = Arc::as_ptr(&self.mmap) as *mut u8;
+        while current_pos < metadata_end && frange_idx < modified_franges.len() {
+            // read current record size
+            let mut size_bytes = [0u8; 2];
+            // SAFETY: we've already done the bounds check
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.mmap.as_ptr().add(current_pos),
+                    size_bytes.as_mut_ptr(),
+                    2,
+                );
+            }
+            let current_size = u16::from_le_bytes(size_bytes) as usize;
 
-                        // Update next_frange_id if needed
-                        let mut current = fs.next_frange_id.load(SeqCst);
-                        while current <= *entry.frange_id() {
-                            match fs.next_frange_id.compare_exchange(
-                                current,
-                                entry.frange_id() + 1,
-                                SeqCst,
-                                SeqCst,
-                            ) {
-                                | Ok(_) => break,
-                                | Err(actual) => current = actual,
-                            }
+            // read current record id
+            let mut id_bytes = [0u8; 8];
+            // SAFETY: we've already done the bounds check
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.mmap.as_ptr().add(current_pos + 4),
+                    id_bytes.as_mut_ptr(),
+                    8,
+                );
+            }
+            let current_id = u64::from_le_bytes(id_bytes);
+
+            if current_id == modified_franges[frange_idx] {
+                let frange = match self.franges.read().get(&current_id) {
+                    | None => return Err(FRangeNotFound),
+                    | Some(v) => v.value().clone(),
+                };
+                let new_bytes = frange.serialize();
+                let new_size = new_bytes.len();
+                let new_total_size = new_size + 2;
+                let old_total_size = current_size + 2;
+
+                // sometimes the franges will grow or shrink, so we need to shift the data if
+                // needed
+                if new_total_size != old_total_size {
+                    // calculate shift
+                    let shift = new_total_size as isize - old_total_size as isize;
+                    let next_pos = current_pos + old_total_size;
+
+                    // Ensure we don't overflow metadata region
+                    if shift > 0 && next_pos + shift as usize > metadata_end {
+                        return Err(InsufficientSpace);
+                    }
+
+                    // calculate remaining data length
+                    let remaining_len = metadata_end - next_pos;
+
+                    // SAFETY: we've already done the bounds check
+                    unsafe {
+                        // shift remaining data if needed
+                        if remaining_len > 0 {
+                            ptr::copy(
+                                self.mmap.as_ptr().add(next_pos),
+                                mut_ptr.add(next_pos + shift as usize),
+                                remaining_len,
+                            );
                         }
                     }
-                },
+                    
+                    // ensure the memory ordering is correct before new records are written
+                    fence(SeqCst);
+                }
 
-                | DeleteFRange => {
-                    // Remove the frange from franges map
-                    if let Some(metadata) = fs.franges.write().remove(entry.frange_id()) {
-                        // Add its range back to free ranges
-                        fs.free_ranges
-                            .write()
-                            .insert(metadata.value().range().clone());
-                    }
-                },
+                // write new record
+                let size_prefix = (new_size as u16).to_le_bytes();
+                self.write_to_mmap(current_pos, &size_prefix);
+                self.write_to_mmap(current_pos + 2, &new_bytes);
 
-                | UpdateFRange => {
-                    if let Some(metadata) = entry.metadata() {
-                        // Update frange metadata if it exists
-                        if let Some(current) = fs.franges.write().get(entry.frange_id()) {
-                            current
-                                .value()
-                                .length()
-                                .store(metadata.length().load(SeqCst), SeqCst);
-                            current
-                                .value()
-                                .modified_at()
-                                .store(metadata.modified_at().load(SeqCst), SeqCst);
-                        }
-                    }
-                },
-
-                | CoalesceFreeRanges => {
-                    // Re-add all free ranges from journal entry
-                    if let Some(ranges) = entry.free_ranges() {
-                        let free_ranges = fs.free_ranges.write();
-                        free_ranges.clear(); // Remove existing ranges
-                        for range in ranges {
-                            free_ranges.insert(range.clone());
-                        }
-                    }
-                },
+                frange_idx += 1;
+                current_pos += new_total_size;
+            } else {
+                current_pos += current_size + 2;
             }
         }
 
+        // update header with new metadata size and next_frange_id
+        {
+            let changes = self.metadata_changes.read();
+            if changes.header_modified.load(SeqCst) {
+                header.next_frange_id = self.next_frange_id.load(SeqCst);
+                let header_bytes = header.serialize();
+                self.write_to_mmap(0, &header_bytes);
+            }
+        }
+
+        // clear the change tracking
+        {
+            self.metadata_changes.write().clear();
+        }
+
+        Ok(())
+    }
+
+    fn grow_metadata_region(&self, header: &mut FsHeader, new_size: usize) -> Result<(), FsError> {
+        let metadata_end = header.metadata_offset + header.metadata_size;
+        let growth_needed = new_size as u64 - header.metadata_size;
+
+        // TODO(@siennathesane): this is wrong. it need to check if there's enough free space
+        // from the free_ranges section, not just the size of the mmap
+        if metadata_end + growth_needed > self.mmap.len() as u64 {
+            return Err(InsufficientSpace);
+        }
+
+        header.metadata_size = new_size as u64;
         Ok(())
     }
 
@@ -839,6 +689,7 @@ impl Fs {
     /// This function is unsafe because it dereferences a raw pointer.
     /// - There is pointer arithmetic to calculate the destination pointer.
     /// - There is a `memcpy` on a raw pointer.
+    #[inline]
     fn write_to_mmap(self: &Arc<Self>, offset: usize, data: &[u8]) {
         // TODO(@siennathesane): do some bounds checking or something
         // SAFETY: yeah this is actually unsafe, see docstring
@@ -864,14 +715,14 @@ impl Fs {
             }
         };
 
-        // Calculate start of data region - UPDATED calculation
-        let data_start = header_bytes.journal_offset + header_bytes.journal_size;
+        // calculate start of data region - just after metadata
+        let data_start = header_bytes.metadata_offset + header_bytes.metadata_size;
 
         // Find the rightmost suitable range by iterating in reverse
         let suitable_range = match free
             .iter()
             .rev()
-            .find(|r| r.end() - r.start() >= size && r.start() >= data_start)
+            .find(|r| r.end - r.start >= size && r.start >= data_start)
         {
             | None => return Err(NoFreeSpace),
             | Some(v) => v,
@@ -880,44 +731,36 @@ impl Fs {
         free.remove(&suitable_range);
 
         // When splitting a range, keep the left part free and allocate from the right
-        if suitable_range.end() - suitable_range.start() > size {
-            let new_free = OrderedRange::new(suitable_range.start(), suitable_range.end() - size);
+        if suitable_range.end - suitable_range.start > size {
+            let new_free = OrderedRange::new(suitable_range.start, suitable_range.end - size);
             free.insert(new_free);
         }
 
         Ok(OrderedRange::new(
-            suitable_range.end() - size,
-            suitable_range.end(),
+            suitable_range.end - size,
+            suitable_range.end,
         ))
     }
 
     pub(in crate::fs) fn coalesce_free_ranges(self: &Arc<Self>) -> Result<(), FsError> {
-        let free = self.free_ranges.write();
-        let mut ranges: Vec<OrderedRange> = free.iter().map(|entry| (*entry).clone()).collect();
-        ranges.sort();
-
-        let entry = JournalEntry::new(
-            CoalesceFreeRanges,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            0,
-            None,
-            Some(ranges.clone()),
-        );
-        match self.journal.append(entry) {
-            | Ok(_) => {},
-            | Err(e) => return Err(e),
+        let mut ranges = {
+            let free = self.free_ranges.read();
+            let mut ranges: Vec<OrderedRange> = free.iter().map(|entry| (*entry).clone()).collect();
+            ranges.sort();
+            ranges
         };
 
         let mut i = 0;
         while i < ranges.len() - 1 {
-            if ranges[i].end() == ranges[i + 1].start() {
-                let merged = OrderedRange::new(ranges[i].start(), ranges[i + 1].end());
-                free.remove(&ranges[i]);
-                free.remove(&ranges[i + 1]);
-                free.insert(merged);
+            if ranges[i].end == ranges[i + 1].start {
+                let merged = OrderedRange::new(ranges[i].start, ranges[i + 1].end);
+                // Take write lock only for the actual modifications
+                {
+                    let free = self.free_ranges.write();
+                    free.remove(&ranges[i]);
+                    free.remove(&ranges[i + 1]);
+                    free.insert(merged.clone());
+                }
                 ranges.remove(i + 1);
             } else {
                 i += 1;
@@ -970,8 +813,8 @@ impl Fs {
 
         for range in ranges {
             match self.mmap.flush_range(
-                range.start() as usize,
-                (range.end() - range.start()) as usize,
+                range.start as usize,
+                (range.end - range.start) as usize,
             ) {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
@@ -998,8 +841,8 @@ impl Fs {
             let end = start + self.page_size;
 
             match &mut current_range {
-                | Some(range) if range.end() as usize == start => {
-                    range.set_end(end as u64);
+                | Some(range) if range.end as usize == start => {
+                    range.end = end as u64;
                 },
                 | Some(range) => {
                     ranges.push(range.clone());
@@ -1057,9 +900,12 @@ mod tests {
             },
             Arc,
         },
+        thread,
+        time::Duration,
     };
-
+    use std::cmp::max;
     use memmap2::MmapMut;
+    use parking_lot::deadlock;
     use tempfile::tempdir;
 
     use crate::{
@@ -1086,6 +932,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&file_path)
             .unwrap();
 
@@ -1097,6 +944,8 @@ mod tests {
         let (dir, file) = setup_test_file();
 
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+
+        println!("Creating filesystem");
         let fs = Fs::init(mmap).expect("Failed to initialize filesystem");
 
         // Ensure mmap is synced before dropping
@@ -1117,8 +966,27 @@ mod tests {
         (dir, file, fs)
     }
 
+    fn setup_deadlock_detection() {
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            let deadlocks = deadlock::check_deadlock();
+            if !deadlocks.is_empty() {
+                eprintln!("{} deadlocks detected", deadlocks.len());
+                for (i, threads) in deadlocks.iter().enumerate() {
+                    eprintln!("Deadlock #{}", i);
+                    for t in threads {
+                        eprintln!("Thread Id {:#?}", t.thread_id());
+                        eprintln!("{:#?}", t.backtrace());
+                    }
+                }
+            }
+        });
+    }
+
     #[test]
     fn test_create_frange() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         // Test creating a frange
@@ -1128,12 +996,14 @@ mod tests {
         // Verify metadata
         let franges = fs.franges.read();
         let metadata = franges.get(&id).unwrap();
-        assert_eq!(metadata.value().size(), 1024);
-        assert_eq!(metadata.value().id(), 0);
+        assert_eq!(metadata.value().size, 1024);
+        assert_eq!(metadata.value().id, 0);
     }
 
     #[test]
     fn test_open_and_close_frange() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         // Create and open a frange
@@ -1152,14 +1022,22 @@ mod tests {
 
     #[test]
     fn test_write_and_read() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
-        // Create and open a frange
-        let id = fs.create_frange(1024).unwrap();
-        let handle = fs.open_frange(id).unwrap();
+        // Create and open two franges that we'll combine
+        let id1 = fs.create_frange(512).unwrap();
+        let id2 = fs.create_frange(512).unwrap();
 
-        // Write some data
-        let data = b"Hello, World!";
+        let mut handle = fs.open_frange(id1).unwrap();
+        let handle2 = fs.open_frange(id2).unwrap();
+
+        // Add the second range to our first handle
+        handle.add_range(handle2.ranges[0].clone());
+
+        // Write data that spans both ranges
+        let data = b"Hello, World! This is a longer string that will span multiple ranges";
         handle.write_at(0, data).unwrap();
 
         // Read it back
@@ -1167,18 +1045,27 @@ mod tests {
         handle.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf, data);
 
-        // Verify size matches written data
-        assert_eq!(handle.len(), data.len() as u64);
+        // Test writing at offset that crosses range boundary
+        let data2 = b"Cross-boundary write";
+        let cross_boundary_offset = 500; // Close to the boundary between ranges
+        handle.write_at(cross_boundary_offset, data2).unwrap();
 
-        // If we want to verify allocation size:
-        assert_eq!(
-            handle.metadata().range().end() - handle.metadata().range().start(),
-            1024
-        );
+        // Read back the cross-boundary write
+        let mut buf2 = vec![0u8; data2.len()];
+        handle.read_at(cross_boundary_offset, &mut buf2).unwrap();
+        assert_eq!(&buf2, data2);
+
+        assert_eq!(handle.len(), max(
+            cross_boundary_offset + data2.len() as u64,
+            data.len() as u64
+        ));
+        assert_eq!(handle.capacity(), 1024); // 512 + 512
     }
 
     #[test]
     fn test_delete_frange() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         // Create a frange
@@ -1198,6 +1085,8 @@ mod tests {
 
     #[test]
     fn test_out_of_bounds_write() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         let id = fs.create_frange(1024).unwrap();
@@ -1210,6 +1099,8 @@ mod tests {
 
     #[test]
     fn test_out_of_bounds_read() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         let id = fs.create_frange(1024).unwrap();
@@ -1222,6 +1113,8 @@ mod tests {
 
     #[test]
     fn test_multiple_franges() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         // Create multiple franges
@@ -1252,6 +1145,8 @@ mod tests {
 
     #[test]
     fn test_fragmentation() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         // Create and delete franges to create fragmentation
@@ -1277,6 +1172,8 @@ mod tests {
 
     #[test]
     fn test_flush_behavior() {
+        setup_deadlock_detection();
+
         let (_dir, _file, fs) = create_and_reopen_fs();
 
         let id = fs.create_frange(1024).unwrap();
@@ -1294,6 +1191,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_access() {
+        setup_deadlock_detection();
+
         use std::thread;
 
         let (_dir, _file, fs) = create_and_reopen_fs();
@@ -1321,6 +1220,8 @@ mod tests {
 
     #[test]
     fn test_fs_init() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
 
         // Test basic initialization
@@ -1336,8 +1237,8 @@ mod tests {
         {
             let free_range = fs.free_ranges.read();
             let free_range = free_range.iter().next().unwrap();
-            assert!(free_range.end() > free_range.start()); // Ensure valid range
-            assert!(free_range.start() >= (size_of::<FsHeader>() + INITIAL_METADATA_SIZE) as u64);
+            assert!(free_range.end > free_range.start); // Ensure valid range
+            assert!(free_range.start >= (size_of::<FsHeader>() + INITIAL_METADATA_SIZE) as u64);
             // After header and metadata
         }
 
@@ -1347,6 +1248,8 @@ mod tests {
 
     #[test]
     fn test_fs_new_after_init() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
 
         // First initialize
@@ -1368,6 +1271,8 @@ mod tests {
 
     #[test]
     fn test_fs_new_on_uninitialized() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
 
@@ -1380,6 +1285,8 @@ mod tests {
 
     #[test]
     fn test_header_persistence() {
+        setup_deadlock_detection();
+
         let (dir, mut file, _) = create_and_reopen_fs();
 
         // Read the raw header bytes
@@ -1399,6 +1306,8 @@ mod tests {
 
     #[test]
     fn test_frange_metadata_persistence() {
+        setup_deadlock_detection();
+
         // Create initial filesystem and add some franges
         let (dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
@@ -1434,18 +1343,20 @@ mod tests {
         let franges = reopened_fs.franges.read();
 
         let metadata1 = franges.get(&id1).unwrap();
-        assert_eq!(metadata1.value().size(), 1024);
-        assert_eq!(metadata1.value().length().load(SeqCst), 11); // "test data 1" length
+        assert_eq!(metadata1.value().size, 1024);
+        assert_eq!(metadata1.value().length.load(SeqCst), 11); // "test data 1" length
 
         let metadata2 = franges.get(&id2).unwrap();
-        assert_eq!(metadata2.value().size(), 2048);
-        assert_eq!(metadata2.value().length().load(SeqCst), 11); // "test data 2" length
+        assert_eq!(metadata2.value().size, 2048);
+        assert_eq!(metadata2.value().length.load(SeqCst), 11); // "test data 2" length
 
         dir.close().unwrap();
     }
 
     #[test]
     fn test_free_range_persistence() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         let fs = Fs::init(mmap).expect("Failed to initialize filesystem");
@@ -1480,6 +1391,8 @@ mod tests {
 
     #[test]
     fn test_data_persistence() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         let fs = Fs::init(mmap).expect("Failed to initialize filesystem");
@@ -1514,6 +1427,8 @@ mod tests {
 
     #[test]
     fn test_next_frange_id_persistence() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         let fs = Fs::init(mmap).expect("Failed to initialize filesystem");
@@ -1550,6 +1465,8 @@ mod tests {
 
     #[test]
     fn test_dirty_pages_persistence() {
+        setup_deadlock_detection();
+
         let (dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         let fs = Fs::init(mmap).expect("Failed to initialize filesystem");
@@ -1586,6 +1503,8 @@ mod tests {
 
     #[test]
     fn test_compaction_triggers() {
+        setup_deadlock_detection();
+
         let (_dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         let fs = Fs::init(mmap).unwrap();
@@ -1627,6 +1546,8 @@ mod tests {
 
     #[test]
     fn test_compaction_preserves_data() {
+        setup_deadlock_detection();
+
         let (_dir, file) = setup_test_file();
         let mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
         let fs = Fs::init(mmap).unwrap();
