@@ -7,10 +7,15 @@ use bytes::{
 };
 
 use crate::{
+    errs::{
+        BlockError,
+        BlockError::{
+            BlockFull,
+            TooLargeForBlock,
+        },
+    },
     utils::Deserializer,
 };
-use crate::errs::BlockError;
-use crate::errs::BlockError::{BlockFull, TooLargeForBlock};
 
 const OFFSET_SIZE: usize = size_of::<u16>();
 const MAX_ENTRIES: usize = BLOCK_SIZE / ENTRY_SIZE;

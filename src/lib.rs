@@ -1,6 +1,8 @@
 // Copyright (c) Sienna Satterwhite, CesiumDB Contributors
+
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
+#![feature(sync_unsafe_cell)]
 #![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
 #![allow(dead_code)]
 #![allow(unused)]
@@ -28,7 +30,10 @@ use mimalloc::MiMalloc;
 use parking_lot::Mutex;
 
 use crate::{
-    errs::CesiumError,
+    errs::{
+        CesiumError,
+        CesiumError::MemtableError,
+    },
     hlc::{
         HybridLogicalClock,
         HLC,
@@ -49,7 +54,6 @@ use crate::{
         PutNs,
     },
 };
-use crate::errs::CesiumError::MemtableError;
 
 #[cfg(not(miri))]
 #[global_allocator]
@@ -57,21 +61,22 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod block;
 mod block_alloc;
+pub mod errs;
+pub mod hlc;
 mod index;
+pub mod keypair;
+mod manifest;
+mod map;
+pub mod memtable;
+pub mod merge;
+pub mod peek;
 mod segment;
 mod segment_builder;
 mod segment_reader;
 mod segment_writer;
+pub(crate) mod state;
 mod stats;
 mod utils;
-pub mod errs;
-pub mod fs;
-pub mod hlc;
-pub mod keypair;
-pub mod memtable;
-pub mod merge;
-pub mod peek;
-pub(crate) mod state;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
@@ -293,7 +298,7 @@ impl DbInner {
         {
             let guard = self.state.lock();
             let mtable = guard.current_memtable();
-            
+
             // TODO(@siennathesane): add memtable swap logic here
             match mtable.put_batch(_batch.as_ref()) {
                 | Ok(_) => Ok(()),

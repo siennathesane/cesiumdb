@@ -10,39 +10,26 @@ use std::{
     },
 };
 
-use bytes::Bytes;
-use parking_lot::RwLock;
-
 use crate::{
     block::{
         Block,
-        EntryFlag,
         EntryFlag::{
             Complete,
             End,
             Middle,
             Start,
         },
-        BLOCK_SIZE,
         MAX_ENTRY_SIZE,
     },
-    errs::{
-        BlockError,
-        SegmentError,
-    },
-    fs::Fs,
+    errs::SegmentError,
     index::SegmentIndex,
-    keypair::{
-        KeyBytes,
-        ValueBytes,
-    },
     segment::BlockType::{
         Key,
         Value,
     },
+    segment_reader::SegmentReader,
     segment_writer::SegmentWriter,
 };
-use crate::segment_reader::SegmentReader;
 
 #[derive(Debug)]
 pub enum BlockType {
@@ -74,6 +61,9 @@ pub(crate) struct Segment {
 
     // shared
     current_ns: AtomicU64,
+
+    // readers
+    reader: Arc<SegmentReader>,
 }
 
 impl Segment {
@@ -83,6 +73,7 @@ impl Segment {
         seed: i64,
         key_writer: SegmentWriter,
         val_writer: SegmentWriter,
+        reader: SegmentReader,
     ) -> Self {
         Self {
             key_writer,
@@ -94,6 +85,7 @@ impl Segment {
             current_val_block: Block::new(),
             val_index: SegmentIndex::new(val_id, seed),
             current_ns: AtomicU64::new(0),
+            reader: Arc::new(reader),
         }
     }
 
@@ -105,12 +97,6 @@ impl Segment {
             self.key_index.add_ns_offset(ns);
             self.val_index.add_ns_offset(ns);
         }
-
-        // NB(@siennathesane): we are tightly packing the keys and values into blocks
-        // and sometimes the payload will span multiple blocks. this sometimes means
-        // the underlying "file" (re: FRange) will be fragmented. this isn't
-        // inherently a problem because when a full compaction is run, the
-        // filesystem will be defragmented and the data will be contiguous.
 
         match self.current_key_block.add_entry(key, Complete) {
             | Ok(()) => {},
@@ -174,10 +160,10 @@ impl Segment {
 
         Ok(())
     }
-    
-    // pub(crate) fn new_reader(&self) -> SegmentReader {
-    //     SegmentReader::new(self)
-    // }
+
+    pub(crate) fn new_reader(&self) -> Arc<SegmentReader> {
+        self.reader.clone()
+    }
 
     /// Split a payload across multiple blocks.
     fn split_across_blocks(&mut self, data: &[u8], r#type: &BlockType) -> Result<(), SegmentError> {
@@ -230,7 +216,9 @@ impl Segment {
                     match block.add_entry(&remaining[..MAX_ENTRY_SIZE], Middle) {
                         | Ok(_) => {},
                         | Err(_) => {
-                            unreachable!("middle key block is properly sized, this should never happen")
+                            unreachable!(
+                                "middle key block is properly sized, this should never happen"
+                            )
                         },
                     };
                     match self.write_block(key) {
@@ -243,7 +231,9 @@ impl Segment {
                     match block.add_entry(&remaining[..MAX_ENTRY_SIZE], Middle) {
                         | Ok(_) => {},
                         | Err(_) => {
-                            unreachable!("middle val block is properly sized, this should never happen")
+                            unreachable!(
+                                "middle val block is properly sized, this should never happen"
+                            )
                         },
                     };
                     match self.write_block(value) {

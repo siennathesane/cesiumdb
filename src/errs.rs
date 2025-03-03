@@ -4,6 +4,7 @@
 use std::io;
 
 use thiserror::Error;
+
 use crate::segment::BlockType;
 
 #[derive(Error, Debug)]
@@ -64,6 +65,8 @@ pub enum SegmentError {
     ReadOutOfBounds,
     #[error("write out of bounds")]
     WriteOutOfBounds,
+    #[error("io error")]
+    IoError(io::Error),
 }
 
 #[derive(Error, Debug)]

@@ -354,18 +354,10 @@ mod x86_atomic_tests {
         let atomic = AtomicU128::new(0);
 
         // Valid store orderings
-        let store_orderings = [
-            Ordering::SeqCst,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ];
+        let store_orderings = [Ordering::SeqCst, Ordering::Release, Ordering::Relaxed];
 
         // Valid load orderings
-        let load_orderings = [
-            Ordering::SeqCst,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ];
+        let load_orderings = [Ordering::SeqCst, Ordering::Acquire, Ordering::Relaxed];
 
         for &store_order in &store_orderings {
             for &load_order in &load_orderings {
@@ -383,12 +375,9 @@ mod x86_atomic_tests {
             Ordering::Relaxed,
         ];
 
-        // Failure ordering must be no stronger than success and cannot be Release or AcqRel
-        let failure_orderings = [
-            Ordering::SeqCst,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ];
+        // Failure ordering must be no stronger than success and cannot be Release or
+        // AcqRel
+        let failure_orderings = [Ordering::SeqCst, Ordering::Acquire, Ordering::Relaxed];
 
         for &success_order in &success_orderings {
             for &failure_order in &failure_orderings {
@@ -397,12 +386,7 @@ mod x86_atomic_tests {
                     continue;
                 }
 
-                let _ = atomic.compare_exchange(
-                    42,
-                    100,
-                    success_order,
-                    failure_order,
-                );
+                let _ = atomic.compare_exchange(42, 100, success_order, failure_order);
             }
         }
     }

@@ -24,7 +24,7 @@ mimalloc = { version = "0.1.43" } # maybe there's no_std support? big question m
 parking_lot = { version = "0.12.3", features = ["deadlock_detection"] } # we would need to find a replacement for this, maybe lock_api?
 rand = "0.8.5" # has no_std support
 thiserror = "1.0" # it looks like there is no_std support
-tracing = "0.1.40" # there is no_std support
+tracing = "0.1.40"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -44,10 +44,6 @@ harness = false
 
 [[bench]]
 name = "merge"
-harness = false
-
-[[bench]]
-name = "fs"
 harness = false
 
 [build-dependencies]

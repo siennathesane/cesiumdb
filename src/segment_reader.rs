@@ -1,7 +1,10 @@
-use std::ops::DerefMut;
-use std::sync::Arc;
+use std::{
+    ops::DerefMut,
+    sync::Arc,
+};
+
 use bytes::{
-    Bytes,
+    Buf,
     BytesMut,
 };
 use crossbeam_queue::ArrayQueue;
@@ -12,14 +15,13 @@ use crate::{
         BLOCK_SIZE,
     },
     errs::{
-        FsError,
         SegmentError,
         SegmentError::{
             InvalidSize,
             ReadOutOfBounds,
         },
     },
-    fs::FRangeHandle,
+    map::Map,
     utils::Deserializer,
 };
 
@@ -37,8 +39,8 @@ impl Default for ReadConfig {
 }
 
 pub(crate) struct SegmentReader {
-    key_handle: Arc<FRangeHandle>,
-    val_handle: Arc<FRangeHandle>,
+    key_handle: Arc<Map>,
+    val_handle: Arc<Map>,
     num_blocks: usize,
     config: ReadConfig,
     // Cache for read-ahead blocks using a fixed-size queue
@@ -46,16 +48,16 @@ pub(crate) struct SegmentReader {
 }
 
 impl<'a> SegmentReader {
-    pub(crate) fn new(key_handle: Arc<FRangeHandle>, val_handle: Arc<FRangeHandle>) -> Result<Self, SegmentError> {
+    pub(crate) fn new(key_handle: Arc<Map>, val_handle: Arc<Map>) -> Result<Self, SegmentError> {
         Self::with_config(key_handle, val_handle, ReadConfig::default())
     }
 
     pub(crate) fn with_config(
-        key_handle: Arc<FRangeHandle>,
-        val_handle: Arc<FRangeHandle>,
+        key_handle: Arc<Map>,
+        val_handle: Arc<Map>,
         config: ReadConfig,
     ) -> Result<Self, SegmentError> {
-        let segment_size = key_handle.capacity() as usize;
+        let segment_size = key_handle.len();
 
         if segment_size % BLOCK_SIZE != 0 {
             return Err(InvalidSize);
@@ -117,14 +119,14 @@ impl<'a> SegmentReader {
 
         Ok(block)
     }
-    
+
     pub(crate) fn iter(&'a mut self) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator {
             reader: self,
             current_block: 0,
         }
     }
-    
+
     pub(crate) fn seeking_iter(&'a mut self) -> SeekingBlockIterator<'a> {
         SeekingBlockIterator {
             start: 0,
@@ -139,13 +141,11 @@ impl<'a> SegmentReader {
         let offset = block_index * BLOCK_SIZE;
         let mut buffer = BytesMut::zeroed(BLOCK_SIZE);
 
-        match self.key_handle.read_at(offset as u64, &mut buffer) {
-            | Ok(_) => {},
-            | Err(fse) => match fse {
-                | FsError::ReadOutOfBounds => return Err(ReadOutOfBounds),
-                | _ => !unreachable!("unexpected error reading block"),
-            },
-        };
+        if offset + BLOCK_SIZE > self.key_handle.len() {
+            return Err(ReadOutOfBounds);
+        }
+
+        buffer.copy_from_slice(&self.key_handle[offset..offset + BLOCK_SIZE]);
 
         let block = Block::deserialize(buffer.freeze());
 
@@ -275,235 +275,285 @@ impl<'a> Iterator for SeekingBlockIterator<'a> {
 #[allow(clippy::missing_safety_doc)]
 #[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
-    use std::{
-        fs::{
-            File,
-            OpenOptions,
-        },
-        sync::Arc,
-    };
+    use std::sync::Arc;
 
-    use bytes::BytesMut;
-    use memmap2::MmapOptions;
-    use tempfile::tempfile;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::{
         block::{
             Block,
             EntryFlag,
-            EntryFlag::Complete,
         },
-        errs::CesiumError::FsError,
-        fs::Fs,
+        map::Map,
     };
 
-    const TEST_FS_SIZE: u64 = BLOCK_SIZE as u64 * 16; // 16 blocks total space
+    // Helper function to create a temporary Map with specified size
+    fn create_test_map(size: usize) -> (tempfile::TempDir, Arc<Map>) {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.map");
 
-    // Helper to set up a test filesystem
-    fn setup_test_fs() -> (Arc<Fs>, File) {
-        let file = tempfile().unwrap();
-        file.set_len(TEST_FS_SIZE).unwrap();
+        // Initialize Map with the specified size
+        let map = Arc::new(Map::new(file_path, size as u64).unwrap());
 
-        let mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
-
-        let fs = Fs::init(mmap).unwrap();
-        (fs, file)
+        (dir, map)
     }
 
-    // Helper to create a test block with specified content
-    fn create_test_block(value: u8) -> Block {
-        let mut block = Block::new();
-        let data = vec![value; 8]; // Use 8 bytes for test data
-        block.add_entry(&data, Complete).unwrap();
-        block
-    }
+    // Helper to prepare a Map with blocks
+    fn prepare_blocks_map(num_blocks: usize) -> (tempfile::TempDir, Arc<Map>) {
+        let (dir, map) = create_test_map(num_blocks * BLOCK_SIZE);
 
-    // Helper to create a segment with test data
-    fn create_test_segment(fs: &Arc<Fs>, num_blocks: u64) -> FRangeHandle {
-        let segment_size = num_blocks * BLOCK_SIZE as u64;
-        let frange_id = fs.create_frange(segment_size).unwrap();
-        let frange = fs.open_frange(frange_id).unwrap();
-
-        // Write test data
+        // Fill with test blocks
         for i in 0..num_blocks {
-            let block = create_test_block(i as u8 + 1);
-            let mut buffer = vec![0u8; BLOCK_SIZE];
-            unsafe {
-                block.finalize(buffer.as_mut_ptr());
-            }
-            frange.write_at(i * BLOCK_SIZE as u64, &buffer).unwrap();
+            let mut block = Block::new();
+            let data = vec![i as u8; 16]; // Use block index as data
+            block.add_entry(&data, EntryFlag::Complete).unwrap();
+
+            // Write block to map
+            let offset = i * BLOCK_SIZE;
+            let block_range = offset..(offset + BLOCK_SIZE);
+
+            map.write_to_range(block_range, |slice| unsafe {
+                block.finalize(slice.as_mut_ptr());
+            })
+            .unwrap();
         }
 
-        frange
+        (dir, map)
     }
 
-    // #[test]
-    // fn test_segment_reader_new() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 2);
-    //     let handle = Arc::new(frange);
-    // 
-    //     let reader = SegmentReader::new(Arc::new(frange));
-    //     assert!(reader.is_ok());
-    //     let reader = reader.unwrap();
-    //     assert_eq!(reader.num_blocks(), 2);
-    //     assert_eq!(reader.config().read_ahead, 2); // Default read-ahead
-    // }
+    #[test]
+    fn test_new_segment_reader() {
+        let size = BLOCK_SIZE * 4;
+        let (_dir, key_map) = create_test_map(size);
+        let (_dir2, val_map) = create_test_map(size);
 
-    // #[test]
-    // fn test_segment_reader_invalid_size() {
-    //     let (fs, _file) = setup_test_fs();
-    // 
-    //     // Create a file range with invalid size
-    //     if let Ok(frange_id) = fs.create_frange(BLOCK_SIZE as u64 + 1) {
-    //         if let Ok(frange) = fs.open_frange(frange_id) {
-    //             // Debug the actual result
-    //             let result = SegmentReader::new(Arc::new(frange));
-    //             assert!(matches!(result, Err(SegmentSizeInvalid)));
-    //         }
-    //     }
-    // }
+        let reader = SegmentReader::new(key_map.clone(), val_map.clone());
+        assert!(reader.is_ok());
 
-    // #[test]
-    // fn test_read_block_basic() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 2);
-    // 
-    //     let mut reader = SegmentReader::new(Arc::new(frange)).unwrap();
-    //     let block = reader.read_block(0).unwrap();
-    //     let val = block.get(0).unwrap();
-    //     assert_eq!(block.get(0).unwrap(), val);
-    // }
+        let reader = reader.unwrap();
+        assert_eq!(reader.num_blocks(), 4);
+        assert_eq!(reader.config().read_ahead, 2); // Default value
+    }
 
-    // #[test]
-    // fn test_read_block_out_of_bounds() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 1);
-    // 
-    //     let mut reader = SegmentReader::new(Arc::new(frange)).unwrap();
-    //     let result = reader.read_block(1);
-    //     assert!(matches!(result.err().unwrap(), ReadOutOfBounds));
-    // }
+    #[test]
+    fn test_with_config() {
+        let size = BLOCK_SIZE * 4;
+        let (_dir, key_map) = create_test_map(size);
+        let (_dir2, val_map) = create_test_map(size);
 
-    // #[test]
-    // fn test_read_block_caching() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 4);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //
-    //     // First read should cache next blocks
-    //     let block1 = reader.read_block(0).unwrap();
-    //     assert_eq!(block1.get(0).unwrap(), &vec![1u8; 8]);
-    //
-    //     // This should come from cache
-    //     let block2 = reader.read_block(1).unwrap();
-    //     assert_eq!(block2.get(0).unwrap(), &vec![2u8; 8]);
-    //
-    //     // Moving beyond cache should trigger new reads
-    //     let block4 = reader.read_block(3).unwrap();
-    //     assert_eq!(block4.get(0).unwrap(), &vec![4u8; 8]);
-    // }
-    //
-    // #[test]
-    // fn test_read_block_sequential() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 4);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //
-    //     // Read all blocks sequentially
-    //     for i in 0..4 {
-    //         let block = reader.read_block(i).unwrap();
-    //         assert_eq!(block.get(0).unwrap(), &vec![(i + 1) as u8; 8]);
-    //     }
-    // }
-    //
-    // #[test]
-    // fn test_block_iterator() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 3);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //
-    //     let mut count = 0;
-    //     for block_result in reader.iter() {
-    //         let block = block_result.unwrap();
-    //         assert_eq!(block.get(0).unwrap(), &vec![(count + 1) as u8; 8]);
-    //         count += 1;
-    //     }
-    //     assert_eq!(count, 3);
-    // }
-    //
-    // #[test]
-    // fn test_seeking_iterator() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 4);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //     let mut seeking_iter = reader.seeking_iter();
-    //
-    //     // Seek to middle
-    //     seeking_iter.seek(2).unwrap();
-    //     assert_eq!(seeking_iter.current_position(), 2);
-    //     assert_eq!(seeking_iter.blocks_remaining(), 2);
-    //
-    //     // Read blocks and verify
-    //     for i in 2..4 {
-    //         let block = seeking_iter.next().unwrap().unwrap();
-    //         assert_eq!(block.get(0).unwrap(), &vec![(i + 1) as u8; 8]);
-    //     }
-    //     assert!(seeking_iter.next().is_none()); // Verify we hit the end
-    // }
-    //
-    // #[test]
-    // fn test_config_update() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 2);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //
-    //     let new_config = ReadConfig { read_ahead: 4 };
-    //     reader.set_config(new_config.clone());
-    //
-    //     assert_eq!(reader.config().read_ahead, 4);
-    //     reader.clear_cache(); // Verify cache clearing works
-    // }
-    //
-    // #[test]
-    // fn test_read_block_random_access() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 8);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //
-    //     // Read blocks in random order
-    //     let indices = vec![3, 1, 4, 2, 6, 5];
-    //     for &i in indices.iter() {
-    //         let block = reader.read_block(i).unwrap();
-    //         assert_eq!(block.get(0).unwrap(), &vec![(i + 1) as u8; 8]);
-    //     }
-    // }
-    //
-    // #[test]
-    // fn test_iterator_size_hint() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 5);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //     let iter = reader.iter();
-    //
-    //     let (min, max) = iter.size_hint();
-    //     assert_eq!(min, 5);
-    //     assert_eq!(max, Some(5));
-    // }
-    //
-    // #[test]
-    // fn test_seeking_iterator_bounds() {
-    //     let (fs, _file) = setup_test_fs();
-    //     let frange = create_test_segment(&fs, 3);
-    //     let mut reader = SegmentReader::new(frange).unwrap();
-    //     let mut seeking_iter = reader.seeking_iter();
-    //
-    //     // Test seeking out of bounds
-    //     assert!(seeking_iter.seek(3).is_err());
-    //
-    //     // Test seeking to last block
-    //     assert!(seeking_iter.seek(2).is_ok());
-    //     assert_eq!(seeking_iter.blocks_remaining(), 1);
-    // }
+        let config = ReadConfig { read_ahead: 3 };
+        let reader = SegmentReader::with_config(key_map.clone(), val_map.clone(), config);
+
+        assert!(reader.is_ok());
+        let reader = reader.unwrap();
+        assert_eq!(reader.config().read_ahead, 3);
+    }
+
+    #[test]
+    fn test_invalid_size() {
+        // Create Map with size that's not a multiple of BLOCK_SIZE
+        let invalid_size = BLOCK_SIZE * 2 + 100; // Not a multiple of BLOCK_SIZE
+        let (_dir, key_map) = create_test_map(invalid_size);
+        let (_dir2, val_map) = create_test_map(invalid_size);
+
+        let result = SegmentReader::new(key_map.clone(), val_map.clone());
+        assert!(result.is_err());
+        assert!(matches!(result.err().unwrap(), InvalidSize));
+    }
+
+    #[test]
+    fn test_read_block() {
+        let (_, key_map) = prepare_blocks_map(4);
+        let (_, val_map) = prepare_blocks_map(4);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        // Read each block and verify contents
+        for i in 0..4 {
+            let block = reader.read_block(i).unwrap();
+            let entry = block.get(0).unwrap();
+            assert_eq!(entry.1, &vec![i as u8; 16]);
+        }
+    }
+
+    #[test]
+    fn test_read_block_out_of_bounds() {
+        let (_, key_map) = prepare_blocks_map(2);
+        let (_, val_map) = prepare_blocks_map(2);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        let result = reader.read_block(2); // Only 2 blocks exist (0 and 1)
+        assert!(result.is_err());
+        assert!(matches!(result.err().unwrap(), ReadOutOfBounds));
+    }
+
+    #[test]
+    fn test_read_block_caching() {
+        let (_, key_map) = prepare_blocks_map(5);
+        let (_, val_map) = prepare_blocks_map(5);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        // First read
+        let block0 = reader.read_block(0).unwrap();
+        assert_eq!(block0.get(0).unwrap().1, &vec![0u8; 16]);
+
+        // Next block should be in cache now
+        let block1 = reader.read_block(1).unwrap();
+        assert_eq!(block1.get(0).unwrap().1, &vec![1u8; 16]);
+
+        // Skip to block 3, which should clear cache and rebuild
+        let block3 = reader.read_block(3).unwrap();
+        assert_eq!(block3.get(0).unwrap().1, &vec![3u8; 16]);
+
+        // Block 4 should be in cache now
+        let block4 = reader.read_block(4).unwrap();
+        assert_eq!(block4.get(0).unwrap().1, &vec![4u8; 16]);
+    }
+
+    #[test]
+    fn test_read_block_random_access() {
+        let (_, key_map) = prepare_blocks_map(8);
+        let (_, val_map) = prepare_blocks_map(8);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        // Access blocks in non-sequential order
+        let indices = [3, 1, 5, 0, 7, 2];
+
+        for &idx in &indices {
+            let block = reader.read_block(idx).unwrap();
+            assert_eq!(block.get(0).unwrap().1, &vec![idx as u8; 16]);
+        }
+    }
+
+    #[test]
+    fn test_clear_cache() {
+        let (_, key_map) = prepare_blocks_map(4);
+        let (_, val_map) = prepare_blocks_map(4);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        // Read a block to fill cache
+        reader.read_block(0).unwrap();
+
+        // Clear cache
+        reader.clear_cache();
+
+        // Cache should be empty, but this shouldn't affect functionality
+        let block = reader.read_block(1).unwrap();
+        assert_eq!(block.get(0).unwrap().1, &vec![1u8; 16]);
+    }
+
+    #[test]
+    fn test_set_config() {
+        let (_, key_map) = prepare_blocks_map(4);
+        let (_, val_map) = prepare_blocks_map(4);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        // Change read-ahead configuration
+        let new_config = ReadConfig { read_ahead: 1 };
+        reader.set_config(new_config);
+
+        assert_eq!(reader.config().read_ahead, 1);
+
+        // With read-ahead of 1, only the next block should be cached
+        reader.read_block(0).unwrap();
+
+        // Block 1 should be cached
+        let block1 = reader.read_block(1).unwrap();
+        assert_eq!(block1.get(0).unwrap().1, &vec![1u8; 16]);
+
+        // Block 3 shouldn't be in cache since read-ahead is only 1
+        reader.read_block(3).unwrap();
+    }
+
+    #[test]
+    fn test_segment_block_iterator() {
+        let (_, key_map) = prepare_blocks_map(3);
+        let (_, val_map) = prepare_blocks_map(3);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        let blocks: Vec<Block> = reader.iter().map(|result| result.unwrap()).collect();
+
+        assert_eq!(blocks.len(), 3);
+
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(block.get(0).unwrap().1, &vec![i as u8; 16]);
+        }
+    }
+
+    #[test]
+    fn test_seeking_block_iterator() {
+        let (_, key_map) = prepare_blocks_map(5);
+        let (_, val_map) = prepare_blocks_map(5);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+        let mut iter = reader.seeking_iter();
+
+        // Start at beginning
+        assert_eq!(iter.current_position(), 0);
+
+        // Read first block
+        let block0 = iter.next().unwrap().unwrap();
+        assert_eq!(block0.get(0).unwrap().1, &vec![0u8; 16]);
+
+        // Seek to position 3
+        iter.seek(3).unwrap();
+        assert_eq!(iter.current_position(), 3);
+
+        // Read from position 3
+        let block3 = iter.next().unwrap().unwrap();
+        assert_eq!(block3.get(0).unwrap().1, &vec![3u8; 16]);
+
+        // Seek out of bounds should fail
+        let result = iter.seek(5);
+        assert!(result.is_err());
+        assert!(matches!(result.err().unwrap(), ReadOutOfBounds));
+    }
+
+    #[test]
+    fn test_iterator_size_hint() {
+        let (_, key_map) = prepare_blocks_map(5);
+        let (_, val_map) = prepare_blocks_map(5);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+
+        // Test regular iterator
+        let iter = reader.iter();
+        let (min, max) = iter.size_hint();
+        assert_eq!(min, 5);
+        assert_eq!(max, Some(5));
+
+        // Test seeking iterator
+        let mut seeking_iter = reader.seeking_iter();
+        seeking_iter.seek(2).unwrap();
+
+        let (min, max) = seeking_iter.size_hint();
+        assert_eq!(min, 3); // 3 blocks remaining (2,3,4)
+        assert_eq!(max, Some(3));
+    }
+
+    #[test]
+    fn test_blocks_remaining() {
+        let (_, key_map) = prepare_blocks_map(5);
+        let (_, val_map) = prepare_blocks_map(5);
+
+        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+        let mut iter = reader.seeking_iter();
+
+        assert_eq!(iter.blocks_remaining(), 5);
+
+        // Read one block
+        iter.next();
+        assert_eq!(iter.blocks_remaining(), 4);
+
+        // Seek forward
+        iter.seek(3).unwrap();
+        assert_eq!(iter.blocks_remaining(), 2);
+    }
 }

@@ -40,6 +40,13 @@ use rand::random;
 use tracing::instrument;
 
 use crate::{
+    errs::{
+        MemtableError,
+        MemtableError::{
+            DataExceedsMaximum,
+            MemtableIsFrozen,
+        },
+    },
     keypair::{
         map_key_bound,
         KeyBytes,
@@ -52,8 +59,6 @@ use crate::{
         Serializer,
     },
 };
-use crate::errs::MemtableError;
-use crate::errs::MemtableError::{DataExceedsMaximum, MemtableIsFrozen};
 
 pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 2 << 28; // 256MiB
 
@@ -182,15 +187,15 @@ impl Memtable {
 
         Ok(())
     }
-    
+
     #[instrument(level = "debug")]
     #[inline]
     pub fn scan(&self, lower: Bound<KeyBytes>, upper: Bound<KeyBytes>) -> MemtableIterator {
         let (_lower, _upper) = (map_key_bound(lower), map_key_bound(upper));
         let ranger = self.map.range((_lower, _upper));
 
-        // TODO(@siennathesane): this is actually really unsafe because we might flush the data
-        // while the scan is happening
+        // TODO(@siennathesane): this is actually really unsafe because we might flush
+        // the data while the scan is happening
         // SAFETY: we need to extend the lifetime of `range` to 'static
         // so the user can hold onto it. as self.map is Arc'd,
         // this won't be deallocated while the iterator exists
