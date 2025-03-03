@@ -3,19 +3,14 @@ use std::{
     sync::Arc,
 };
 
-use bloom2::{
-    Bloom2,
-    BloomFilterBuilder,
-    CompressedBitmap,
-    FilterSize::KeyBytes4,
-};
+use bloom2::{Bloom2, BloomFilterBuilder, BytesBitmap, CompressedBitmap, FilterSize::KeyBytes4};
 use bytes::{
     BufMut,
     Bytes,
     BytesMut,
 };
-use gxhash::gxhash64;
-
+use gxhash::{gxhash64, GxBuildHasher, GxHasher};
+use crate::hash::SeedableHasher;
 use crate::utils::{
     Deserializer,
     Serializer,
@@ -40,11 +35,12 @@ pub(crate) struct SegmentIndex {
     bloom_filter: BytesMut,
 
     // temporary fields
-    active_bloom: Bloom2<RandomState, CompressedBitmap, u64>,
+    active_bloom: Bloom2<SeedableHasher, BytesBitmap, u64>,
 }
 
 impl SegmentIndex {
     pub(crate) fn new(id: u64, seed: i64) -> Self {
+        let hasher = SeedableHasher::new(seed);
         Self {
             id,
             bloom_filter_seed: seed,
@@ -57,7 +53,7 @@ impl SegmentIndex {
             block_offsets: BytesMut::new(),
             ns_offsets: BytesMut::new(),
             bloom_filter: BytesMut::new(),
-            active_bloom: BloomFilterBuilder::default().size(KeyBytes4).build(),
+            active_bloom: BloomFilterBuilder::hasher(hasher).with_bitmap().size(KeyBytes4).build(),
         }
     }
 
@@ -141,7 +137,8 @@ impl Deserializer for SegmentIndex {
                 ns_offset_size as usize * 8..],
         );
 
-        let active_bloom = BloomFilterBuilder::default().size(KeyBytes4).build();
+        let hasher = SeedableHasher::new(bloom_filter_seed);
+        let active_bloom = BloomFilterBuilder::hasher(hasher).with_bitmap().size(KeyBytes4).build();
 
         Self {
             id,
