@@ -299,8 +299,8 @@ mod tests {
         let memtable = Memtable::new(0, 2 << 23);
         let clock = HybridLogicalClock::new();
 
-        let mut rng = rand::thread_rng();
-        let ns = rng.gen();
+        let mut rng = rand::rng();
+        let ns = rng.random();
 
         let key = Bytes::from("test-key");
 
