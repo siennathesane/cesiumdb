@@ -74,7 +74,7 @@ impl<'a> SegmentReader {
         })
     }
 
-    pub(crate) fn read_block(&mut self, block_index: usize) -> Result<Block, SegmentError> {
+    pub(crate) fn read_block(&self, block_index: usize) -> Result<Block, SegmentError> {
         if block_index >= self.num_blocks {
             return Err(ReadOutOfBounds);
         }
@@ -137,7 +137,7 @@ impl<'a> SegmentReader {
     }
 
     /// Internal method to read a single block without caching
-    fn read_block_at(&mut self, block_index: usize) -> Result<Block, SegmentError> {
+    fn read_block_at(&self, block_index: usize) -> Result<Block, SegmentError> {
         let offset = block_index * BLOCK_SIZE;
         let mut buffer = BytesMut::zeroed(BLOCK_SIZE);
 
@@ -153,7 +153,7 @@ impl<'a> SegmentReader {
     }
 
     /// Fill the read-ahead cache starting from the given block index
-    fn fill_cache(&mut self, start_index: usize) -> Result<(), SegmentError> {
+    fn fill_cache(&self, start_index: usize) -> Result<(), SegmentError> {
         // Clear old cache entries
         while self.cache.pop().is_some() {}
 
@@ -367,7 +367,7 @@ mod tests {
         let (_, key_map) = prepare_blocks_map(4);
         let (_, val_map) = prepare_blocks_map(4);
 
-        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+        let reader = SegmentReader::new(key_map, val_map).unwrap();
 
         // Read each block and verify contents
         for i in 0..4 {
@@ -382,7 +382,7 @@ mod tests {
         let (_, key_map) = prepare_blocks_map(2);
         let (_, val_map) = prepare_blocks_map(2);
 
-        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+        let reader = SegmentReader::new(key_map, val_map).unwrap();
 
         let result = reader.read_block(2); // Only 2 blocks exist (0 and 1)
         assert!(result.is_err());
@@ -394,7 +394,7 @@ mod tests {
         let (_, key_map) = prepare_blocks_map(5);
         let (_, val_map) = prepare_blocks_map(5);
 
-        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+        let reader = SegmentReader::new(key_map, val_map).unwrap();
 
         // First read
         let block0 = reader.read_block(0).unwrap();
@@ -418,7 +418,7 @@ mod tests {
         let (_, key_map) = prepare_blocks_map(8);
         let (_, val_map) = prepare_blocks_map(8);
 
-        let mut reader = SegmentReader::new(key_map, val_map).unwrap();
+        let reader = SegmentReader::new(key_map, val_map).unwrap();
 
         // Access blocks in non-sequential order
         let indices = [3, 1, 5, 0, 7, 2];
