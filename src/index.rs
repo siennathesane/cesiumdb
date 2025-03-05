@@ -96,13 +96,19 @@ impl Index {
         self.block_offsets.extend_from_slice(&hash.to_le_bytes());
 
         // add to in-memory block index
-        let block_offset = (self.block_offset_size - 1) as u64;
+        let block_offset = (self.block_offset_size - 1);
         self.insert_block_entry(hash, block_offset);
     }
 
     /// add a namespace offset to the most recent block
+    // Ensure no underflow occurs in the implementation
     pub fn add_ns_offset(&mut self, ns: u64) {
         self.ns_offset_size += 1;
+        // Ensure there's at least one block before accessing block_offsets
+        if self.block_offsets.is_empty() {
+            // Handle the case where there are no blocks yet
+            return;
+        }
         let cur_block_offset = self.block_offsets[self.block_offsets.len() - 8..].as_ref();
         self.ns_offsets.extend_from_slice(cur_block_offset);
     }
