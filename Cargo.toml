@@ -42,5 +42,9 @@ harness = false
 name = "merge"
 harness = false
 
+[[bench]]
+name = "segment"
+harness = false
+
 [build-dependencies]
 cbindgen = "0.27.0"

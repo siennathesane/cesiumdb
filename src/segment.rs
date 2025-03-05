@@ -51,7 +51,7 @@ impl Display for BlockType {
     }
 }
 
-pub(crate) struct Segment {
+pub struct Segment {
     // keys
     key_writer: SegmentWriter,
     key_block_count: AtomicU64,
@@ -72,7 +72,7 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
-    pub(crate) fn new(
+    pub fn new(
         key_id: u64,
         val_id: u64,
         seed: i64,
@@ -109,7 +109,7 @@ impl Segment {
         }
     }
 
-    pub(crate) fn write(&mut self, key: &[u8], val: &[u8]) -> Result<(), SegmentError> {
+    pub fn write(&mut self, key: &[u8], val: &[u8]) -> Result<(), SegmentError> {
         // set the namespace
         let ns = u64::from_le_bytes(key[0..8].as_ref().try_into().unwrap());
         if ns != self.current_ns.load(Relaxed) {
@@ -456,7 +456,7 @@ impl Segment {
     }
 
     /// Flush any pending blocks
-    pub(crate) fn flush(&mut self) -> Result<(), SegmentError> {
+    pub fn flush(&mut self) -> Result<(), SegmentError> {
         // Flush key block if it has entries
         if !self.current_key_block.is_empty() {
             match self.write_block(&Key) {
@@ -476,7 +476,7 @@ impl Segment {
         Ok(())
     }
     
-    pub(crate) fn sync(&mut self) -> Result<(), SegmentError> {
+    pub fn sync(&mut self) -> Result<(), SegmentError> {
         match self.flush() {
             | Ok(_) => {
                 self.key_writer.wait_for_completion();

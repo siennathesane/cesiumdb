@@ -59,7 +59,7 @@ use crate::{
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-mod block;
+pub mod block;
 mod block_alloc;
 pub mod errs;
 mod hash;
@@ -67,14 +67,14 @@ pub mod hlc;
 mod index;
 pub mod keypair;
 mod manifest;
-mod map;
+pub mod map;
 pub mod memtable;
 pub mod merge;
 pub mod peek;
-mod segment;
+pub mod segment;
 mod segment_builder;
-mod segment_reader;
-mod segment_writer;
+pub mod segment_reader;
+pub mod segment_writer;
 pub(crate) mod state;
 mod stats;
 mod utils;

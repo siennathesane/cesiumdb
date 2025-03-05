@@ -36,7 +36,7 @@ use crate::errs::{
     SegmentError::IoError,
 };
 
-pub(crate) struct Map {
+pub struct Map {
     inner: AtomicPtr<SyncUnsafeCell<MmapMut>>,
     file: Mutex<File>,
     current_offset: AtomicU64,

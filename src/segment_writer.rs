@@ -31,7 +31,7 @@ use crate::{
     stats::STATS,
 };
 
-pub(crate) struct SegmentWriter {
+pub struct SegmentWriter {
     pub(crate) map: Arc<Map>,
     block_queue: Arc<SegQueue<Block>>,
     blocks_enqueued: Arc<AtomicUsize>,
@@ -44,7 +44,7 @@ pub(crate) struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    pub(crate) fn new(map: Arc<Map>) -> Result<Self, SegmentError> {
+    pub fn new(map: Arc<Map>) -> Result<Self, SegmentError> {
         let done = Arc::new(AtomicBool::new(false));
         let thread_exited = Arc::new(AtomicBool::new(false));
         let segment_full = Arc::new(AtomicBool::new(false));

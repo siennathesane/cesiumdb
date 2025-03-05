@@ -38,7 +38,7 @@ impl Default for ReadConfig {
     }
 }
 
-pub(crate) struct SegmentReader {
+pub struct SegmentReader {
     key_handle: Arc<Map>,
     val_handle: Arc<Map>,
     visible_key_blocks: usize,
@@ -50,7 +50,7 @@ pub(crate) struct SegmentReader {
 }
 
 impl<'a> SegmentReader {
-    pub(crate) fn new(key_handle: Arc<Map>, val_handle: Arc<Map>) -> Result<Self, SegmentError> {
+    pub fn new(key_handle: Arc<Map>, val_handle: Arc<Map>) -> Result<Self, SegmentError> {
         Self::with_config(key_handle, val_handle, ReadConfig::default())
     }
 
