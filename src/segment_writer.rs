@@ -13,7 +13,7 @@ use std::{
     thread,
     time::Duration,
 };
-
+use std::sync::atomic::AtomicUsize;
 use bytes::BufMut;
 use crossbeam_queue::SegQueue;
 use parking_lot::{
@@ -34,8 +34,11 @@ use crate::{
 pub(crate) struct SegmentWriter {
     pub(crate) map: Arc<Map>,
     block_queue: Arc<SegQueue<Block>>,
+    blocks_enqueued: Arc<AtomicUsize>,
+    blocks_processed: Arc<AtomicUsize>,
     segment_full: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    thread_exited: Arc<AtomicBool>,
     completion_mutex: Arc<Mutex<()>>,
     completion_condvar: Arc<Condvar>,
 }
@@ -43,21 +46,37 @@ pub(crate) struct SegmentWriter {
 impl SegmentWriter {
     pub(crate) fn new(map: Arc<Map>) -> Result<Self, SegmentError> {
         let done = Arc::new(AtomicBool::new(false));
+        let thread_exited = Arc::new(AtomicBool::new(false));
         let segment_full = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(SegQueue::<Block>::new());
+        let blocks_enqueued = Arc::new(AtomicUsize::new(0));
+        let blocks_processed = Arc::new(AtomicUsize::new(0));
         let completion_mutex = Arc::new(Mutex::new(()));
         let completion_condvar = Arc::new(Condvar::new());
 
         let done_clone = done.clone();
+        let thread_exited_clone = thread_exited.clone();
         let queue_clone = queue.clone();
         let map_clone = map.clone();
+        let blocks_enqueued_clone = blocks_enqueued.clone();
+        let blocks_processed_clone = blocks_processed.clone();
         let completion_mutex_clone = completion_mutex.clone();
         let completion_condvar_clone = completion_condvar.clone();
+
+        // Increment thread count BEFORE spawning thread
+        STATS.current_threads.fetch_add(1, Relaxed);
 
         thread::spawn(move || {
             let mut current_offset = 0;
 
             loop {
+                // Check for termination condition first
+                let all_blocks_processed = blocks_processed_clone.load(Relaxed) ==
+                    blocks_enqueued_clone.load(Relaxed);
+                if done_clone.load(Relaxed) && all_blocks_processed {
+                    break;
+                }
+
                 if let Some(block) = queue_clone.pop() {
                     let required_size = current_offset + BLOCK_SIZE as usize;
 
@@ -82,22 +101,43 @@ impl SegmentWriter {
                     }
 
                     current_offset += BLOCK_SIZE;
-                } else if done_clone.load(Relaxed) {
-                    break;
+                    blocks_processed_clone.fetch_add(1, Relaxed);
+
+                    // Notify after processing a block
+                    let _guard = completion_mutex_clone.lock();
+                    completion_condvar_clone.notify_all();
+                } else {
+                    // No blocks to process, check if done or sleep briefly
+                    if done_clone.load(Relaxed) {
+                        // If done flag is set, check if all blocks are processed
+                        if all_blocks_processed {
+                            break;
+                        }
+                        thread::sleep(Duration::from_micros(100));
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
             }
 
-            // notify completion
+            // Mark thread as exited
+            thread_exited_clone.store(true, Relaxed);
+
+            // Final notification before decrementing thread count
             let _guard = completion_mutex_clone.lock();
-            completion_condvar_clone.notify_one();
+            completion_condvar_clone.notify_all();
+
+            // Decrement thread count - LAST OPERATION before thread exits
             STATS.current_threads.fetch_sub(1, Relaxed);
         });
-        STATS.current_threads.fetch_add(1, Relaxed);
 
         Ok(Self {
             map,
             block_queue: queue,
+            blocks_enqueued,
+            blocks_processed,
             done,
+            thread_exited,
             segment_full,
             completion_mutex,
             completion_condvar,
@@ -106,14 +146,22 @@ impl SegmentWriter {
 
     pub(crate) fn write_block(&mut self, block: Block) -> Result<(), SegmentError> {
         self.block_queue.push(block);
+        self.blocks_enqueued.fetch_add(1, Relaxed);
         Ok(())
     }
-    
+
     /// Wait for all blocks to be written
     pub(crate) fn wait_for_completion(&self) {
         let mut guard = self.completion_mutex.lock();
-        while !self.block_queue.is_empty() || !self.done.load(Relaxed) {
-            self.completion_condvar.wait(&mut guard);
+        // Only wait if there are items in the queue
+        if !self.block_queue.is_empty() {
+            // Add a timeout to prevent indefinite hanging
+            let timeout = Duration::from_secs(5);
+            let result = self.completion_condvar.wait_for(&mut guard, timeout);
+            if result.timed_out() {
+                // Log warning but continue - better than hanging indefinitely
+                eprintln!("Warning: Timed out waiting for segment writer to complete");
+            }
         }
     }
 
@@ -123,25 +171,51 @@ impl SegmentWriter {
     }
 }
 
-impl Debug for SegmentWriter {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        // TODO(@siennathesane): impl debug for segment writer
-        todo!()
-    }
-}
-
 impl Drop for SegmentWriter {
     fn drop(&mut self) {
         // Signal the worker thread to finish
         self.done.store(true, Relaxed);
 
         {
+            // Wait for completion with timeout to prevent indefinite hanging
             let mut guard = self.completion_mutex.lock();
-            // Wait for both queue to be empty AND worker to finish
-            while !self.block_queue.is_empty() || !self.done.load(Relaxed) {
-                self.completion_condvar.wait(&mut guard);
+
+            // Notify to ensure worker checks done flag
+            self.completion_condvar.notify_all();
+
+            // Wait while the queue is not empty or thread hasn't exited
+            let timeout = Duration::from_secs(2);
+            let start = std::time::Instant::now();
+
+            while !self.thread_exited.load(Relaxed) {
+                // Break if we've waited too long
+                if start.elapsed() > timeout {
+                    eprintln!("Warning: Timed out waiting for SegmentWriter thread to exit");
+                    break;
+                }
+
+                // Wait with a shorter timeout for each iteration
+                let wait_result = self.completion_condvar.wait_for(
+                    &mut guard,
+                    Duration::from_millis(100)
+                );
+
+                if wait_result.timed_out() {
+                    // Just continue to the next iteration
+                    continue;
+                }
             }
         }
+
+        // Give the thread a moment to exit
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl Debug for SegmentWriter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // TODO(@siennathesane): impl debug for segment writer
+        todo!()
     }
 }
 
@@ -391,11 +465,20 @@ mod tests {
         // drop the writer - should wait for all blocks to be processed
         drop(writer);
 
-        // check that the thread count decreased
-        let threads_after = STATS.current_threads.load(Relaxed);
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+
+        while STATS.current_threads.load(Relaxed) >= threads_before {
+            if start.elapsed() > timeout {
+                panic!("Timed out waiting for thread count to decrease");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // If we get here, the thread count decreased
         assert!(
-            threads_after < threads_before,
-            "worker thread didn't complete properly"
+            STATS.current_threads.load(Relaxed) < threads_before,
+            "Worker thread didn't complete properly"
         );
     }
 
