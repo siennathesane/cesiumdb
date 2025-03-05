@@ -8,9 +8,7 @@ use bloom2::{
     BloomFilterBuilder,
     BytesBitmap,
     CompressedBitmap,
-    FilterSize::{
-        KeyBytes3,
-    },
+    FilterSize::KeyBytes3,
 };
 use bytes::{
     BufMut,

@@ -374,16 +374,20 @@ impl Segment {
                 // Now swap the block
                 let block = mem::replace(&mut self.current_key_block, Block::new());
 
-                // Add to index if we have a starting key
-                if let Some(key_data) = starting_key_data {
-                    self.key_index.add_block(&key_data);
-                }
-
                 // Write block and increment counter
-                self.key_writer.write_block(block).map(|_| {
+                let result = self.key_writer.write_block(block).map(|_| {
                     self.key_block_count.fetch_add(1, Relaxed);
                     ()
-                })
+                });
+
+                // Add to index if we have a starting key
+                if result.is_ok() {
+                    if let Some(key_data) = starting_key_data {
+                        self.key_index.add_block(&key_data);
+                    }
+                }
+
+                result
             },
             | Value => {
                 if self.current_val_block.is_empty() {
@@ -399,18 +403,49 @@ impl Segment {
                 // Now swap the block
                 let block = mem::replace(&mut self.current_val_block, Block::new());
 
-                // Add to index if we have a starting key
-                if let Some(key_data) = starting_key_data {
-                    self.val_index.add_block(&key_data);
-                }
-
                 // Write block and increment counter
-                self.val_writer.write_block(block).map(|_| {
+                let result = self.val_writer.write_block(block).map(|_| {
                     self.val_block_count.fetch_add(1, Relaxed);
                     ()
-                })
+                });
+
+                // Add to index if we have a starting key
+                if result.is_ok() {
+                    if let Some(key_data) = starting_key_data {
+                        self.val_index.add_block(&key_data);
+                    }
+                }
+
+                result
             },
         }
+    }
+
+    /// Flush any pending blocks
+    pub(crate) fn flush(&mut self) -> Result<(), SegmentError> {
+        // Flush key block if it has entries
+        if !self.current_key_block.is_empty() {
+            match self.write_block(&Key) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        // Flush value block if it has entries
+        if !self.current_val_block.is_empty() {
+            match self.write_block(&Value) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -796,16 +831,14 @@ mod tests {
             println!(
                 "After write {}, block count: {}",
                 i,
-                segment.key_index.block_count()
+                segment.key_index.block_count() + 1
             );
         }
 
-        let final_key_blocks = segment.key_index.block_count();
-        println!("Final block count: {}", final_key_blocks);
+        segment.flush().expect("failed to flush segment");
 
-        assert!(
-            final_key_blocks > initial_key_blocks,
-            "Key index should have added blocks"
-        );
+        let final_key_blocks = segment.key_index.block_count();
+
+        assert_eq!(final_key_blocks, 4, "there should be 4 blocks in the key index, found: {}", final_key_blocks);
     }
 }
