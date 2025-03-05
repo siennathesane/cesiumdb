@@ -41,6 +41,8 @@ impl Default for ReadConfig {
 pub(crate) struct SegmentReader {
     key_handle: Arc<Map>,
     val_handle: Arc<Map>,
+    visible_key_blocks: usize,
+    visible_val_blocks: usize,
     num_blocks: usize,
     config: ReadConfig,
     // Cache for read-ahead blocks using a fixed-size queue
@@ -64,10 +66,41 @@ impl<'a> SegmentReader {
         }
 
         let num_blocks = segment_size / BLOCK_SIZE;
+        
+        let visible_key_blocks = num_blocks;
+        let visible_val_blocks = val_handle.len() / BLOCK_SIZE;
 
         Ok(Self {
             key_handle,
             val_handle,
+            visible_key_blocks,
+            visible_val_blocks,
+            num_blocks,
+            cache: ArrayQueue::new(config.read_ahead + 1),
+            config,
+        })
+    }
+    
+    pub(crate) fn with_visibility(
+        key_handle: Arc<Map>,
+        val_handle: Arc<Map>,
+        visible_key_blocks: usize,
+        visible_val_blocks: usize,
+        config: ReadConfig,
+    ) -> Result<Self, SegmentError> {
+        let segment_size = key_handle.len();
+
+        if segment_size % BLOCK_SIZE != 0 {
+            return Err(InvalidSize);
+        }
+
+        let num_blocks = segment_size / BLOCK_SIZE;
+
+        Ok(Self {
+            key_handle,
+            val_handle,
+            visible_key_blocks,
+            visible_val_blocks,
             num_blocks,
             cache: ArrayQueue::new(config.read_ahead + 1),
             config,
@@ -75,7 +108,7 @@ impl<'a> SegmentReader {
     }
 
     pub(crate) fn read_block(&self, block_index: usize) -> Result<Block, SegmentError> {
-        if block_index >= self.num_blocks {
+        if block_index >= self.visible_key_blocks {
             return Err(ReadOutOfBounds);
         }
 
@@ -118,6 +151,17 @@ impl<'a> SegmentReader {
         };
 
         Ok(block)
+    }
+    
+    pub(crate) fn refresh(&mut self) {
+        self.visible_key_blocks = self.key_handle.len() /BLOCK_SIZE;
+        self.visible_val_blocks = self.val_handle.len() / BLOCK_SIZE;
+        
+        self.clear_cache();
+    }
+
+    pub(crate) fn visible_blocks(&self) -> (usize, usize) {
+        (self.visible_key_blocks, self.visible_val_blocks)
     }
 
     pub(crate) fn iter(&'a mut self) -> SegmentBlockIterator<'a> {

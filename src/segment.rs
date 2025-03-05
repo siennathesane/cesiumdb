@@ -24,11 +24,15 @@ use crate::{
     },
     errs::SegmentError,
     index::Index,
+    keypair::DEFAULT_NS,
     segment::BlockType::{
         Key,
         Value,
     },
-    segment_reader::SegmentReader,
+    segment_reader::{
+        ReadConfig,
+        SegmentReader,
+    },
     segment_writer::SegmentWriter,
 };
 
@@ -76,16 +80,31 @@ impl Segment {
         val_writer: SegmentWriter,
         reader: SegmentReader,
     ) -> Self {
+        let mut key_index = Index::new(key_id, seed);
+        let mut val_index = Index::new(val_id, seed);
+
+        // explicitly record the default namespace in both indexes
+        // during init to ensure the namespace is always recorded.
+        // this is because the namespace is only recorded when it
+        // changes, but if we start with the default namespace, it
+        // will never be seen to change. this creates an extra byte
+        // of space in the index, but there isn't a way to say "this
+        // is the first namespace" without doing this. so even if the
+        // first seen namespace isn't the default one, it will still
+        // be a pointer to the same record.
+        key_index.add_ns_offset(DEFAULT_NS);
+        val_index.add_ns_offset(DEFAULT_NS);
+
         Self {
             key_writer,
             key_block_count: AtomicU64::new(0),
             val_writer,
             val_block_count: AtomicU64::new(0),
-            key_index: Index::new(key_id, seed),
+            key_index,
             current_key_block: Block::new(),
             current_val_block: Block::new(),
-            val_index: Index::new(val_id, seed),
-            current_ns: AtomicU64::new(0),
+            val_index,
+            current_ns: AtomicU64::new(DEFAULT_NS),
             reader: Arc::new(reader),
         }
     }
@@ -171,6 +190,23 @@ impl Segment {
     }
 
     pub(crate) fn new_reader(&self) -> Arc<SegmentReader> {
+        let key_blocks = self.key_block_count.load(Relaxed) as usize;
+        let val_blocks = self.val_block_count.load(Relaxed) as usize;
+
+        match SegmentReader::with_visibility(
+            self.key_writer.map.clone(),
+            self.val_writer.map.clone(),
+            key_blocks,
+            val_blocks,
+            ReadConfig::default(),
+        ) {
+            | Ok(v) => Arc::new(v),
+            // fallback to default if there's an error
+            | Err(_) => self.reader.clone(),
+        }
+    }
+
+    pub(crate) fn new_current_reader(&self) -> Arc<SegmentReader> {
         self.reader.clone()
     }
 
@@ -441,6 +477,17 @@ impl Segment {
 
         Ok(())
     }
+    
+    pub(crate) fn sync(&mut self) -> Result<(), SegmentError> {
+        match self.flush() {
+            | Ok(_) => {
+                self.key_writer.wait_for_completion();
+                self.val_writer.wait_for_completion();
+                Ok(())
+            },
+            | Err(e) => Err(e),
+        }
+    }
 }
 
 impl Drop for Segment {
@@ -623,7 +670,7 @@ mod tests {
 
             memtable
                 .put(key_bytes.clone(), val_bytes.clone())
-                .expect("Failed to add to memtable");
+                .expect("failed to add to memtable");
             expected_entries.insert(key.clone(), value.clone());
         }
 
@@ -631,14 +678,18 @@ mod tests {
         let (mut segment, _dir) = create_test_segment();
         let segment = Arc::get_mut(&mut segment).unwrap();
 
-        // Persist each entry from memtable to segment
+        // record initial block counts for verification
+        let initial_key_blocks = segment.key_block_count.load(Relaxed);
+        let initial_val_blocks = segment.val_block_count.load(Relaxed);
+
+        // persist each entry from memtable to segment
         for i in 0..100 {
             let key = format!("key{:03}", i);
             let key_bytes = KeyBytes::new(DEFAULT_NS, Bytes::from(key.clone()), 0);
 
-            // Get the key from memtable
+            // get the key from memtable
             if let Some(val_bytes) = memtable.get(key_bytes) {
-                // Prepare key and value for segment
+                // prepare key and value for segment
                 let mut key_data = DEFAULT_NS.to_le_bytes().to_vec();
                 key_data.extend_from_slice(key.as_bytes());
 
@@ -648,19 +699,101 @@ mod tests {
                 let result = segment.write(&key_data, &val_data);
                 assert!(
                     result.is_ok(),
-                    "Failed to write memtable entry to segment: {:?}",
+                    "failed to write memtable entry to segment: {:?}",
                     result
                 );
             } else {
-                panic!("Entry not found in memtable: {}", key);
+                panic!("entry not found in memtable: {}", key);
             }
         }
 
-        // At this point, we've successfully persisted the memtable entries to
-        // the segment In a real implementation, you would now read back
-        // the data from the segment to verify persistence, but that
-        // requires more complex integration with the
-        // reader functionality
+        // flush the segment to ensure all data is written
+        segment.flush().expect("failed to flush segment");
+
+        // verify structural integrity
+        let final_key_blocks = segment.key_block_count.load(Relaxed);
+        let final_val_blocks = segment.val_block_count.load(Relaxed);
+
+        assert!(
+            final_key_blocks > initial_key_blocks,
+            "no key blocks were created during persistence"
+        );
+
+        assert!(
+            final_val_blocks > initial_val_blocks,
+            "no value blocks were created during persistence"
+        );
+
+        // verify the key and value indexes have block entries
+        assert!(
+            segment.key_index.block_count() > 0,
+            "key index should have block entries"
+        );
+
+        assert!(
+            segment.val_index.block_count() > 0,
+            "value index should have block entries"
+        );
+
+        // verify that namespaces are recorded
+        assert!(
+            segment.key_index.ns_offset_count() >= 1,
+            "key index should record at least one namespace"
+        );
+
+        assert!(
+            segment.val_index.ns_offset_count() >= 1,
+            "value index should record at least one namespace"
+        );
+
+        // get a reader and try to read some blocks to verify content
+        let reader = segment.new_current_reader();
+
+        // attempt to read the first few blocks
+        let mut found_valid_blocks = 0;
+        let blocks_to_check = 5; // check the first 5 blocks
+
+        for i in 0..blocks_to_check {
+            if i >= final_key_blocks as usize {
+                break;
+            }
+
+            match reader.read_block(i) {
+                | Ok(block) => {
+                    assert!(block.num_entries() > 0, "block should contain entries");
+                    found_valid_blocks += 1;
+                },
+                | Err(e) => {
+                    println!("note: could not read block {}: {:?}", i, e);
+                },
+            }
+        }
+
+        assert!(
+            found_valid_blocks > 0,
+            "should be able to read at least one block back from disk"
+        );
+
+        // log detailed statistics for debugging
+        println!("key blocks: {} -> {}", initial_key_blocks, final_key_blocks);
+        println!(
+            "value blocks: {} -> {}",
+            initial_val_blocks, final_val_blocks
+        );
+        println!("key index block count: {}", segment.key_index.block_count());
+        println!(
+            "value index block count: {}",
+            segment.val_index.block_count()
+        );
+        println!(
+            "valid blocks read back: {}/{}",
+            found_valid_blocks, blocks_to_check
+        );
+
+        // a complete implementation would include a
+        // segment_reader::SegmentIterator that allows indexing into the
+        // segment to find a specific key or to iterate through key/value pairs,
+        // but that functionality is not implemented yet
     }
 
     #[test]
@@ -704,7 +837,7 @@ mod tests {
         let (segment, _dir) = create_test_segment();
 
         // Get a new reader
-        let reader = segment.new_reader();
+        let reader = segment.new_current_reader();
         assert!(
             reader.num_blocks() >= 0,
             "Should be able to get block count from reader"
@@ -839,6 +972,10 @@ mod tests {
 
         let final_key_blocks = segment.key_index.block_count();
 
-        assert_eq!(final_key_blocks, 4, "there should be 4 blocks in the key index, found: {}", final_key_blocks);
+        assert_eq!(
+            final_key_blocks, 4,
+            "there should be 4 blocks in the key index, found: {}",
+            final_key_blocks
+        );
     }
 }

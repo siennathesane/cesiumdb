@@ -32,7 +32,7 @@ use crate::{
 };
 
 pub(crate) struct SegmentWriter {
-    map: Arc<Map>,
+    pub(crate) map: Arc<Map>,
     block_queue: Arc<SegQueue<Block>>,
     segment_full: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
@@ -108,9 +108,18 @@ impl SegmentWriter {
         self.block_queue.push(block);
         Ok(())
     }
+    
+    /// Wait for all blocks to be written
+    pub(crate) fn wait_for_completion(&self) {
+        let mut guard = self.completion_mutex.lock();
+        while !self.block_queue.is_empty() || !self.done.load(Relaxed) {
+            self.completion_condvar.wait(&mut guard);
+        }
+    }
 
     pub(crate) fn shutdown(&self) {
         self.done.store(true, Relaxed);
+        self.wait_for_completion();
     }
 }
 
