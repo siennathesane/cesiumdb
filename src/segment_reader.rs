@@ -11,8 +11,8 @@ use crossbeam_queue::ArrayQueue;
 
 use crate::{
     block::{
-        Block,
         BLOCK_SIZE,
+        Block,
     },
     errs::{
         SegmentError,

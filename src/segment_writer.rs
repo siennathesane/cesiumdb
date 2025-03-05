@@ -4,11 +4,11 @@ use std::{
         Formatter,
     },
     sync::{
+        Arc,
         atomic::{
             AtomicBool,
             Ordering::Relaxed,
         },
-        Arc,
     },
     thread,
     time::Duration,
@@ -23,8 +23,8 @@ use parking_lot::{
 
 use crate::{
     block::{
-        Block,
         BLOCK_SIZE,
+        Block,
     },
     errs::SegmentError,
     map::Map,
@@ -147,9 +147,9 @@ mod tests {
 
     use super::*;
     use crate::block::{
+        BLOCK_SIZE,
         Block,
         EntryFlag,
-        BLOCK_SIZE,
     };
 
     // helper function to create a temporary map for testing

@@ -2,11 +2,11 @@ use std::{
     fmt::Display,
     mem,
     sync::{
+        Arc,
         atomic::{
             AtomicU64,
             Ordering::Relaxed,
         },
-        Arc,
     },
 };
 
@@ -22,7 +22,7 @@ use crate::{
         MAX_ENTRY_SIZE,
     },
     errs::SegmentError,
-    index::SegmentIndex,
+    index::Index,
     segment::BlockType::{
         Key,
         Value,
@@ -50,14 +50,14 @@ pub(crate) struct Segment {
     // keys
     key_writer: SegmentWriter,
     key_block_count: AtomicU64,
-    key_index: SegmentIndex,
+    key_index: Index,
     current_key_block: Block,
 
     // values
     val_writer: SegmentWriter,
     val_block_count: AtomicU64,
     current_val_block: Block,
-    val_index: SegmentIndex,
+    val_index: Index,
 
     // shared
     current_ns: AtomicU64,
@@ -80,10 +80,10 @@ impl Segment {
             key_block_count: AtomicU64::new(0),
             val_writer,
             val_block_count: AtomicU64::new(0),
-            key_index: SegmentIndex::new(key_id, seed),
+            key_index: Index::new(key_id, seed),
             current_key_block: Block::new(),
             current_val_block: Block::new(),
-            val_index: SegmentIndex::new(val_id, seed),
+            val_index: Index::new(val_id, seed),
             current_ns: AtomicU64::new(0),
             reader: Arc::new(reader),
         }

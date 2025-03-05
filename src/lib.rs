@@ -30,28 +30,28 @@ use mimalloc::MiMalloc;
 use parking_lot::Mutex;
 
 use crate::{
-    errs::{
-        CesiumError,
-        CesiumError::MemtableError,
-    },
-    hlc::{
-        HybridLogicalClock,
-        HLC,
-    },
-    keypair::{
-        KeyBytes,
-        ValueBytes,
-        DEFAULT_NS,
-    },
-    state::{
-        DbStorageBuilder,
-        DbStorageState,
-    },
     Batch::{
         Delete,
         DeleteNs,
         Put,
         PutNs,
+    },
+    errs::{
+        CesiumError,
+        CesiumError::MemtableError,
+    },
+    hlc::{
+        HLC,
+        HybridLogicalClock,
+    },
+    keypair::{
+        DEFAULT_NS,
+        KeyBytes,
+        ValueBytes,
+    },
+    state::{
+        DbStorageBuilder,
+        DbStorageState,
     },
 };
 
@@ -62,6 +62,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod block;
 mod block_alloc;
 pub mod errs;
+mod hash;
 pub mod hlc;
 mod index;
 pub mod keypair;
@@ -77,7 +78,6 @@ mod segment_writer;
 pub(crate) mod state;
 mod stats;
 mod utils;
-mod hash;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
@@ -344,7 +344,10 @@ mod tests {
 
         {
             let guard = db.inner.state.lock();
-            assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
+            assert!(
+                guard.current_memtable().size() > keypair_size as u64,
+                "the memtable must be bigger than the keypair size to ensure the keys are actually stored"
+            );
         }
 
         // re-insert the same keys but with new versions
@@ -385,7 +388,10 @@ mod tests {
 
             {
                 let guard = db.inner.state.lock();
-                assert!(guard.current_memtable().size() > keypair_size as u64, "the memtable must be bigger than the keypair size to ensure the keys are actually stored");
+                assert!(
+                    guard.current_memtable().size() > keypair_size as u64,
+                    "the memtable must be bigger than the keypair size to ensure the keys are actually stored"
+                );
             }
         }
     }

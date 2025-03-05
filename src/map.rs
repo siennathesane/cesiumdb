@@ -14,6 +14,7 @@ use std::{
     path::PathBuf,
     ptr,
     sync::{
+        Arc,
         atomic::{
             AtomicPtr,
             AtomicU64,
@@ -24,7 +25,6 @@ use std::{
                 Release,
             },
         },
-        Arc,
     },
 };
 

@@ -3,28 +3,28 @@ use std::collections::Bound;
 use bytes::Bytes;
 use cesiumdb::{
     hlc::{
-        HybridLogicalClock,
         HLC,
+        HybridLogicalClock,
     },
     keypair::{
+        DEFAULT_NS,
         KeyBytes,
         ValueBytes,
-        DEFAULT_NS,
     },
     memtable::Memtable,
     merge::MergeIterator,
 };
 use criterion::{
-    black_box,
-    criterion_group,
-    criterion_main,
     BatchSize,
     BenchmarkId,
     Criterion,
+    black_box,
+    criterion_group,
+    criterion_main,
 };
 use rand::{
-    thread_rng,
     Rng,
+    thread_rng,
 };
 
 struct TestData {

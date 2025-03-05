@@ -6,12 +6,12 @@ use std::{
     hash::RandomState,
     mem::transmute,
     sync::{
+        Arc,
         atomic::{
             AtomicBool,
             AtomicU64,
             Ordering::Relaxed,
         },
-        Arc,
     },
     thread,
 };
@@ -24,15 +24,15 @@ use bloom2::{
 };
 use bytes::Bytes;
 use crossbeam_channel::{
-    bounded,
     Sender,
+    bounded,
 };
 use crossbeam_skiplist::{
+    SkipMap,
     map::{
         Entry,
         Range,
     },
-    SkipMap,
 };
 use gxhash::gxhash64;
 use parking_lot::Mutex;
@@ -48,9 +48,9 @@ use crate::{
         },
     },
     keypair::{
-        map_key_bound,
         KeyBytes,
         ValueBytes,
+        map_key_bound,
     },
     peek::Peekable,
     stats::STATS,
@@ -264,17 +264,17 @@ mod tests {
 
     use crate::{
         hlc::{
-            HybridLogicalClock,
             HLC,
+            HybridLogicalClock,
         },
         keypair::{
+            DEFAULT_NS,
             KeyBytes,
             ValueBytes,
-            DEFAULT_NS,
         },
         memtable::{
-            Memtable,
             DEFAULT_MEMTABLE_SIZE_IN_BYTES,
+            Memtable,
         },
     };
 
@@ -285,9 +285,11 @@ mod tests {
 
         let original_key = KeyBytes::new(DEFAULT_NS, Bytes::from("test"), clock.time());
         let original_val = ValueBytes::new(DEFAULT_NS, Bytes::from("value"));
-        assert!(memtable
-            .put(original_key.clone(), original_val.clone())
-            .is_ok());
+        assert!(
+            memtable
+                .put(original_key.clone(), original_val.clone())
+                .is_ok()
+        );
 
         let val = memtable.get(original_key.clone());
         assert!(val.is_some());

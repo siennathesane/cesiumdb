@@ -5,11 +5,11 @@
 use std::sync::atomic::AtomicU128 as StdAtomicU128;
 use std::{
     sync::{
+        Arc,
         atomic::{
             AtomicBool,
             Ordering::Relaxed,
         },
-        Arc,
     },
     thread,
     time::{
@@ -90,8 +90,8 @@ impl Drop for HybridLogicalClock {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use crate::hlc::{
-        HybridLogicalClock,
         HLC,
+        HybridLogicalClock,
     };
 
     #[test]

@@ -9,8 +9,8 @@ use parking_lot::{
 };
 
 use crate::memtable::{
-    Memtable,
     DEFAULT_MEMTABLE_SIZE_IN_BYTES,
+    Memtable,
 };
 
 pub const DEFAULT_BLOCK_SIZE: u64 = 4096;

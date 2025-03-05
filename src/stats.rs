@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 use std::sync::{
-    atomic::AtomicUsize,
     LazyLock,
+    atomic::AtomicUsize,
 };
 
 pub(crate) static STATS: LazyLock<Stats> = LazyLock::new(|| Stats::default());

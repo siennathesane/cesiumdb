@@ -160,9 +160,9 @@ mod tests {
     use super::*;
     use crate::{
         keypair::{
+            DEFAULT_NS,
             KeyBytes,
             ValueBytes,
-            DEFAULT_NS,
         },
         memtable::Memtable,
     };

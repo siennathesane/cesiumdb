@@ -1,14 +1,24 @@
-use std::hash::{BuildHasher, Hasher};
-use gxhash::{gxhash64, GxHasher};
+use std::hash::{
+    BuildHasher,
+    Hasher,
+};
+
+use gxhash::{
+    GxHasher,
+    gxhash64,
+};
 
 pub(crate) struct SeedableHasher {
     seed: i64,
-    hasher: GxHasher
+    hasher: GxHasher,
 }
 
 impl SeedableHasher {
     pub(crate) fn new(seed: i64) -> Self {
-        Self {seed, hasher: GxHasher::with_seed(seed)}
+        Self {
+            seed,
+            hasher: GxHasher::with_seed(seed),
+        }
     }
 }
 
@@ -80,9 +90,15 @@ impl BuildHasher for SeedableHasher {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{
+            Hash,
+            Hasher,
+        },
+    };
+
     use super::*;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     #[test]
     fn test_same_seed_produces_same_hash() {
@@ -216,6 +232,9 @@ mod tests {
         test_value.hash(&mut hasher2);
         let hash2 = hasher2.finish();
 
-        assert_eq!(hash1, hash2, "hash values should be consistent when using with Hash trait");
+        assert_eq!(
+            hash1, hash2,
+            "hash values should be consistent when using with Hash trait"
+        );
     }
 }

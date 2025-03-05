@@ -12,15 +12,15 @@ use cesiumdb::{
     DbOptions,
 };
 use criterion::{
-    criterion_group,
-    criterion_main,
     BenchmarkId,
     Criterion,
     Throughput,
+    criterion_group,
+    criterion_main,
 };
 use rand::{
-    prelude::ThreadRng,
     Rng,
+    prelude::ThreadRng,
 };
 
 static KB: usize = 1024;

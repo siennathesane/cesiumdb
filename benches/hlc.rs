@@ -1,11 +1,11 @@
 use cesiumdb::hlc::{
-    HybridLogicalClock,
     HLC,
+    HybridLogicalClock,
 };
 use criterion::{
+    Criterion,
     criterion_group,
     criterion_main,
-    Criterion,
 };
 
 pub fn clock_gettime(c: &mut Criterion) {
