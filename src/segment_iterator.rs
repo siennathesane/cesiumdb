@@ -122,7 +122,7 @@ impl<'a> Iterator for SeekingBlockIterator<'a> {
 }
 
 /// Iterator for scanning a range of keys in a segment.
-pub(crate) struct SegmentScanIterator<'a> {
+pub struct SegmentScanIterator<'a> {
     reader: &'a SegmentReader<'a>,
     current_block_index: usize,
     current_key_block: Option<Block>,

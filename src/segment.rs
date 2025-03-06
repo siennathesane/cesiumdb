@@ -187,7 +187,7 @@ impl Segment {
         Ok(())
     }
 
-    pub(crate) fn new_reader(&self) -> SegmentReader {
+    pub fn new_reader(&self) -> SegmentReader {
         let key_blocks = self.key_block_count.load(Relaxed) as usize;
         let val_blocks = self.val_block_count.load(Relaxed) as usize;
 

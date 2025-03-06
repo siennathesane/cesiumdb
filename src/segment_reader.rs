@@ -160,7 +160,7 @@ impl<'a> SegmentReader<'a> {
         })
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Bytes>, SegmentError> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, SegmentError> {
         // First check the bloom filter - quick reject if not present
         if !self.key_index.may_contain(key) {
             return Ok(None);
@@ -516,7 +516,7 @@ impl<'a> SegmentReader<'a> {
         Err(ReadOutOfBounds)
     }
 
-    pub(crate) fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         self.clear_cache();
     }
 

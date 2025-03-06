@@ -78,7 +78,7 @@ pub mod segment_reader;
 pub mod segment_writer;
 pub(crate) mod state;
 mod stats;
-mod utils;
+pub mod utils;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
