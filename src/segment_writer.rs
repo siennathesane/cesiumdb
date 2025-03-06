@@ -7,13 +7,14 @@ use std::{
         Arc,
         atomic::{
             AtomicBool,
+            AtomicUsize,
             Ordering::Relaxed,
         },
     },
     thread,
     time::Duration,
 };
-use std::sync::atomic::AtomicUsize;
+
 use bytes::BufMut;
 use crossbeam_queue::SegQueue;
 use parking_lot::{
@@ -53,24 +54,25 @@ impl SegmentWriter {
             // Calculate new size with some growth factor (doubling is a common strategy)
             let new_size = (required_size as u64).max(self.map.len() as u64 * 2);
             match self.map.grow(new_size) {
-                Ok(_) => {}
-                Err(e) => {
+                | Ok(_) => {},
+                | Err(e) => {
                     return Err(e);
-                }
+                },
             };
         }
 
         // Write block to the map at the current offset
         let block_range = *current_offset..(*current_offset + BLOCK_SIZE);
-        
-        // SAFETY: We know the block is exactly BLOCK_SIZE bytes
+
+        // SAFETY: We know the block is exactly BLOCK_SIZE bytes and we also know the
+        // space is available
         match self.map.write_to_range(block_range, |slice| unsafe {
             block.finalize(slice.as_mut_ptr());
         }) {
-            Ok(_) => {}
-            Err(e) => {
+            | Ok(_) => {},
+            | Err(e) => {
                 return Err(e);
-            }
+            },
         };
 
         // Update offset for the next write
@@ -94,10 +96,10 @@ impl SegmentWriter {
             // Calculate new size with some growth factor
             let new_size = (required_size as u64).max(self.map.len() as u64 * 2);
             match self.map.grow(new_size) {
-                Ok(_) => {}
-                Err(e) => {
+                | Ok(_) => {},
+                | Err(e) => {
                     return Err(e);
-                }
+                },
             };
         }
 
@@ -106,14 +108,15 @@ impl SegmentWriter {
             let block_offset = *current_offset + (i * BLOCK_SIZE);
             let block_range = block_offset..(block_offset + BLOCK_SIZE);
 
-            // SAFETY: We know the block is exactly BLOCK_SIZE bytes
+            // SAFETY: We know the block is exactly BLOCK_SIZE bytes and we also know the
+            // space is available
             match self.map.write_to_range(block_range, |slice| unsafe {
                 block.finalize(slice.as_mut_ptr());
             }) {
-                Ok(_) => {}
-                Err(e) => {
+                | Ok(_) => {},
+                | Err(e) => {
                     return Err(e);
-                }
+                },
             };
         }
 
@@ -124,14 +127,10 @@ impl SegmentWriter {
     }
 
     /// Wait for all blocks to be written
-    pub(crate) fn wait_for_completion(&self) {
-        
-    }
+    pub(crate) fn wait_for_completion(&self) {}
 
-    pub(crate) fn shutdown(&self) {
-        
-    }
-    
+    pub(crate) fn shutdown(&self) {}
+
     pub(crate) fn current_offset(&self) -> usize {
         *self.current_offset.lock()
     }
@@ -420,17 +419,29 @@ mod tests {
         let mut block2 = Block::new();
         let mut block3 = Block::new();
 
-        block1.add_complete_entry(b"first block data").expect("failed to add entry");
-        block2.add_complete_entry(b"second block data").expect("failed to add entry");
-        block3.add_complete_entry(b"third block data").expect("failed to add entry");
+        block1
+            .add_complete_entry(b"first block data")
+            .expect("failed to add entry");
+        block2
+            .add_complete_entry(b"second block data")
+            .expect("failed to add entry");
+        block3
+            .add_complete_entry(b"third block data")
+            .expect("failed to add entry");
 
         let blocks = vec![block1, block2, block3];
 
         // Write all blocks in one batch
-        writer.write_blocks(&blocks).expect("failed to write blocks batch");
+        writer
+            .write_blocks(&blocks)
+            .expect("failed to write blocks batch");
 
         // Check if offset was updated correctly
-        assert_eq!(writer.current_offset(), BLOCK_SIZE * 3, "offset should advance by 3 blocks");
+        assert_eq!(
+            writer.current_offset(),
+            BLOCK_SIZE * 3,
+            "offset should advance by 3 blocks"
+        );
 
         // Verify first block
         let num_entries_bytes_1 = &map[0..2];
@@ -462,8 +473,10 @@ mod tests {
         // Create a map that's just big enough for 1.5 blocks
         let dir = tempdir().expect("failed to create temp dir");
         let file_path = dir.path().join("small-grow-map");
-        let map = Arc::new(Map::new(file_path, (BLOCK_SIZE + BLOCK_SIZE/2) as u64)
-            .expect("failed to create map"));
+        let map = Arc::new(
+            Map::new(file_path, (BLOCK_SIZE + BLOCK_SIZE / 2) as u64)
+                .expect("failed to create map"),
+        );
 
         let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
 
@@ -472,14 +485,18 @@ mod tests {
         for i in 0..3 {
             let mut block = Block::new();
             let data = format!("block data {}", i).into_bytes();
-            block.add_complete_entry(&data).expect("failed to add entry");
+            block
+                .add_complete_entry(&data)
+                .expect("failed to add entry");
             blocks.push(block);
         }
 
         let initial_size = map.len();
 
         // Write all blocks at once
-        writer.write_blocks(&blocks).expect("failed to write blocks");
+        writer
+            .write_blocks(&blocks)
+            .expect("failed to write blocks");
 
         // Check if the map grew
         let new_size = map.len();
@@ -493,7 +510,11 @@ mod tests {
         );
 
         // Check offset was updated correctly
-        assert_eq!(writer.current_offset(), BLOCK_SIZE * 3, "offset should advance by 3 blocks");
+        assert_eq!(
+            writer.current_offset(),
+            BLOCK_SIZE * 3,
+            "offset should advance by 3 blocks"
+        );
     }
 
     #[test]
@@ -505,22 +526,32 @@ mod tests {
 
         // Block with a single entry
         let mut block1 = Block::new();
-        block1.add_complete_entry(b"single entry").expect("failed to add entry");
+        block1
+            .add_complete_entry(b"single entry")
+            .expect("failed to add entry");
 
         // Block with multiple entries
         let mut block2 = Block::new();
-        block2.add_complete_entry(b"entry 1").expect("failed to add entry");
-        block2.add_complete_entry(b"entry 2").expect("failed to add entry");
+        block2
+            .add_complete_entry(b"entry 1")
+            .expect("failed to add entry");
+        block2
+            .add_complete_entry(b"entry 2")
+            .expect("failed to add entry");
 
         // Block with a fragmented entry
         let mut block3 = Block::new();
-        block3.add_entry(b"start fragment", EntryFlag::Start).expect("failed to add entry");
+        block3
+            .add_entry(b"start fragment", EntryFlag::Start)
+            .expect("failed to add entry");
 
         blocks.push(block1);
         blocks.push(block2);
         blocks.push(block3);
 
-        writer.write_blocks(&blocks).expect("failed to write blocks");
+        writer
+            .write_blocks(&blocks)
+            .expect("failed to write blocks");
 
         // Verify first block has 1 entry
         let num_entries_bytes_1 = &map[0..2];
@@ -552,19 +583,31 @@ mod tests {
         // First batch
         let mut block1 = Block::new();
         let mut block2 = Block::new();
-        block1.add_complete_entry(b"batch1-block1").expect("failed to add entry");
-        block2.add_complete_entry(b"batch1-block2").expect("failed to add entry");
+        block1
+            .add_complete_entry(b"batch1-block1")
+            .expect("failed to add entry");
+        block2
+            .add_complete_entry(b"batch1-block2")
+            .expect("failed to add entry");
 
-        writer.write_blocks(&[block1, block2]).expect("failed to write first batch");
+        writer
+            .write_blocks(&[block1, block2])
+            .expect("failed to write first batch");
         assert_eq!(writer.current_offset(), BLOCK_SIZE * 2);
 
-        // Second batch 
+        // Second batch
         let mut block3 = Block::new();
         let mut block4 = Block::new();
-        block3.add_complete_entry(b"batch2-block1").expect("failed to add entry");
-        block4.add_complete_entry(b"batch2-block2").expect("failed to add entry");
+        block3
+            .add_complete_entry(b"batch2-block1")
+            .expect("failed to add entry");
+        block4
+            .add_complete_entry(b"batch2-block2")
+            .expect("failed to add entry");
 
-        writer.write_blocks(&[block3, block4]).expect("failed to write second batch");
+        writer
+            .write_blocks(&[block3, block4])
+            .expect("failed to write second batch");
         assert_eq!(writer.current_offset(), BLOCK_SIZE * 4);
 
         // Verify all blocks were written in sequence
