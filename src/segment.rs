@@ -741,7 +741,7 @@ mod tests {
         //                 for j in 0..block.num_entries() as usize {
         //                     if let Some((flag, data)) = block.get(j) {
         //                         println!("  Entry {}: flag={:?},
-        // data_len={}", j, flag, data.len());                         
+        // data_len={}", j, flag, data.len());
         // if !data.is_empty() {                             let preview
         // = if data.len() <= 16 {                                 data
         //                             } else {

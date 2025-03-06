@@ -1,8 +1,11 @@
 use std::{
-    ops::DerefMut,
+    ops::{
+        Bound,
+        DerefMut,
+    },
     sync::Arc,
 };
-use std::ops::Bound;
+
 use bytes::{
     Buf,
     Bytes,
@@ -26,6 +29,10 @@ use crate::{
         },
     },
     index::Index,
+    keypair::{
+        KeyBytes,
+        ValueBytes,
+    },
     map::Map,
     segment::{
         BlockType,
@@ -34,10 +41,14 @@ use crate::{
             Value,
         },
     },
+    segment_iterator::{
+        SeekingBlockIterator,
+        SegmentBlockIterator,
+        SegmentScanIterator,
+        convert_bound_to_bytes,
+    },
     utils::Deserializer,
 };
-use crate::keypair::{KeyBytes, ValueBytes};
-use crate::segment_iterator::{convert_bound_to_bytes, SeekingBlockIterator, SegmentBlockIterator, SegmentScanIterator};
 
 /// Configuration for read-ahead behavior
 #[derive(Debug, Clone)]
@@ -605,19 +616,25 @@ impl<'a> SegmentReader<'a> {
 
     /// Create a new iterator to scan a range of keys in the segment.
     ///
-    /// * `lower_bound` - The lower bound of the key range (inclusive if Included, exclusive if Excluded)
-    /// * `upper_bound` - The upper bound of the key range (inclusive if Included, exclusive if Excluded)
-    pub fn scan(&'a self, lower_bound: Bound<&[u8]>, upper_bound: Bound<&[u8]>) -> SegmentScanIterator<'a> {
+    /// * `lower_bound` - The lower bound of the key range (inclusive if
+    ///   Included, exclusive if Excluded)
+    /// * `upper_bound` - The upper bound of the key range (inclusive if
+    ///   Included, exclusive if Excluded)
+    pub fn scan(
+        &'a self,
+        lower_bound: Bound<&[u8]>,
+        upper_bound: Bound<&[u8]>,
+    ) -> SegmentScanIterator<'a> {
         // Determine starting block based on lower bound
         let start_block = match lower_bound {
-            Bound::Included(key) | Bound::Excluded(key) => {
+            | Bound::Included(key) | Bound::Excluded(key) => {
                 // Use the index to find the block that would contain this key
                 match self.key_index.find_block(key) {
-                    Some(block_offset) => block_offset as usize,
-                    None => 0, // Start from the beginning if not found
+                    | Some(block_offset) => block_offset as usize,
+                    | None => 0, // Start from the beginning if not found
                 }
             },
-            Bound::Unbounded => 0, // Start from the beginning
+            | Bound::Unbounded => 0, // Start from the beginning
         };
 
         SegmentScanIterator::new(self, (lower_bound, upper_bound))
