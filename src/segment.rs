@@ -480,11 +480,7 @@ impl Segment {
 
     pub fn sync(&mut self) -> Result<(), SegmentError> {
         match self.flush() {
-            | Ok(_) => {
-                self.key_writer.wait_for_completion();
-                self.val_writer.wait_for_completion();
-                Ok(())
-            },
+            | Ok(_) => Ok(()),
             | Err(e) => Err(e),
         }
     }
@@ -815,7 +811,7 @@ mod tests {
         // Get a new reader
         let reader = segment.new_reader();
         assert!(
-            reader.num_blocks() >= 0,
+            reader.num_blocks() > 0,
             "Should be able to get block count from reader"
         );
     }

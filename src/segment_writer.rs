@@ -126,9 +126,6 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Wait for all blocks to be written
-    pub(crate) fn wait_for_completion(&self) {}
-
     pub(crate) fn shutdown(&self) {}
 
     pub(crate) fn current_offset(&self) -> usize {

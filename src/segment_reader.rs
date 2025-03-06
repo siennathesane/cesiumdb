@@ -2,7 +2,7 @@ use std::{
     ops::DerefMut,
     sync::Arc,
 };
-
+use std::ops::Bound;
 use bytes::{
     Buf,
     Bytes,
@@ -36,6 +36,8 @@ use crate::{
     },
     utils::Deserializer,
 };
+use crate::keypair::{KeyBytes, ValueBytes};
+use crate::segment_iterator::{convert_bound_to_bytes, SeekingBlockIterator, SegmentBlockIterator, SegmentScanIterator};
 
 /// Configuration for read-ahead behavior
 #[derive(Debug, Clone)]
@@ -54,10 +56,10 @@ pub struct SegmentReader<'a> {
     key_handle: Arc<Map>,
     val_handle: Arc<Map>,
     key_index: &'a Index,
-    val_index: &'a Index,
-    visible_key_blocks: usize,
+    pub(crate) val_index: &'a Index,
+    pub(crate) visible_key_blocks: usize,
     visible_val_blocks: usize,
-    num_blocks: usize,
+    pub(crate) num_blocks: usize,
     config: ReadConfig,
     // Caches for read-ahead blocks using a fixed-size queue
     key_cache: ArrayQueue<(usize, Block)>, // (block_index, block)
@@ -218,7 +220,7 @@ impl<'a> SegmentReader<'a> {
         Ok(None)
     }
 
-    fn read_key_block(&self, block_index: usize) -> Result<Block, SegmentError> {
+    pub(crate) fn read_key_block(&self, block_index: usize) -> Result<Block, SegmentError> {
         if block_index >= self.visible_key_blocks {
             return Err(ReadOutOfBounds);
         }
@@ -325,7 +327,7 @@ impl<'a> SegmentReader<'a> {
         }
     }
 
-    fn read_value(
+    pub(crate) fn read_value(
         &self,
         val_block_index: usize,
         entry_index: usize,
@@ -512,19 +514,11 @@ impl<'a> SegmentReader<'a> {
     }
 
     pub(crate) fn iter(&'a mut self) -> SegmentBlockIterator<'a> {
-        SegmentBlockIterator {
-            reader: self,
-            current_block: 0,
-        }
+        SegmentBlockIterator::new(self)
     }
 
     pub(crate) fn seeking_iter(&'a mut self) -> SeekingBlockIterator<'a> {
-        SeekingBlockIterator {
-            start: 0,
-            end: self.num_blocks,
-            current: 0,
-            reader: self,
-        }
+        SeekingBlockIterator::new(self, 0, self.num_blocks)
     }
 
     /// Internal method to read a single block without caching
@@ -609,6 +603,26 @@ impl<'a> SegmentReader<'a> {
         Ok(())
     }
 
+    /// Create a new iterator to scan a range of keys in the segment.
+    ///
+    /// * `lower_bound` - The lower bound of the key range (inclusive if Included, exclusive if Excluded)
+    /// * `upper_bound` - The upper bound of the key range (inclusive if Included, exclusive if Excluded)
+    pub fn scan(&'a self, lower_bound: Bound<&[u8]>, upper_bound: Bound<&[u8]>) -> SegmentScanIterator<'a> {
+        // Determine starting block based on lower bound
+        let start_block = match lower_bound {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                // Use the index to find the block that would contain this key
+                match self.key_index.find_block(key) {
+                    Some(block_offset) => block_offset as usize,
+                    None => 0, // Start from the beginning if not found
+                }
+            },
+            Bound::Unbounded => 0, // Start from the beginning
+        };
+
+        SegmentScanIterator::new(self, (lower_bound, upper_bound))
+    }
+
     /// Get the total number of blocks in this segment
     #[inline]
     pub(crate) fn num_blocks(&self) -> usize {
@@ -632,103 +646,6 @@ impl<'a> SegmentReader<'a> {
     pub(crate) fn config(&self) -> &ReadConfig {
         &self.config
     }
-}
-
-impl<'a> Clone for SegmentReader<'a> {
-    fn clone(&self) -> Self {
-        Self {
-            key_handle: self.key_handle.clone(),
-            val_handle: self.val_handle.clone(),
-            key_index: self.key_index,
-            val_index: self.val_index,
-            visible_key_blocks: self.visible_key_blocks,
-            visible_val_blocks: self.visible_val_blocks,
-            num_blocks: self.num_blocks,
-            config: self.config.clone(),
-            key_cache: ArrayQueue::new(self.config.read_ahead),
-            val_cache: ArrayQueue::new(self.config.read_ahead),
-        }
-    }
-}
-
-pub(crate) struct SegmentBlockIterator<'a> {
-    reader: &'a mut SegmentReader<'a>,
-    current_block: usize,
-}
-
-impl<'a> Iterator for SegmentBlockIterator<'a> {
-    type Item = Result<Block, SegmentError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_block >= self.reader.num_blocks {
-            return None;
-        }
-
-        let result = self.reader.read_key_block(self.current_block);
-        self.current_block += 1;
-        Some(result)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.reader.num_blocks - self.current_block;
-        (remaining, Some(remaining))
-    }
-}
-
-pub(crate) struct SeekingBlockIterator<'a> {
-    start: usize,
-    end: usize,
-    current: usize,
-    reader: &'a mut SegmentReader<'a>,
-}
-
-impl<'a> SeekingBlockIterator<'a> {
-    pub(crate) fn seek(&mut self, block_index: usize) -> Result<(), SegmentError> {
-        if block_index >= self.end {
-            return Err(ReadOutOfBounds);
-        }
-        self.reader.clear_cache();
-        self.current = block_index;
-        Ok(())
-    }
-
-    pub(crate) fn current_position(&self) -> usize {
-        self.current
-    }
-
-    pub(crate) fn blocks_remaining(&self) -> usize {
-        self.end - self.current
-    }
-}
-
-impl<'a> Iterator for SeekingBlockIterator<'a> {
-    type Item = Result<Block, SegmentError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.end {
-            return None;
-        }
-        let result = self.reader.read_key_block(self.current);
-        self.current += 1;
-        Some(result)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.end - self.current;
-        (remaining, Some(remaining))
-    }
-}
-
-pub(crate) struct SegmentScanIterator<'a> {
-    reader: &'a SegmentReader<'a>,
-    iterator: SeekingBlockIterator<'a>,
-    current_key_block: Option<Block>,
-    current_key_index: usize,
-    current_val_block: Option<Block>,
-    current_val_index: usize,
-    end_key: Option<Bytes>,
-    key_index: &'a Index,
-    val_index: &'a Index,
 }
 
 #[cfg(test)]
