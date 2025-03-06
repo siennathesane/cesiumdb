@@ -33,189 +33,116 @@ use crate::{
 
 pub struct SegmentWriter {
     pub(crate) map: Arc<Map>,
-    block_queue: Arc<SegQueue<Block>>,
-    blocks_enqueued: Arc<AtomicUsize>,
-    blocks_processed: Arc<AtomicUsize>,
-    segment_full: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
-    thread_exited: Arc<AtomicBool>,
-    completion_mutex: Arc<Mutex<()>>,
-    completion_condvar: Arc<Condvar>,
+    current_offset: Mutex<usize>,
 }
 
 impl SegmentWriter {
     pub fn new(map: Arc<Map>) -> Result<Self, SegmentError> {
-        let done = Arc::new(AtomicBool::new(false));
-        let thread_exited = Arc::new(AtomicBool::new(false));
-        let segment_full = Arc::new(AtomicBool::new(false));
-        let queue = Arc::new(SegQueue::<Block>::new());
-        let blocks_enqueued = Arc::new(AtomicUsize::new(0));
-        let blocks_processed = Arc::new(AtomicUsize::new(0));
-        let completion_mutex = Arc::new(Mutex::new(()));
-        let completion_condvar = Arc::new(Condvar::new());
-
-        let done_clone = done.clone();
-        let thread_exited_clone = thread_exited.clone();
-        let queue_clone = queue.clone();
-        let map_clone = map.clone();
-        let blocks_enqueued_clone = blocks_enqueued.clone();
-        let blocks_processed_clone = blocks_processed.clone();
-        let completion_mutex_clone = completion_mutex.clone();
-        let completion_condvar_clone = completion_condvar.clone();
-
-        // Increment thread count BEFORE spawning thread
-        STATS.current_threads.fetch_add(1, Relaxed);
-
-        thread::spawn(move || {
-            let mut current_offset = 0;
-
-            loop {
-                // Check for termination condition first
-                let all_blocks_processed = blocks_processed_clone.load(Relaxed) ==
-                    blocks_enqueued_clone.load(Relaxed);
-                if done_clone.load(Relaxed) && all_blocks_processed {
-                    break;
-                }
-
-                if let Some(block) = queue_clone.pop() {
-                    let required_size = current_offset + BLOCK_SIZE as usize;
-
-                    // Check if we need to grow the map
-                    if required_size > map_clone.len() {
-                        // Calculate new size with some growth factor
-                        let new_size = (required_size as u64).max(map_clone.len() as u64 * 2);
-                        if let Err(e) = map_clone.grow(new_size) {
-                            eprintln!("Failed to grow map: {:?}", e);
-                            break;
-                        }
-                    }
-
-                    let block_range = current_offset..(current_offset + BLOCK_SIZE);
-
-                    // SAFETY: the range is already allocated, we're just copying data
-                    if let Err(e) = map_clone.write_to_range(block_range, |slice| unsafe {
-                        block.finalize(slice.as_mut_ptr());
-                    }) {
-                        eprintln!("Failed to write block: {:?}", e);
-                        break;
-                    }
-
-                    current_offset += BLOCK_SIZE;
-                    blocks_processed_clone.fetch_add(1, Relaxed);
-
-                    // Notify after processing a block
-                    let _guard = completion_mutex_clone.lock();
-                    completion_condvar_clone.notify_all();
-                } else {
-                    // No blocks to process, check if done or sleep briefly
-                    if done_clone.load(Relaxed) {
-                        // If done flag is set, check if all blocks are processed
-                        if all_blocks_processed {
-                            break;
-                        }
-                        thread::sleep(Duration::from_micros(100));
-                    } else {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            }
-
-            // Mark thread as exited
-            thread_exited_clone.store(true, Relaxed);
-
-            // Final notification before decrementing thread count
-            let _guard = completion_mutex_clone.lock();
-            completion_condvar_clone.notify_all();
-
-            // Decrement thread count - LAST OPERATION before thread exits
-            STATS.current_threads.fetch_sub(1, Relaxed);
-        });
-
         Ok(Self {
             map,
-            block_queue: queue,
-            blocks_enqueued,
-            blocks_processed,
-            done,
-            thread_exited,
-            segment_full,
-            completion_mutex,
-            completion_condvar,
+            current_offset: Mutex::new(0),
         })
     }
 
     pub(crate) fn write_block(&mut self, block: Block) -> Result<(), SegmentError> {
-        self.block_queue.push(block);
-        self.blocks_enqueued.fetch_add(1, Relaxed);
+        let mut current_offset = self.current_offset.lock();
+        let required_size = *current_offset + BLOCK_SIZE;
+
+        // Check if we need to grow the map
+        if required_size > self.map.len() {
+            // Calculate new size with some growth factor (doubling is a common strategy)
+            let new_size = (required_size as u64).max(self.map.len() as u64 * 2);
+            match self.map.grow(new_size) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+        }
+
+        // Write block to the map at the current offset
+        let block_range = *current_offset..(*current_offset + BLOCK_SIZE);
+        
+        // SAFETY: We know the block is exactly BLOCK_SIZE bytes
+        match self.map.write_to_range(block_range, |slice| unsafe {
+            block.finalize(slice.as_mut_ptr());
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        // Update offset for the next write
+        *current_offset += BLOCK_SIZE;
+
+        Ok(())
+    }
+
+    /// Write multiple blocks in a batch
+    pub(crate) fn write_blocks(&self, blocks: &[Block]) -> Result<(), SegmentError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let mut current_offset = self.current_offset.lock();
+        let total_size = blocks.len() * BLOCK_SIZE;
+        let required_size = *current_offset + total_size;
+
+        // Check if we need to grow the map
+        if required_size > self.map.len() {
+            // Calculate new size with some growth factor
+            let new_size = (required_size as u64).max(self.map.len() as u64 * 2);
+            match self.map.grow(new_size) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+        }
+
+        // Write all blocks in sequence
+        for (i, block) in blocks.iter().enumerate() {
+            let block_offset = *current_offset + (i * BLOCK_SIZE);
+            let block_range = block_offset..(block_offset + BLOCK_SIZE);
+
+            // SAFETY: We know the block is exactly BLOCK_SIZE bytes
+            match self.map.write_to_range(block_range, |slice| unsafe {
+                block.finalize(slice.as_mut_ptr());
+            }) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+        }
+
+        // Update offset for the next write
+        *current_offset += total_size;
+
         Ok(())
     }
 
     /// Wait for all blocks to be written
     pub(crate) fn wait_for_completion(&self) {
-        let mut guard = self.completion_mutex.lock();
-        // Only wait if there are items in the queue
-        if !self.block_queue.is_empty() {
-            // Add a timeout to prevent indefinite hanging
-            let timeout = Duration::from_secs(5);
-            let result = self.completion_condvar.wait_for(&mut guard, timeout);
-            if result.timed_out() {
-                // Log warning but continue - better than hanging indefinitely
-                eprintln!("Warning: Timed out waiting for segment writer to complete");
-            }
-        }
+        
     }
 
     pub(crate) fn shutdown(&self) {
-        self.done.store(true, Relaxed);
-        self.wait_for_completion();
+        
     }
-}
-
-impl Drop for SegmentWriter {
-    fn drop(&mut self) {
-        // Signal the worker thread to finish
-        self.done.store(true, Relaxed);
-
-        {
-            // Wait for completion with timeout to prevent indefinite hanging
-            let mut guard = self.completion_mutex.lock();
-
-            // Notify to ensure worker checks done flag
-            self.completion_condvar.notify_all();
-
-            // Wait while the queue is not empty or thread hasn't exited
-            let timeout = Duration::from_secs(2);
-            let start = std::time::Instant::now();
-
-            while !self.thread_exited.load(Relaxed) {
-                // Break if we've waited too long
-                if start.elapsed() > timeout {
-                    eprintln!("Warning: Timed out waiting for SegmentWriter thread to exit");
-                    break;
-                }
-
-                // Wait with a shorter timeout for each iteration
-                let wait_result = self.completion_condvar.wait_for(
-                    &mut guard,
-                    Duration::from_millis(100)
-                );
-
-                if wait_result.timed_out() {
-                    // Just continue to the next iteration
-                    continue;
-                }
-            }
-        }
-
-        // Give the thread a moment to exit
-        thread::sleep(Duration::from_millis(10));
+    
+    pub(crate) fn current_offset(&self) -> usize {
+        *self.current_offset.lock()
     }
 }
 
 impl Debug for SegmentWriter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        // TODO(@siennathesane): impl debug for segment writer
-        todo!()
+        f.debug_struct("SegmentWriter")
+            .field("current_offset", &self.current_offset())
+            .field("map_size", &self.map.len())
+            .finish()
     }
 }
 
@@ -281,54 +208,6 @@ mod tests {
     }
 
     #[test]
-    fn test_write_multiple_blocks() {
-        let (map, _dir) = create_test_map().expect("failed to create map");
-
-        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
-
-        // Create first block
-        let mut block1 = Block::new();
-        let test_data1 = b"first block data";
-        block1
-            .add_complete_entry(test_data1)
-            .expect("failed to add entry to first block");
-
-        // Create second block
-        let mut block2 = Block::new();
-        let test_data2 = b"second block data";
-        block2
-            .add_complete_entry(test_data2)
-            .expect("failed to add entry to second block");
-
-        // write the blocks
-        writer
-            .write_block(block1)
-            .expect("failed to write first block");
-        writer
-            .write_block(block2)
-            .expect("failed to write second block");
-
-        // wait a bit to ensure the blocks are written
-        thread::sleep(Duration::from_millis(100));
-
-        // Verify first block has entries
-        let num_entries_bytes_1 = &map[0..2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_1[0], num_entries_bytes_1[1]]),
-            1,
-            "expected 1 entry in the first block"
-        );
-
-        // Verify second block has entries
-        let num_entries_bytes_2 = &map[BLOCK_SIZE..BLOCK_SIZE + 2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_2[0], num_entries_bytes_2[1]]),
-            1,
-            "expected 1 entry in the second block"
-        );
-    }
-
-    #[test]
     fn test_auto_growing() {
         // start with a very small map that needs to grow
         let dir = tempdir().expect("failed to create temp dir");
@@ -372,21 +251,6 @@ mod tests {
             1,
             "expected 1 entry in the block"
         );
-    }
-
-    #[test]
-    fn test_shutdown_and_completion() {
-        let (map, _dir) = create_test_map().expect("failed to create map");
-
-        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
-
-        // shutdown the writer
-        writer.shutdown();
-
-        // dropping the writer should wait for completion
-        drop(writer);
-
-        // if we got here without deadlock, the test passes
     }
 
     #[test]
@@ -440,45 +304,6 @@ mod tests {
         assert!(
             map.len() >= expected_min_size,
             "map size is less than expected"
-        );
-    }
-
-    #[test]
-    fn test_drop_waits_for_completion() {
-        let (map, _dir) = create_test_map().expect("failed to create map");
-
-        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
-
-        // create and write a bunch of blocks
-        for i in 0..100 {
-            let mut block = Block::new();
-            let test_data = format!("Block {}", i).into_bytes();
-            block
-                .add_complete_entry(&test_data)
-                .expect("failed to add entry to block");
-            writer.write_block(block).expect("failed to write block");
-        }
-
-        // store the current stats count
-        let threads_before = STATS.current_threads.load(Relaxed);
-
-        // drop the writer - should wait for all blocks to be processed
-        drop(writer);
-
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-
-        while STATS.current_threads.load(Relaxed) >= threads_before {
-            if start.elapsed() > timeout {
-                panic!("Timed out waiting for thread count to decrease");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        // If we get here, the thread count decreased
-        assert!(
-            STATS.current_threads.load(Relaxed) < threads_before,
-            "Worker thread didn't complete properly"
         );
     }
 
@@ -571,5 +396,187 @@ mod tests {
             size_used >= BLOCK_SIZE * 3,
             "expected at least 3 blocks to be used"
         );
+    }
+
+    #[test]
+    fn test_write_blocks_empty() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Empty blocks vector should succeed
+        let blocks = Vec::new();
+        let result = writer.write_blocks(&blocks);
+        assert!(result.is_ok(), "writing empty blocks vector should succeed");
+        assert_eq!(writer.current_offset(), 0, "offset should not change");
+    }
+
+    #[test]
+    fn test_write_blocks_batch() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Create three blocks with different data
+        let mut block1 = Block::new();
+        let mut block2 = Block::new();
+        let mut block3 = Block::new();
+
+        block1.add_complete_entry(b"first block data").expect("failed to add entry");
+        block2.add_complete_entry(b"second block data").expect("failed to add entry");
+        block3.add_complete_entry(b"third block data").expect("failed to add entry");
+
+        let blocks = vec![block1, block2, block3];
+
+        // Write all blocks in one batch
+        writer.write_blocks(&blocks).expect("failed to write blocks batch");
+
+        // Check if offset was updated correctly
+        assert_eq!(writer.current_offset(), BLOCK_SIZE * 3, "offset should advance by 3 blocks");
+
+        // Verify first block
+        let num_entries_bytes_1 = &map[0..2];
+        assert_eq!(
+            u16::from_le_bytes([num_entries_bytes_1[0], num_entries_bytes_1[1]]),
+            1,
+            "expected 1 entry in the first block"
+        );
+
+        // Verify second block
+        let num_entries_bytes_2 = &map[BLOCK_SIZE..BLOCK_SIZE + 2];
+        assert_eq!(
+            u16::from_le_bytes([num_entries_bytes_2[0], num_entries_bytes_2[1]]),
+            1,
+            "expected 1 entry in the second block"
+        );
+
+        // Verify third block
+        let num_entries_bytes_3 = &map[BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 2];
+        assert_eq!(
+            u16::from_le_bytes([num_entries_bytes_3[0], num_entries_bytes_3[1]]),
+            1,
+            "expected 1 entry in the third block"
+        );
+    }
+
+    #[test]
+    fn test_write_blocks_growth() {
+        // Create a map that's just big enough for 1.5 blocks
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("small-grow-map");
+        let map = Arc::new(Map::new(file_path, (BLOCK_SIZE + BLOCK_SIZE/2) as u64)
+            .expect("failed to create map"));
+
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Create three blocks that together exceed initial map size
+        let mut blocks = Vec::new();
+        for i in 0..3 {
+            let mut block = Block::new();
+            let data = format!("block data {}", i).into_bytes();
+            block.add_complete_entry(&data).expect("failed to add entry");
+            blocks.push(block);
+        }
+
+        let initial_size = map.len();
+
+        // Write all blocks at once
+        writer.write_blocks(&blocks).expect("failed to write blocks");
+
+        // Check if the map grew
+        let new_size = map.len();
+        assert!(
+            new_size > initial_size,
+            "map should have grown when writing multiple blocks"
+        );
+        assert!(
+            new_size >= BLOCK_SIZE * 3,
+            "map should be able to accommodate all three blocks"
+        );
+
+        // Check offset was updated correctly
+        assert_eq!(writer.current_offset(), BLOCK_SIZE * 3, "offset should advance by 3 blocks");
+    }
+
+    #[test]
+    fn test_write_blocks_with_varying_content() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        let mut blocks = Vec::new();
+
+        // Block with a single entry
+        let mut block1 = Block::new();
+        block1.add_complete_entry(b"single entry").expect("failed to add entry");
+
+        // Block with multiple entries
+        let mut block2 = Block::new();
+        block2.add_complete_entry(b"entry 1").expect("failed to add entry");
+        block2.add_complete_entry(b"entry 2").expect("failed to add entry");
+
+        // Block with a fragmented entry
+        let mut block3 = Block::new();
+        block3.add_entry(b"start fragment", EntryFlag::Start).expect("failed to add entry");
+
+        blocks.push(block1);
+        blocks.push(block2);
+        blocks.push(block3);
+
+        writer.write_blocks(&blocks).expect("failed to write blocks");
+
+        // Verify first block has 1 entry
+        let num_entries_bytes_1 = &map[0..2];
+        assert_eq!(
+            u16::from_le_bytes([num_entries_bytes_1[0], num_entries_bytes_1[1]]),
+            1
+        );
+
+        // Verify second block has 2 entries
+        let num_entries_bytes_2 = &map[BLOCK_SIZE..BLOCK_SIZE + 2];
+        assert_eq!(
+            u16::from_le_bytes([num_entries_bytes_2[0], num_entries_bytes_2[1]]),
+            2
+        );
+
+        // Verify third block has 1 entry
+        let num_entries_bytes_3 = &map[BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 2];
+        assert_eq!(
+            u16::from_le_bytes([num_entries_bytes_3[0], num_entries_bytes_3[1]]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_sequential_write_blocks_calls() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // First batch
+        let mut block1 = Block::new();
+        let mut block2 = Block::new();
+        block1.add_complete_entry(b"batch1-block1").expect("failed to add entry");
+        block2.add_complete_entry(b"batch1-block2").expect("failed to add entry");
+
+        writer.write_blocks(&[block1, block2]).expect("failed to write first batch");
+        assert_eq!(writer.current_offset(), BLOCK_SIZE * 2);
+
+        // Second batch 
+        let mut block3 = Block::new();
+        let mut block4 = Block::new();
+        block3.add_complete_entry(b"batch2-block1").expect("failed to add entry");
+        block4.add_complete_entry(b"batch2-block2").expect("failed to add entry");
+
+        writer.write_blocks(&[block3, block4]).expect("failed to write second batch");
+        assert_eq!(writer.current_offset(), BLOCK_SIZE * 4);
+
+        // Verify all blocks were written in sequence
+        for i in 0..4 {
+            let offset = i * BLOCK_SIZE;
+            let num_entries_bytes = &map[offset..offset + 2];
+            assert_eq!(
+                u16::from_le_bytes([num_entries_bytes[0], num_entries_bytes[1]]),
+                1,
+                "Block {} should have 1 entry",
+                i
+            );
+        }
     }
 }

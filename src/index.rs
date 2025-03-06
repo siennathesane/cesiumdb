@@ -82,7 +82,9 @@ impl Index {
     /// add an item to the bloom filter
     pub fn add_item(&mut self, item: &[u8]) {
         let hash = gxhash64(item, self.bloom_filter_seed);
-        self.active_bloom.insert(&hash);
+        if !self.active_bloom.contains(&hash) {
+            self.active_bloom.insert(&hash);
+        }
     }
 
     /// add a new block with the given starting key
