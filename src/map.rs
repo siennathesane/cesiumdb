@@ -28,7 +28,10 @@ use std::{
     },
 };
 
-use memmap2::MmapMut;
+use memmap2::{
+    Advice::WillNeed,
+    MmapMut,
+};
 use parking_lot::Mutex;
 
 use crate::errs::{
@@ -137,6 +140,17 @@ impl Map {
         }
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn warn(&self, range: Range<usize>) {
+        let ptr = self.inner.load(Acquire);
+        // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer
+        unsafe {
+            let mmap = &*ptr;
+            let inner = &*mmap.get();
+            &inner.advise_range(WillNeed, range.start, range.end - range.start);
+        }
     }
 
     pub fn len(&self) -> usize {

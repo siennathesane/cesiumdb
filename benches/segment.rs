@@ -1,15 +1,28 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, BatchSize, Criterion, Throughput, SamplingMode};
-use rand::{Rng};
-use std::sync::Arc;
-use tempfile::tempdir;
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 // Assuming these modules are exposed for benchmarking
 use cesiumdb::block::BLOCK_SIZE;
-use cesiumdb::map::Map;
-use cesiumdb::segment::Segment;
-use cesiumdb::segment_reader::SegmentReader;
-use cesiumdb::segment_writer::SegmentWriter;
+use cesiumdb::{
+    map::Map,
+    segment::Segment,
+    segment_reader::SegmentReader,
+    segment_writer::SegmentWriter,
+};
+use criterion::{
+    BatchSize,
+    BenchmarkId,
+    Criterion,
+    SamplingMode,
+    Throughput,
+    black_box,
+    criterion_group,
+    criterion_main,
+};
+use rand::Rng;
+use tempfile::tempdir;
 
 // Helper function remains the same
 fn create_test_segment() -> (Arc<Segment>, tempfile::TempDir) {
@@ -21,25 +34,19 @@ fn create_test_segment() -> (Arc<Segment>, tempfile::TempDir) {
 
     // Create key map and writer with more space for benchmarking
     let key_path = dir.path().join(format!("bench-key-segment-{}", random_id));
-    let key_map = Arc::new(
-        Map::new(key_path, BLOCK_SIZE as u64 * 100).expect("failed to create key map"),
-    );
+    let key_map =
+        Arc::new(Map::new(key_path, BLOCK_SIZE as u64 * 100).expect("failed to create key map"));
     let key_writer = SegmentWriter::new(key_map.clone()).expect("failed to create key writer");
 
     // Create value map and writer with more space
     let val_path = dir.path().join(format!("bench-val-segment-{}", random_id));
-    let val_map = Arc::new(
-        Map::new(val_path, BLOCK_SIZE as u64 * 100).expect("failed to create val map"),
-    );
+    let val_map =
+        Arc::new(Map::new(val_path, BLOCK_SIZE as u64 * 100).expect("failed to create val map"));
     let val_writer = SegmentWriter::new(val_map.clone()).expect("failed to create val writer");
-
-    // Create segment reader
-    let reader = SegmentReader::new(key_map.clone(), val_map.clone())
-        .expect("failed to create segment reader");
 
     // Create segment with a fixed seed for reproducibility
     let seed = 42i64;
-    let segment = Arc::new(Segment::new(1, 2, seed, key_writer, val_writer, reader));
+    let segment = Arc::new(Segment::new(1, 2, seed, key_writer, val_writer));
 
     (segment, dir)
 }
@@ -200,7 +207,8 @@ fn bench_namespace_switching(c: &mut Criterion) {
             || {
                 // Setup: create segment and prepare kv pairs with the namespace pattern
                 let (segment, dir) = create_test_segment();
-                let kv_pairs = ns_pattern.iter()
+                let kv_pairs = ns_pattern
+                    .iter()
                     .map(|&ns| generate_kv_pair(16, 64, ns as u64))
                     .collect::<Vec<_>>();
 

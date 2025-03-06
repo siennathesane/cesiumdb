@@ -3,6 +3,7 @@
 
 use std::io;
 
+use bytes::Bytes;
 use thiserror::Error;
 
 use crate::segment::BlockType;
@@ -53,18 +54,20 @@ pub enum SegmentError {
     InsufficientSpace,
     #[error("segment must be multiple of 4096")]
     InvalidSize,
-    #[error("can't create frange for {0} block id {1}")]
-    CantCreateFRange(BlockType, u64, FsError),
-    #[error("can't open frange for {0} block id {1}")]
-    CantOpenFRange(BlockType, u64, FsError),
-    #[error("can't read frange for {0} block id {1}")]
-    CantReadFRange(BlockType, u64, FsError),
+    #[error("read-ahead cache size is invalid")]
+    InvalidReadAheadSize,
     #[error("can't create writer for {0} block id {1}")]
     CantCreateWriter(BlockType, u64),
+    #[error("can't create reader")]
+    CantCreateReader,
     #[error("read out of bounds")]
     ReadOutOfBounds,
     #[error("write out of bounds")]
     WriteOutOfBounds,
+    #[error("missing key")]
+    MissingKey,
+    #[error("corrupted block")]
+    CorruptedBlock,
     #[error("io error")]
     IoError(io::Error),
 }

@@ -60,18 +60,12 @@ impl SegmentBuilder {
             | Err(e) => return Err(CantCreateWriter(Value, val_segment_id)),
         };
 
-        let seg_reader = match SegmentReader::new(key_handle.clone(), val_handle.clone()) {
-            | Ok(v) => v,
-            | Err(e) => return Err(e),
-        };
-
         let segment = Arc::new(Segment::new(
             key_segment_id,
             val_segment_id,
             seed,
             key_seg_writer,
             val_seg_writer,
-            seg_reader,
         ));
 
         Ok(segment)
