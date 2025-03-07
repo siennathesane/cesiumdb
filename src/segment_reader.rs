@@ -345,10 +345,6 @@ impl<'a> SegmentReader<'a> {
     ) -> Result<Bytes, SegmentError> {
         // Check if the block index is within bounds
         if val_block_index >= self.visible_val_blocks {
-            println!(
-                "Value block index out of bounds: {} >= {}",
-                val_block_index, self.visible_val_blocks
-            );
             return Err(ReadOutOfBounds);
         }
 
@@ -356,25 +352,18 @@ impl<'a> SegmentReader<'a> {
         let block = match self.read_block_at(val_block_index, Value) {
             | Ok(v) => v,
             | Err(e) => {
-                println!("Error reading value block: {:?}", e);
                 return Err(e);
             },
         };
 
         // Check if the entry exists
         if entry_index >= block.num_entries() as usize {
-            println!(
-                "Entry index out of bounds: {} >= {}",
-                entry_index,
-                block.num_entries()
-            );
             return Err(MissingKey);
         }
 
         let (flag, data) = match block.get(entry_index) {
             | Some(v) => v,
             | None => {
-                println!("Entry not found at index {}", entry_index);
                 return Err(MissingKey);
             },
         };
@@ -395,7 +384,6 @@ impl<'a> SegmentReader<'a> {
 
                 // Check if we have more blocks to read - if not, this is corrupted
                 if current_block_index >= self.visible_val_blocks {
-                    println!("Not enough value blocks to complete multi-block value");
                     return Err(CorruptedBlock);
                 }
 
@@ -404,13 +392,11 @@ impl<'a> SegmentReader<'a> {
                     let next_block = match self.read_block_at(current_block_index, Value) {
                         | Ok(v) => v,
                         | Err(e) => {
-                            println!("Error reading continuation block: {:?}", e);
                             return Err(e);
                         },
                     };
 
                     if next_block.num_entries() == 0 {
-                        println!("Empty continuation block, skipping");
                         current_block_index += 1;
                         continue;
                     }
@@ -418,38 +404,32 @@ impl<'a> SegmentReader<'a> {
                     let (next_flag, next_data) = match next_block.get(0) {
                         | Some(v) => v,
                         | None => {
-                            println!("Failed to get entry from continuation block");
                             return Err(CorruptedBlock);
                         },
                     };
 
                     match next_flag {
                         | EntryFlag::Middle => {
-                            println!("Found Middle chunk at block {}", current_block_index);
                             buffer.extend_from_slice(next_data);
                             current_block_index += 1;
                         },
                         | EntryFlag::End => {
-                            println!("Found End chunk at block {}", current_block_index);
                             buffer.extend_from_slice(next_data);
                             found_end = true;
                         },
                         | _ => {
-                            println!("Invalid flag in continuation block: {:?}", next_flag);
                             return Err(CorruptedBlock);
                         },
                     }
                 }
 
                 if !found_end {
-                    println!("Reached end of blocks without finding End flag");
                     return Err(CorruptedBlock);
                 }
 
                 Ok(buffer.freeze())
             },
             | EntryFlag::Middle | EntryFlag::End => {
-                println!("Invalid starting flag: {:?}", flag);
                 Err(CorruptedBlock)
             },
         }
@@ -1180,7 +1160,6 @@ mod tests {
             block_offset.is_some(),
             "Block for key should be found in index"
         );
-        println!("Block offset for key: {:?}", block_offset);
 
         // Create segment reader
         let reader =
@@ -1189,22 +1168,13 @@ mod tests {
         // Test get with the key
         let result = reader.get(key);
 
-        // Debug info if result is not Some
-        if result.as_ref().is_ok() && result.as_ref().unwrap().is_none() {
-            println!("Reader returned Ok(None) - key not found");
-            println!("Is key in bloom filter? {}", key_index.may_contain(key));
-            println!("Block offset: {:?}", key_index.find_block(key));
-        } else if result.as_ref().is_err() {
-            println!("Reader returned error: {:?}", result.unwrap_err());
-        }
+        assert!(result.is_ok(), "Result should be Ok");
+        let result_value = result.unwrap();
+        assert!(result_value.is_some(), "Value should be found");
 
-        // assert!(result.is_ok(), "Result should be Ok");
-        // let result_value = result.unwrap();
-        // assert!(result_value.is_some(), "Value should be found");
-
-        // let retrieved_value = result_value.unwrap();
-        // assert_eq!(retrieved_value.len(), value.len());
-        // assert_eq!(retrieved_value.as_ref(), value.as_slice());
+        let retrieved_value = result_value.unwrap();
+        assert_eq!(retrieved_value.len(), value.len());
+        assert_eq!(retrieved_value.as_ref(), value.as_slice());
     }
 
     #[test]

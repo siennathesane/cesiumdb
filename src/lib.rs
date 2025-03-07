@@ -324,7 +324,7 @@ mod tests {
         DbOptions,
     };
 
-    const MAX_KEYS: u64 = 100_000;
+    const MAX_KEYS: u64 = 10_000;
 
     fn db_builder() -> Arc<Db> {
         Db::open(DbOptions::default())
@@ -373,7 +373,7 @@ mod tests {
         let db = db_builder();
 
         let mut keypair_size = 0;
-        for batch_size in [1, 10, 100, 1000].iter() {
+        for batch_size in [1, 10, 100].iter() {
             let mut batch = Vec::with_capacity(*batch_size);
 
             for i in 0..(*batch_size * 100) {

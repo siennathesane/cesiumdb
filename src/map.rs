@@ -39,10 +39,14 @@ use crate::errs::{
     SegmentError::IoError,
 };
 
+/// The maximum amount of disk space that can be allocated at once.
+pub const MAX_GROWTH_INCREMENT: u64 = 8 * 1024 * 1024;
+
 pub struct Map {
     inner: AtomicPtr<SyncUnsafeCell<MmapMut>>,
     file: Mutex<File>,
     current_offset: AtomicU64,
+    current_size: AtomicU64,
     resize_lock: Mutex<()>,
 }
 
@@ -62,6 +66,12 @@ impl Map {
             | Ok(_) => {},
             | Err(e) => return Err(IoError(e)),
         };
+
+        let size_metadata = match file.metadata() {
+            Ok(v) => v.len(),
+            Err(e) => return Err(IoError(e)),
+        };
+
         // SAFETY: none, this is an unsafe operation
         let mmap = unsafe {
             match MmapMut::map_mut(&file) {
@@ -74,6 +84,7 @@ impl Map {
             inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
             file: Mutex::new(file),
             current_offset: AtomicU64::new(0),
+            current_size: AtomicU64::new(size_metadata),
             resize_lock: Mutex::new(()),
         })
     }
@@ -87,6 +98,13 @@ impl Map {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
             };
+
+            let size_metadata = match file.metadata() {
+                Ok(v) => v.len(),
+                Err(e) => return Err(IoError(e)),
+            };
+
+            self.current_size.store(size_metadata, Release);
         }
 
         let new_mmap = {
@@ -149,16 +167,15 @@ impl Map {
         unsafe {
             let mmap = &*ptr;
             let inner = &*mmap.get();
-            &inner.advise_range(WillNeed, range.start, range.end - range.start);
+            inner.advise_range(WillNeed, range.start, range.end - range.start);
         }
     }
 
     pub fn len(&self) -> usize {
-        // SAFETY: none, this is an unsafe operation
-        unsafe {
-            let ptr = self.inner.load(Acquire);
-            // please don't ask me to explain this
-            (*(*ptr).get()).len()
+        let fh = self.file.lock();
+        match fh.metadata() {
+            Ok(v) => v.len() as usize,
+            Err(_) => 0,
         }
     }
 
@@ -230,6 +247,17 @@ impl DerefMut for Map {
             let inner = &mut *mmap.get();
             inner
         }
+    }
+}
+
+impl Drop for Map {
+    fn drop(&mut self) {
+        let ptr = self.inner.load(Acquire);
+        // SAFETY: none, this is an unsafe operation
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+        self.file.lock().sync_all();
     }
 }
 

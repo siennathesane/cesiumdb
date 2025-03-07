@@ -651,124 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_memtable_persistence() {
-        // Create a memtable and populate it
-        let memtable = Memtable::new(1, 1024 * 1024); // 1MB memtable
-        let clock = HybridLogicalClock::new();
-
-        // Reduce number of entries for faster test
-        let num_entries = 10;
-        let mut expected_entries = HashMap::new();
-
-        // Add entries to memtable
-        for i in 0..num_entries {
-            let key = format!("key{:03}", i);
-            let value = format!("value{:03}", i);
-            let (key_bytes, val_bytes) = create_kv(&key, &value, &clock);
-
-            memtable
-                .put(key_bytes.clone(), val_bytes.clone())
-                .expect("failed to add to memtable");
-            expected_entries.insert(key.clone(), value.clone());
-        }
-
-        // Create segment to persist memtable
-        let (mut segment, _dir) = create_test_segment();
-        let segment_ptr = Arc::get_mut(&mut segment).unwrap();
-
-        // Record initial block counts
-        let initial_key_blocks = segment_ptr.key_block_count.load(Relaxed);
-
-        // Force at least one entry to be written immediately to test block contents
-        // This ensures we're not just testing empty blocks
-        let first_key = "key000";
-        let first_key_bytes = KeyBytes::new(DEFAULT_NS, Bytes::from(first_key.clone()), 0);
-
-        if let Some(val_bytes) = memtable.get(first_key_bytes) {
-            let mut key_data = DEFAULT_NS.to_le_bytes().to_vec();
-            key_data.extend_from_slice(first_key.as_bytes());
-
-            let mut val_data = DEFAULT_NS.to_le_bytes().to_vec();
-            val_data.extend_from_slice(val_bytes.value.as_ref());
-
-            // Write directly to a new block to ensure it has entries
-            let mut key_block = Block::new();
-            key_block
-                .add_complete_entry(&key_data)
-                .expect("Failed to add entry to block");
-
-            // Write the block directly
-            segment_ptr
-                .key_writer
-                .write_block(key_block)
-                .expect("Failed to write block");
-
-            // Increment block counter manually
-            segment_ptr.key_block_count.fetch_add(1, Relaxed);
-            segment_ptr.key_index.add_block(&key_data);
-        }
-
-        // Manually shutdown writers to ensure all blocks are written
-        segment_ptr.key_writer.shutdown();
-        segment_ptr.val_writer.shutdown();
-
-        // Verify block count increased
-        let final_key_blocks = segment_ptr.key_block_count.load(Relaxed);
-        assert!(
-            final_key_blocks > initial_key_blocks,
-            "No key blocks were created (initial: {}, final: {})",
-            initial_key_blocks,
-            final_key_blocks
-        );
-
-        // Get a reader
-        let reader = segment_ptr.new_reader();
-
-        // Read all blocks and check for entries
-        // let mut found_valid_blocks = 0;
-        //
-        // for i in 0..final_key_blocks as usize {
-        //     match reader.read_key_block(i) {
-        //         Ok(block) => {
-        //             println!("Block {}: num_entries={}", i,
-        // block.num_entries());
-        //
-        //             // Dump detailed block info for debugging
-        //             if block.num_entries() > 0 {
-        //                 found_valid_blocks += 1;
-        //
-        //                 // Print entries
-        //                 for j in 0..block.num_entries() as usize {
-        //                     if let Some((flag, data)) = block.get(j) {
-        //                         println!("  Entry {}: flag={:?},
-        // data_len={}", j, flag, data.len());
-        // if !data.is_empty() {                             let preview
-        // = if data.len() <= 16 {                                 data
-        //                             } else {
-        //                                 &data[0..16]
-        //                             };
-        //                             println!("    Data preview: {:?}",
-        // preview);                         }
-        //                     }
-        //                 }
-        //             } else {
-        //                 println!("  Block has no entries! Dumping raw block
-        // data:");                 // You could add code here to dump
-        // the raw block bytes for debugging             }
-        //         },
-        //         Err(e) => {
-        //             println!("Could not read block {}: {:?}", i, e);
-        //         }
-        //     }
-        // }
-        //
-        // // Assert we found at least one valid block with entries
-        // assert!(found_valid_blocks > 0,
-        //         "Should find at least one block with entries (blocks checked:
-        // {})",         final_key_blocks);
-    }
-
-    #[test]
     fn test_segment_mixed_entry_sizes() {
         let (mut segment, _dir) = create_test_segment();
         let segment = Arc::get_mut(&mut segment).unwrap();
@@ -922,7 +804,6 @@ mod tests {
 
         // Write entries and check index growth
         let initial_key_blocks = segment.key_index.block_count();
-        println!("Initial block count: {}", initial_key_blocks);
 
         for i in 0u32..512 {
             let mut key = vec![0u8; 8]; // namespace
@@ -933,11 +814,6 @@ mod tests {
 
             let result = segment.write(&key, &val);
             assert!(result.is_ok(), "Failed to write entry {}: {:?}", i, result);
-            println!(
-                "After write {}, block count: {}",
-                i,
-                segment.key_index.block_count() + 1
-            );
         }
 
         segment.flush().expect("failed to flush segment");

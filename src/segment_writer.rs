@@ -31,6 +31,7 @@ use crate::{
     map::Map,
     stats::STATS,
 };
+use crate::map::MAX_GROWTH_INCREMENT;
 
 pub struct SegmentWriter {
     pub(crate) map: Arc<Map>,
@@ -45,14 +46,31 @@ impl SegmentWriter {
         })
     }
 
+    fn calculate_new_size(&self, required_size: usize) -> u64 {
+        // start with the minimum required size
+        let mut new_size = required_size as u64;
+
+        // add a growth increment of 4MiB or less
+        let current_size = self.map.len() as u64;
+        if new_size <= current_size + MAX_GROWTH_INCREMENT {
+            // round up to the next multiple of MAX_GROWTH_INCREMENT
+            new_size = new_size.div_ceil(MAX_GROWTH_INCREMENT) * MAX_GROWTH_INCREMENT;
+        } else {
+            // required size is already more than current + 4MiB, just use that exact size
+            // this handles cases where a very large batch of blocks is being written
+        }
+
+        // ensure we don't shrink
+        new_size.max(current_size)
+    }
+
     pub(crate) fn write_block(&mut self, block: Block) -> Result<(), SegmentError> {
         let mut current_offset = self.current_offset.lock();
         let required_size = *current_offset + BLOCK_SIZE;
 
-        // Check if we need to grow the map
+        // check if we need to grow the map
         if required_size > self.map.len() {
-            // Calculate new size with some growth factor (doubling is a common strategy)
-            let new_size = (required_size as u64).max(self.map.len() as u64 * 2);
+            let new_size = self.calculate_new_size(required_size);
             match self.map.grow(new_size) {
                 | Ok(_) => {},
                 | Err(e) => {
@@ -91,10 +109,9 @@ impl SegmentWriter {
         let total_size = blocks.len() * BLOCK_SIZE;
         let required_size = *current_offset + total_size;
 
-        // Check if we need to grow the map
+        // check if we need to grow the map
         if required_size > self.map.len() {
-            // Calculate new size with some growth factor
-            let new_size = (required_size as u64).max(self.map.len() as u64 * 2);
+            let new_size = self.calculate_new_size(required_size);
             match self.map.grow(new_size) {
                 | Ok(_) => {},
                 | Err(e) => {
@@ -125,8 +142,6 @@ impl SegmentWriter {
 
         Ok(())
     }
-
-    pub(crate) fn shutdown(&self) {}
 
     pub(crate) fn current_offset(&self) -> usize {
         *self.current_offset.lock()
@@ -291,7 +306,6 @@ mod tests {
         let writer = Arc::try_unwrap(writer)
             .expect("failed to unwrap Arc")
             .into_inner();
-        writer.shutdown();
         drop(writer);
 
         // verify the map has enough data (we can't verify exact content due to thread
