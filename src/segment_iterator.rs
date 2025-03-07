@@ -89,7 +89,6 @@ impl<'a> SeekingBlockIterator<'a> {
         if block_index >= self.end {
             return Err(ReadOutOfBounds);
         }
-        self.reader.clear_cache();
         self.current = block_index;
         Ok(())
     }
@@ -454,16 +453,8 @@ mod tests {
                 .expect("Failed to write value block");
         }
 
-        let reader = SegmentReader::with_visibility(
-            key_map,
-            val_map,
-            key_index,
-            val_index,
-            num_key_blocks,
-            num_val_blocks,
-            ReadConfig::default(),
-        )
-        .expect("Failed to create segment reader");
+        let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
+            .expect("Failed to create segment reader");
 
         (reader, dir)
     }
@@ -594,16 +585,8 @@ mod tests {
         val_index.add_item(&multi_key);
         val_index.add_block(&multi_key);
 
-        let reader = SegmentReader::with_visibility(
-            key_map,
-            val_map,
-            key_index,
-            val_index,
-            3, // 3 key blocks
-            3, // 3 value blocks
-            ReadConfig::default(),
-        )
-        .expect("Failed to create segment reader");
+        let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
+            .expect("Failed to create segment reader");
 
         (reader, dir)
     }
@@ -683,16 +666,8 @@ mod tests {
             val_index.add_block(&full_key);
         }
 
-        let reader = SegmentReader::with_visibility(
-            key_map,
-            val_map,
-            key_index,
-            val_index,
-            test_keys.len(),
-            test_keys.len(),
-            ReadConfig::default(),
-        )
-        .expect("Failed to create segment reader");
+        let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
+            .expect("Failed to create segment reader");
 
         (reader, dir)
     }

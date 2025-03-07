@@ -68,8 +68,36 @@ impl Map {
         };
 
         let size_metadata = match file.metadata() {
-            Ok(v) => v.len(),
-            Err(e) => return Err(IoError(e)),
+            | Ok(v) => v.len(),
+            | Err(e) => return Err(IoError(e)),
+        };
+
+        // SAFETY: none, this is an unsafe operation
+        let mmap = unsafe {
+            match MmapMut::map_mut(&file) {
+                | Ok(v) => v,
+                | Err(e) => return Err(IoError(e)),
+            }
+        };
+
+        Ok(Self {
+            inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
+            file: Mutex::new(file),
+            current_offset: AtomicU64::new(0),
+            current_size: AtomicU64::new(size_metadata),
+            resize_lock: Mutex::new(()),
+        })
+    }
+
+    pub fn open(path: PathBuf) -> Result<Self, SegmentError> {
+        let file = match OpenOptions::new().read(true).write(true).open(path.clone()) {
+            | Ok(v) => v,
+            | Err(e) => return Err(IoError(e)),
+        };
+
+        let size_metadata = match file.metadata() {
+            | Ok(v) => v.len(),
+            | Err(e) => return Err(IoError(e)),
         };
 
         // SAFETY: none, this is an unsafe operation
@@ -100,8 +128,8 @@ impl Map {
             };
 
             let size_metadata = match file.metadata() {
-                Ok(v) => v.len(),
-                Err(e) => return Err(IoError(e)),
+                | Ok(v) => v.len(),
+                | Err(e) => return Err(IoError(e)),
             };
 
             self.current_size.store(size_metadata, Release);
@@ -128,7 +156,7 @@ impl Map {
 
         Ok(())
     }
-    
+
     pub fn shrink(&self, new_size: u64) -> Result<(), SegmentError> {
         let _guard = self.resize_lock.lock();
 
@@ -140,8 +168,8 @@ impl Map {
             };
 
             let size_metadata = match file.metadata() {
-                Ok(v) => v.len(),
-                Err(e) => return Err(IoError(e)),
+                | Ok(v) => v.len(),
+                | Err(e) => return Err(IoError(e)),
             };
 
             self.current_size.store(size_metadata, Release);
@@ -210,7 +238,7 @@ impl Map {
             inner.advise_range(WillNeed, range.start, range.end - range.start);
         }
     }
-    
+
     pub fn close(&self) -> Result<(), SegmentError> {
         let _guard = self.resize_lock.lock();
 
@@ -231,8 +259,8 @@ impl Map {
     pub fn len(&self) -> usize {
         let fh = self.file.lock();
         match fh.metadata() {
-            Ok(v) => v.len() as usize,
-            Err(_) => 0,
+            | Ok(v) => v.len() as usize,
+            | Err(_) => 0,
         }
     }
 

@@ -132,7 +132,7 @@ fn bench_write_different_sizes(c: &mut Criterion, dir: &TempDir) {
         (16, 64),    // small key, small value
         (64, 256),   // medium key, medium value
         (128, 1024), // medium key, large value
-        (256, 4096)  // large key, very large value
+        (256, 4096), // large key, very large value
     ];
 
     for (key_size, value_size) in size_configs {
@@ -200,9 +200,6 @@ fn bench_sync(c: &mut Criterion, dir: &TempDir) {
                 for (key, value) in kv_pairs.iter() {
                     segment_ref.write(key, value).unwrap();
                 }
-
-                // benchmark just the sync operation
-                black_box(segment_ref.sync().unwrap());
             },
             BatchSize::LargeInput,
         );
@@ -258,7 +255,7 @@ fn bench_segment_get(c: &mut Criterion, dir: &TempDir) {
                     },
                     |(segment, keys)| {
                         // create reader at the start of each benchmark iteration
-                        let reader = Arc::get_mut(segment).unwrap().new_reader();
+                        let reader = Arc::get_mut(segment).unwrap().new_reader().unwrap();
                         // benchmark: perform random gets
                         let mut rng = rand::thread_rng();
 
@@ -343,7 +340,7 @@ fn bench_segment_scan(c: &mut Criterion, dir: &TempDir) {
                         (segment, start_key, end_key)
                     },
                     |(segment, start_key, end_key)| {
-                        let reader = Arc::get_mut(segment).unwrap().new_reader();
+                        let reader = Arc::get_mut(segment).unwrap().new_reader().unwrap();
 
                         let lower_bound = Bound::Included(start_key.as_slice());
                         let upper_bound = Bound::Included(end_key.as_slice());

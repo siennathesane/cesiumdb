@@ -71,10 +71,6 @@ pub struct SegmentReader<'a> {
     pub(crate) visible_key_blocks: usize,
     visible_val_blocks: usize,
     pub(crate) num_blocks: usize,
-    config: ReadConfig,
-    // Caches for read-ahead blocks using a fixed-size queue
-    key_cache: ArrayQueue<(usize, Block)>, // (block_index, block)
-    val_cache: ArrayQueue<(usize, Block)>, // (block_index, block)
 }
 
 impl<'a> SegmentReader<'a> {
@@ -123,40 +119,6 @@ impl<'a> SegmentReader<'a> {
             visible_key_blocks,
             visible_val_blocks,
             num_blocks,
-            key_cache: ArrayQueue::new(config.read_ahead),
-            val_cache: ArrayQueue::new(config.read_ahead),
-            config,
-        })
-    }
-
-    pub(crate) fn with_visibility(
-        key_handle: Arc<Map>,
-        val_handle: Arc<Map>,
-        key_index: &'a Index,
-        val_index: &'a Index,
-        visible_key_blocks: usize,
-        visible_val_blocks: usize,
-        config: ReadConfig,
-    ) -> Result<Self, SegmentError> {
-        let segment_size = key_handle.len();
-
-        if segment_size % BLOCK_SIZE != 0 {
-            return Err(InvalidSize);
-        }
-
-        let num_blocks = segment_size / BLOCK_SIZE;
-
-        Ok(Self {
-            key_handle,
-            val_handle,
-            key_index,
-            val_index,
-            visible_key_blocks,
-            visible_val_blocks,
-            num_blocks,
-            key_cache: ArrayQueue::new(config.read_ahead),
-            val_cache: ArrayQueue::new(config.read_ahead),
-            config,
         })
     }
 
@@ -236,41 +198,9 @@ impl<'a> SegmentReader<'a> {
             return Err(ReadOutOfBounds);
         }
 
-        // Check cache first and collect any blocks we may want to keep
-        let mut found_block = None;
-        let mut keep_blocks = Vec::new();
-
-        while let Some((idx, block)) = self.key_cache.pop() {
-            if idx == block_index {
-                found_block = Some(block);
-            } else if idx > block_index && idx < block_index + self.config.read_ahead {
-                // Keep blocks that are within our read-ahead window
-                keep_blocks.push((idx, block));
-            }
-        }
-
-        // If we found our block, restore kept blocks and return
-        if let Some(block) = found_block {
-            // Restore kept blocks to cache
-            for b in keep_blocks {
-                let _ = self.key_cache.push(b);
-            }
-            match self.fill_cache(block_index + 1, Key) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
-            };
-            return Ok(block);
-        }
-
         // Read the requested block
         let block = match self.read_block_at(block_index, Key) {
             | Ok(v) => v,
-            | Err(e) => return Err(e),
-        };
-
-        // Fill read-ahead cache
-        match self.fill_cache(block_index + 1, Key) {
-            | Ok(_) => {},
             | Err(e) => return Err(e),
         };
 
@@ -429,9 +359,7 @@ impl<'a> SegmentReader<'a> {
 
                 Ok(buffer.freeze())
             },
-            | EntryFlag::Middle | EntryFlag::End => {
-                Err(CorruptedBlock)
-            },
+            | EntryFlag::Middle | EntryFlag::End => Err(CorruptedBlock),
         }
     }
 
@@ -496,10 +424,6 @@ impl<'a> SegmentReader<'a> {
         Err(ReadOutOfBounds)
     }
 
-    pub fn refresh(&mut self) {
-        self.clear_cache();
-    }
-
     pub(crate) fn visible_blocks(&self) -> (usize, usize) {
         (self.visible_key_blocks, self.visible_val_blocks)
     }
@@ -543,57 +467,6 @@ impl<'a> SegmentReader<'a> {
         Ok(block)
     }
 
-    /// Fill the read-ahead cache starting from the given block index
-    fn fill_cache(&self, start_index: usize, block_type: BlockType) -> Result<(), SegmentError> {
-        // Clear old cache entries
-        while self.key_cache.pop().is_some() {}
-
-        // warn the kernel ahead of time that we're about to preload some blocks
-        // this is the preloading of the read-ahead 😅
-        match block_type {
-            | key => {
-                self.key_handle
-                    .warn(start_index..start_index + (self.config.read_ahead * BLOCK_SIZE));
-                for idx in start_index..self.num_blocks.min(start_index + self.config.read_ahead) {
-                    match self.read_block_at(idx, Key) {
-                        | Ok(block) => {
-                            // If push fails, cache is full, so we can stop
-                            if self.key_cache.push((idx, block)).is_err() {
-                                break;
-                            }
-                        },
-                        | Err(e) => {
-                            // Clear cache on error but don't fail the operation
-                            while self.key_cache.pop().is_some() {}
-                            return Err(e);
-                        },
-                    }
-                }
-            },
-            | value => {
-                self.val_handle
-                    .warn(start_index..start_index + (self.config.read_ahead * BLOCK_SIZE));
-                for idx in start_index..self.num_blocks.min(start_index + self.config.read_ahead) {
-                    match self.read_block_at(idx, Value) {
-                        | Ok(block) => {
-                            // If push fails, cache is full, so we can stop
-                            if self.key_cache.push((idx, block)).is_err() {
-                                break;
-                            }
-                        },
-                        | Err(e) => {
-                            // Clear cache on error but don't fail the operation
-                            while self.key_cache.pop().is_some() {}
-                            return Err(e);
-                        },
-                    }
-                }
-            },
-        }
-
-        Ok(())
-    }
-
     /// Create a new iterator to scan a range of keys in the segment.
     ///
     /// * `lower_bound` - The lower bound of the key range (inclusive if
@@ -624,24 +497,6 @@ impl<'a> SegmentReader<'a> {
     #[inline]
     pub(crate) fn num_blocks(&self) -> usize {
         self.num_blocks
-    }
-
-    /// Clear the read-ahead cache
-    pub(crate) fn clear_cache(&mut self) {
-        while self.key_cache.pop().is_some() {}
-    }
-
-    /// Update the reader configuration
-    pub(crate) fn set_config(&mut self, config: ReadConfig) {
-        // Create new cache with updated capacity
-        let new_cache = ArrayQueue::new(config.read_ahead + 1);
-        self.key_cache = new_cache;
-        self.config = config;
-    }
-
-    /// Get a reference to the current configuration
-    pub(crate) fn config(&self) -> &ReadConfig {
-        &self.config
     }
 }
 
@@ -741,30 +596,6 @@ mod tests {
 
         let reader = reader.unwrap();
         assert_eq!(reader.num_blocks(), 4);
-        assert_eq!(reader.config().read_ahead, 4); // Default value
-    }
-
-    #[test]
-    fn test_with_config() {
-        let size = BLOCK_SIZE * 4;
-        let (_dir, key_map) = create_test_map(size);
-        let (_dir2, val_map) = create_test_map(size);
-
-        let config = ReadConfig { read_ahead: 3 };
-        let key_index = Index::new(1, 1234);
-        let val_index = Index::new(1, 1234);
-
-        let reader = SegmentReader::with_config(
-            key_map.clone(),
-            val_map.clone(),
-            &key_index,
-            &val_index,
-            config,
-        );
-
-        assert!(reader.is_ok());
-        let reader = reader.unwrap();
-        assert_eq!(reader.config().read_ahead, 3);
     }
 
     #[test]
@@ -863,56 +694,6 @@ mod tests {
             let block = reader.read_key_block(idx).unwrap();
             assert_eq!(block.get(0).unwrap().1, &vec![idx as u8; 16]);
         }
-    }
-
-    #[test]
-    fn test_clear_cache() {
-        let (_, key_map) = prepare_blocks_map(4);
-        let (_, val_map) = prepare_blocks_map(4);
-
-        let key_index = Index::new(1, 1234);
-        let val_index = Index::new(1, 1234);
-
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
-
-        // Read a block to fill cache
-        reader.read_key_block(0).unwrap();
-
-        // Clear cache
-        reader.clear_cache();
-
-        // Cache should be empty, but this shouldn't affect functionality
-        let block = reader.read_key_block(1).unwrap();
-        assert_eq!(block.get(0).unwrap().1, &vec![1u8; 16]);
-    }
-
-    #[test]
-    fn test_set_config() {
-        let (_, key_map) = prepare_blocks_map(4);
-        let (_, val_map) = prepare_blocks_map(4);
-
-        let key_index = Index::new(1, 1234);
-        let val_index = Index::new(1, 1234);
-
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
-
-        // Change read-ahead configuration
-        let new_config = ReadConfig { read_ahead: 1 };
-        reader.set_config(new_config);
-
-        assert_eq!(reader.config().read_ahead, 1);
-
-        // With read-ahead of 1, only the next block should be cached
-        reader.read_key_block(0).unwrap();
-
-        // Block 1 should be cached
-        let block1 = reader.read_key_block(1).unwrap();
-        assert_eq!(block1.get(0).unwrap().1, &vec![1u8; 16]);
-
-        // Block 3 shouldn't be in cache since read-ahead is only 1
-        reader.read_key_block(3).unwrap();
     }
 
     #[test]
@@ -1325,42 +1106,5 @@ mod tests {
         let result3 = reader.get(key3).unwrap();
         assert!(result3.is_some());
         assert_eq!(result3.unwrap().as_ref(), val3);
-    }
-
-    #[test]
-    fn test_get_error_handling() {
-        let (dir, key_map, val_map, mut key_index, mut val_index) = prepare_test_segment_for_get();
-
-        // create test key that's in the index but points to non-existent block
-        let key = b"test_key";
-
-        // add to indexes but don't write any blocks
-        key_index.add_item(key);
-        key_index.add_block(key);
-        val_index.add_item(key);
-        val_index.add_block(key);
-
-        // Create reader with visibility reduced (simulating read out of bounds)
-        let reader = SegmentReader::with_visibility(
-            key_map.clone(),
-            val_map.clone(),
-            &key_index,
-            &val_index,
-            0, // no visible key blocks
-            0, // no visible value blocks
-            ReadConfig::default(),
-        )
-        .unwrap();
-
-        // The result should be an error, but it might be different depending on
-        // implementation details
-        let result = reader.get(key);
-        assert!(
-            result.is_err(),
-            "Should return an error with no visible blocks"
-        );
-
-        // Don't assert specific error type as implementation details might vary
-        println!("Error type received: {:?}", result.err());
     }
 }

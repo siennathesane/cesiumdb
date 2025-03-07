@@ -72,6 +72,8 @@ pub enum SegmentError {
     Closing,
     #[error("segment is not closing")]
     NotClosing,
+    #[error("segment is read-only")]
+    ReadOnly,
     #[error("io error")]
     IoError(io::Error),
 }

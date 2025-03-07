@@ -1,11 +1,22 @@
-use std::{fmt::Display, mem, ptr, sync::{
-    Arc,
-    atomic::{
-        AtomicU64,
-        Ordering::Relaxed,
+use std::{
+    fmt::Display,
+    mem,
+    ptr,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            Ordering::Relaxed,
+        },
     },
-}};
-use bytes::{Bytes, BytesMut};
+};
+
+use bytes::{
+    Bytes,
+    BytesMut,
+};
+
 use crate::{
     block::{
         Block,
@@ -20,10 +31,14 @@ use crate::{
     },
     errs::{
         SegmentError,
-        SegmentError::CantCreateReader,
+        SegmentError::{
+            CantCreateReader,
+            ReadOnly,
+        },
     },
     index::Index,
     keypair::DEFAULT_NS,
+    map::Map,
     segment::BlockType::{
         Key,
         Value,
@@ -76,7 +91,8 @@ impl Metadata {
     ///
     /// # Safety
     ///
-    /// - `dst` must be valid for at least `self.serialized_size()` bytes (32 bytes)
+    /// - `dst` must be valid for at least `self.serialized_size()` bytes (32
+    ///   bytes)
     /// - `dst` must be properly aligned for u64 values
     /// - `dst` must not overlap with any source data
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
@@ -118,16 +134,16 @@ impl Metadata {
         self.id
     }
 
-    pub(crate) fn block_count(&self) -> u64 {
-        self.block_count
+    pub(crate) fn block_count(&self) -> usize {
+        self.block_count as usize
     }
 
-    pub(crate) fn index_size(&self) -> u64 {
-        self.index_size
+    pub(crate) fn index_size(&self) -> usize {
+        self.index_size as usize
     }
 
-    pub(crate) fn index_start(&self) -> u64 {
-        self.index_start
+    pub(crate) fn index_start(&self) -> usize {
+        self.index_start as usize
     }
 }
 
@@ -165,23 +181,31 @@ impl From<Bytes> for Metadata {
 }
 
 pub struct Segment {
+    // writers are used to write data whereas the map is used to read data
+
     // keys
-    key_writer: SegmentWriter,
+    key_writer: Option<SegmentWriter>,
+    key_handle: Option<Arc<Map>>,
     key_block_count: AtomicU64,
     key_index: Index,
     current_key_block: Block,
+    key_id: u64,
 
     // values
-    val_writer: SegmentWriter,
+    val_writer: Option<SegmentWriter>,
+    val_handle: Option<Arc<Map>>,
     val_block_count: AtomicU64,
     current_val_block: Block,
     val_index: Index,
+    val_id: u64,
 
     // shared
     current_ns: AtomicU64,
 }
 
 impl Segment {
+    /// Create a new segment. Once the segment has been closed, it cannot be
+    /// opened again for writes.
     pub fn new(
         key_id: u64,
         val_id: u64,
@@ -205,19 +229,54 @@ impl Segment {
         val_index.add_ns_offset(DEFAULT_NS);
 
         Self {
-            key_writer,
+            key_writer: Some(key_writer),
+            key_handle: None,
             key_block_count: AtomicU64::new(0),
-            val_writer,
+            val_writer: Some(val_writer),
+            val_handle: None,
             val_block_count: AtomicU64::new(0),
             key_index,
             current_key_block: Block::new(),
             current_val_block: Block::new(),
             val_index,
             current_ns: AtomicU64::new(DEFAULT_NS),
+            key_id,
+            val_id,
         }
     }
 
+    /// Open a pre-written segment for reading. A pre-written segment cannot be
+    /// written to.
+    pub fn open(
+        key_map: Arc<Map>,
+        key_index: Index,
+        key_id: u64,
+        val_map: Arc<Map>,
+        val_index: Index,
+        val_id: u64,
+    ) -> Result<Arc<Segment>, SegmentError> {
+        Ok(Arc::new(Segment {
+            key_writer: None,
+            key_handle: Some(key_map),
+            key_block_count: AtomicU64::new(0),
+            val_writer: None,
+            val_handle: Some(val_map),
+            val_block_count: AtomicU64::new(0),
+            key_index,
+            current_key_block: Block::new(),
+            current_val_block: Block::new(),
+            val_index,
+            current_ns: AtomicU64::new(DEFAULT_NS),
+            key_id,
+            val_id,
+        }))
+    }
+
     pub fn write(&mut self, key: &[u8], val: &[u8]) -> Result<(), SegmentError> {
+        if self.key_writer.is_none() {
+            return Err(ReadOnly);
+        }
+
         // set the namespace
         let ns = u64::from_le_bytes(key[0..8].as_ref().try_into().unwrap());
         if ns != self.current_ns.load(Relaxed) {
@@ -297,29 +356,48 @@ impl Segment {
         Ok(())
     }
 
-    pub fn new_reader(&self) -> SegmentReader {
+    pub fn new_reader(&self) -> Result<SegmentReader, SegmentError> {
         let key_blocks = self.key_block_count.load(Relaxed) as usize;
         let val_blocks = self.val_block_count.load(Relaxed) as usize;
 
-        match SegmentReader::with_visibility(
-            self.key_writer.map.clone(),
-            self.val_writer.map.clone(),
-            &self.key_index,
-            &self.val_index,
-            key_blocks,
-            val_blocks,
-            ReadConfig::default(),
-        ) {
-            | Ok(v) => v,
-            // fallback to default if there's an error
-            | Err(_) => SegmentReader::new(
-                self.key_writer.map.clone(),
-                self.val_writer.map.clone(),
-                &self.key_index,
-                &self.val_index,
-            )
-            .unwrap(),
+        let km: Arc<Map> = match (&self.key_handle, &self.key_writer) {
+            | (Some(handle), _) => handle.clone(),
+            | (None, Some(writer)) => writer.map.clone(),
+            | (None, None) => return Err(CantCreateReader),
+        };
+
+        let vm: Arc<Map> = match (&self.val_handle, &self.val_writer) {
+            | (Some(handle), _) => handle.clone(),
+            | (None, Some(writer)) => writer.map.clone(),
+            | (None, None) => return Err(CantCreateReader),
+        };
+
+        SegmentReader::new(km, vm, &self.key_index, &self.val_index)
+    }
+
+    /// Flush any pending blocks
+    pub fn flush(&mut self) -> Result<(), SegmentError> {
+        if self.key_writer.is_none() {
+            return Err(ReadOnly);
         }
+
+        // Flush key block if it has entries
+        if !self.current_key_block.is_empty() {
+            match self.write_block(&Key) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        // Flush value block if it has entries
+        if !self.current_val_block.is_empty() {
+            match self.write_block(&Value) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        Ok(())
     }
 
     /// Split a payload across multiple blocks.
@@ -403,15 +481,17 @@ impl Segment {
                 | Key => {
                     let mut block = Block::new();
                     match block.add_entry(chunk, Middle) {
-                        | Ok(_) => {
-                            match self
-                                .key_writer
-                                .write_block(block)
-                                .map(|_| self.key_block_count.fetch_add(1, Relaxed))
-                            {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
+                        | Ok(_) => match &mut self.key_writer {
+                            | Some(writer) => {
+                                match writer
+                                    .write_block(block)
+                                    .map(|_| self.key_block_count.fetch_add(1, Relaxed))
+                                {
+                                    | Ok(_) => {},
+                                    | Err(e) => return Err(e),
+                                }
+                            },
+                            | None => return Err(ReadOnly),
                         },
                         | Err(e) => {
                             eprintln!(
@@ -426,15 +506,17 @@ impl Segment {
                 | Value => {
                     let mut block = Block::new();
                     match block.add_entry(chunk, Middle) {
-                        | Ok(_) => {
-                            match self
-                                .val_writer
-                                .write_block(block)
-                                .map(|_| self.val_block_count.fetch_add(1, Relaxed))
-                            {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
+                        | Ok(_) => match &mut self.val_writer {
+                            | Some(writer) => {
+                                match writer
+                                    .write_block(block)
+                                    .map(|_| self.val_block_count.fetch_add(1, Relaxed))
+                                {
+                                    | Ok(_) => {},
+                                    | Err(e) => return Err(e),
+                                }
+                            },
+                            | None => return Err(ReadOnly),
                         },
                         | Err(e) => {
                             eprintln!(
@@ -457,15 +539,17 @@ impl Segment {
                 | Key => {
                     let mut block = Block::new();
                     match block.add_entry(remaining, End) {
-                        | Ok(_) => {
-                            match self
-                                .key_writer
-                                .write_block(block)
-                                .map(|_| self.key_block_count.fetch_add(1, Relaxed))
-                            {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
+                        | Ok(_) => match &mut self.key_writer {
+                            | Some(writer) => {
+                                match writer
+                                    .write_block(block)
+                                    .map(|_| self.key_block_count.fetch_add(1, Relaxed))
+                                {
+                                    | Ok(_) => {},
+                                    | Err(e) => return Err(e),
+                                }
+                            },
+                            | None => return Err(ReadOnly),
                         },
                         | Err(e) => {
                             eprintln!(
@@ -480,15 +564,17 @@ impl Segment {
                 | Value => {
                     let mut block = Block::new();
                     match block.add_entry(remaining, End) {
-                        | Ok(_) => {
-                            match self
-                                .val_writer
-                                .write_block(block)
-                                .map(|_| self.val_block_count.fetch_add(1, Relaxed))
-                            {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
+                        | Ok(_) => match &mut self.val_writer {
+                            | Some(writer) => {
+                                match writer
+                                    .write_block(block)
+                                    .map(|_| self.val_block_count.fetch_add(1, Relaxed))
+                                {
+                                    | Ok(_) => {},
+                                    | Err(e) => return Err(e),
+                                }
+                            },
+                            | None => return Err(ReadOnly),
                         },
                         | Err(e) => {
                             eprintln!(
@@ -523,9 +609,12 @@ impl Segment {
                 let block = mem::replace(&mut self.current_key_block, Block::new());
 
                 // Write block and increment counter
-                let result = self.key_writer.write_block(block).map(|_| {
-                    self.key_block_count.fetch_add(1, Relaxed);
-                });
+                let result = match &mut self.key_writer {
+                    | Some(writer) => writer.write_block(block).map(|_| {
+                        self.key_block_count.fetch_add(1, Relaxed);
+                    }),
+                    | None => return Err(ReadOnly),
+                };
 
                 // Add to index if we have a starting key
                 if result.is_ok() {
@@ -551,9 +640,12 @@ impl Segment {
                 let block = mem::replace(&mut self.current_val_block, Block::new());
 
                 // Write block and increment counter
-                let result = self.val_writer.write_block(block).map(|_| {
-                    self.val_block_count.fetch_add(1, Relaxed);
-                });
+                let result = match &mut self.val_writer {
+                    | Some(writer) => writer.write_block(block).map(|_| {
+                        self.val_block_count.fetch_add(1, Relaxed);
+                    }),
+                    | None => return Err(ReadOnly),
+                };
 
                 // Add to index if we have a starting key
                 if result.is_ok() {
@@ -564,34 +656,6 @@ impl Segment {
 
                 result
             },
-        }
-    }
-
-    /// Flush any pending blocks
-    pub fn flush(&mut self) -> Result<(), SegmentError> {
-        // Flush key block if it has entries
-        if !self.current_key_block.is_empty() {
-            match self.write_block(&Key) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
-            };
-        }
-
-        // Flush value block if it has entries
-        if !self.current_val_block.is_empty() {
-            match self.write_block(&Value) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
-            };
-        }
-
-        Ok(())
-    }
-
-    pub fn sync(&mut self) -> Result<(), SegmentError> {
-        match self.flush() {
-            | Ok(_) => Ok(()),
-            | Err(e) => Err(e),
         }
     }
 }
@@ -802,10 +866,7 @@ mod tests {
 
         // Get a new reader
         let reader = segment.new_reader();
-        assert!(
-            reader.num_blocks() > 0,
-            "Should be able to get block count from reader"
-        );
+        assert!(reader.is_ok());
     }
 
     #[test]

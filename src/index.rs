@@ -1,4 +1,8 @@
-use std::{hash::RandomState, ptr, sync::Arc};
+use std::{
+    hash::RandomState,
+    ptr,
+    sync::Arc,
+};
 
 use bloom2::{
     Bloom2,
@@ -225,7 +229,9 @@ impl Index {
 
         // write block_starting_keys_hash_offsets_size
         ptr::copy_nonoverlapping(
-            self.block_starting_keys_hash_offsets_size.to_le_bytes().as_ptr(),
+            self.block_starting_keys_hash_offsets_size
+                .to_le_bytes()
+                .as_ptr(),
             dst.add(offset),
             size_of::<u64>(),
         );
@@ -264,15 +270,11 @@ impl Index {
 
         // write bloom_filter data
         if !bloom_data.is_empty() {
-            ptr::copy_nonoverlapping(
-                bloom_data.as_ptr(),
-                dst.add(offset),
-                bloom_data.len(),
-            );
+            ptr::copy_nonoverlapping(bloom_data.as_ptr(), dst.add(offset), bloom_data.len());
         }
     }
 
-    /// Serializes the index to a Bytes object. 
+    /// Serializes the index to a Bytes object.
     fn to_bytes(&self) -> Bytes {
         let size = self.serialized_size();
         let mut buffer = BytesMut::with_capacity(size);
@@ -350,15 +352,15 @@ impl From<Bytes> for Index {
         );
 
         // extract bloom filter data
-        let bloom_data =
-            if bloom_filter_offset as usize + bloom_filter_size as usize <= value.len() {
-                Bytes::copy_from_slice(
-                    &value[bloom_filter_offset as usize..
-                        bloom_filter_offset as usize + bloom_filter_size as usize],
-                )
-            } else {
-                Bytes::new()
-            };
+        let bloom_data = if bloom_filter_offset as usize + bloom_filter_size as usize <= value.len()
+        {
+            Bytes::copy_from_slice(
+                &value[bloom_filter_offset as usize..
+                    bloom_filter_offset as usize + bloom_filter_size as usize],
+            )
+        } else {
+            Bytes::new()
+        };
 
         // recreate the bloom filter
         let hasher = SeedableHasher::new(bloom_filter_seed);
@@ -699,7 +701,7 @@ mod tests {
         let expected_block_count = 10;
         assert_eq!(index.block_count(), expected_block_count);
         assert_eq!(index.ns_offset_count(), expected_block_count);
-        
+
         let block_count = index.block_count();
         let ns_offset_count = index.ns_offset_count();
 
