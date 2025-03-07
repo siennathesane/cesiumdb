@@ -658,11 +658,71 @@ impl Segment {
             },
         }
     }
+    
+    fn close(&mut self) -> Result<(), SegmentError> {
+        if self.key_writer.is_none() {
+            return Err(ReadOnly);
+        }
+        
+        match self.flush() {
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
+        }
+
+        
+        if let Some(writer) = &self.key_writer {
+            let index_size = self.key_index.serialized_size();
+            let index_start = match writer.write_index(&self.key_index) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            };
+            match writer.write_metadata(Metadata::new(
+                self.key_id,
+                self.key_block_count.load(Relaxed),
+                index_size as u64,
+                index_start,
+            )) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+            match writer.close() {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        if let Some(writer) = &self.val_writer {
+            let index_size = self.val_index.serialized_size();
+            let index_start = match writer.write_index(&self.val_index) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            };
+            match writer.write_metadata(Metadata::new(
+                self.key_id,
+                self.key_block_count.load(Relaxed),
+                index_size as u64,
+                index_start,
+            )) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+            match writer.close() {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        let _ = self.flush();
+        let res = self.close();
+        if let Err(e) = res {
+            // TODO(@siennathesane): log this error instead of panicking
+            panic!("Failed to close segment: {:?}", e);
+        }
     }
 }
 

@@ -168,7 +168,7 @@ impl SegmentWriter {
 
     /// Write the index to the map. Once the index has been written, no more
     /// blocks can be written.
-    pub(crate) fn write_index(&self, index: Index) -> Result<(), SegmentError> {
+    pub(crate) fn write_index(&self, index: &Index) -> Result<u64, SegmentError> {
         self.closing.store(true, Relaxed);
 
         let mut current_offset = self.current_offset.lock();
@@ -185,6 +185,7 @@ impl SegmentWriter {
             };
         }
 
+        let index_start = *current_offset;
         let index_range = *current_offset..(*current_offset + index_size);
 
         // SAFETY: We know the block is exactly BLOCK_SIZE bytes, and we also know the
@@ -200,7 +201,7 @@ impl SegmentWriter {
 
         *current_offset += index_size;
 
-        Ok(())
+        Ok(index_start as u64)
     }
 
     pub(crate) fn write_metadata(&self, metadata: Metadata) -> Result<(), SegmentError> {
