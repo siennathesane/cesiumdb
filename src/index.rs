@@ -1,7 +1,4 @@
-use std::{
-    hash::RandomState,
-    sync::Arc,
-};
+use std::{hash::RandomState, ptr, sync::Arc};
 
 use bloom2::{
     Bloom2,
@@ -140,7 +137,154 @@ impl Index {
         self.ns_offset_size
     }
 
-    // internal methods that were previously in BlockIndex
+    /// Returns the total size in bytes this index will occupy when serialized.
+    pub fn serialized_size(&self) -> usize {
+        let bloom_size = self.active_bloom.bitmap().clone().freeze().len() as u64;
+
+        // calculate offsets for the serialized layout
+        let header_size = 56; // 7 u64/i64 fields at 8 bytes each
+        let block_starting_keys_offset = header_size;
+        let block_offsets_offset =
+            block_starting_keys_offset + self.block_starting_keys_hash_offsets_size;
+        let ns_offsets_offset = block_offsets_offset + (self.block_offset_size * 8);
+        let bloom_filter_offset = ns_offsets_offset + (self.ns_offset_size * 8);
+
+        (bloom_filter_offset + bloom_size) as usize
+    }
+
+    /// Finalizes the Index by writing it directly to a memory location.
+    ///
+    /// # Safety
+    ///
+    /// - `dst` must be valid for at least `self.serialized_size()` bytes
+    /// - `dst` must be properly aligned
+    /// - `dst` must not overlap with any source data
+    pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
+        // calculate offsets for serialized layout
+        let header_size = 56; // 7 u64/i64 fields at 8 bytes each
+        let block_starting_keys_offset = header_size;
+        let block_offsets_offset =
+            block_starting_keys_offset + self.block_starting_keys_hash_offsets_size;
+        let ns_offsets_offset = block_offsets_offset + (self.block_offset_size * 8);
+        let bloom_filter_offset = ns_offsets_offset + (self.ns_offset_size * 8);
+
+        // get bloom filter data
+        let bloom_data = self.active_bloom.bitmap().clone().freeze();
+        let bloom_size = bloom_data.len() as u64;
+
+        // write header fields
+        let mut offset = 0;
+
+        // write id
+        ptr::copy_nonoverlapping(
+            self.id.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // write bloom_filter_seed
+        ptr::copy_nonoverlapping(
+            self.bloom_filter_seed.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<i64>(),
+        );
+        offset += size_of::<i64>();
+
+        // write bloom_size
+        ptr::copy_nonoverlapping(
+            bloom_size.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // write bloom_filter_offset
+        ptr::copy_nonoverlapping(
+            bloom_filter_offset.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // write ns_offset_size
+        ptr::copy_nonoverlapping(
+            self.ns_offset_size.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // write block_offset_size
+        ptr::copy_nonoverlapping(
+            self.block_offset_size.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // write block_starting_keys_hash_offsets_size
+        ptr::copy_nonoverlapping(
+            self.block_starting_keys_hash_offsets_size.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // write data sections
+        // write block_starting_key_hash_offsets
+        if !self.block_starting_key_hash_offsets.is_empty() {
+            ptr::copy_nonoverlapping(
+                self.block_starting_key_hash_offsets.as_ptr(),
+                dst.add(offset),
+                self.block_starting_keys_hash_offsets_size as usize,
+            );
+        }
+        offset += self.block_starting_keys_hash_offsets_size as usize;
+
+        // write block_offsets
+        if !self.block_offsets.is_empty() {
+            ptr::copy_nonoverlapping(
+                self.block_offsets.as_ptr(),
+                dst.add(offset),
+                self.block_offsets.len(),
+            );
+        }
+        offset += self.block_offsets.len();
+
+        // write ns_offsets
+        if !self.ns_offsets.is_empty() {
+            ptr::copy_nonoverlapping(
+                self.ns_offsets.as_ptr(),
+                dst.add(offset),
+                self.ns_offsets.len(),
+            );
+        }
+        offset += self.ns_offsets.len();
+
+        // write bloom_filter data
+        if !bloom_data.is_empty() {
+            ptr::copy_nonoverlapping(
+                bloom_data.as_ptr(),
+                dst.add(offset),
+                bloom_data.len(),
+            );
+        }
+    }
+
+    /// Serializes the index to a Bytes object. 
+    fn to_bytes(&self) -> Bytes {
+        let size = self.serialized_size();
+        let mut buffer = BytesMut::with_capacity(size);
+        buffer.resize(size, 0);
+
+        // SAFETY: we're writing to a buffer with the correct size
+        unsafe {
+            self.finalize(buffer.as_mut_ptr());
+        }
+
+        buffer.freeze()
+    }
 
     /// insert a block entry into the in-memory block index
     fn insert_block_entry(&mut self, hash: u64, block_offset: u64) {
@@ -164,83 +308,52 @@ impl Index {
     }
 }
 
-impl Serializer for Index {
-    fn serialize_for_memory(&self) -> Bytes {
-        // unimplemented per source specification
-        unimplemented!()
-    }
+impl From<Index> for Bytes {
+    fn from(value: Index) -> Bytes {
+        let size = value.serialized_size();
+        let mut buffer = BytesMut::with_capacity(size);
+        buffer.resize(size, 0);
 
-    fn serialize(&self) -> Bytes {
-        // serialize bloom filter - get a complete copy of the bitmap data
-        let bloom_data = self.active_bloom.bitmap().clone().freeze();
-        let bloom_size = bloom_data.len() as u64;
+        // SAFETY: we just allocated enough space
+        unsafe {
+            value.finalize(buffer.as_mut_ptr());
+        }
 
-        // calculate offsets for the serialized layout
-        let header_size = 56; // 7 u64/i64 fields at 8 bytes each
-        let block_starting_keys_offset = header_size;
-        let block_offsets_offset =
-            block_starting_keys_offset + self.block_starting_keys_hash_offsets_size;
-        let ns_offsets_offset = block_offsets_offset + (self.block_offset_size * 8);
-        let bloom_filter_offset = ns_offsets_offset + (self.ns_offset_size * 8);
-
-        let total_size = bloom_filter_offset + bloom_size;
-        let mut buf = BytesMut::with_capacity(total_size as usize);
-
-        // write header
-        buf.put_u64_le(self.id);
-        buf.put_i64_le(self.bloom_filter_seed);
-        buf.put_u64_le(bloom_size);
-        buf.put_u64_le(bloom_filter_offset);
-        buf.put_u64_le(self.ns_offset_size);
-        buf.put_u64_le(self.block_offset_size);
-        buf.put_u64_le(self.block_starting_keys_hash_offsets_size);
-
-        // write data sections
-        buf.put(self.block_starting_key_hash_offsets.as_ref());
-        buf.put(self.block_offsets.as_ref());
-        buf.put(self.ns_offsets.as_ref());
-        buf.put(bloom_data.as_ref());
-
-        buf.freeze()
+        buffer.freeze()
     }
 }
 
-impl Deserializer for Index {
-    fn deserialize_from_memory(payload: Bytes) -> Self {
-        // unimplemented per source specification
-        unimplemented!()
-    }
-
-    fn deserialize(payload: Bytes) -> Self {
+impl From<Bytes> for Index {
+    fn from(value: Bytes) -> Self {
         // extract header fields
-        let id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let bloom_filter_seed = i64::from_le_bytes(payload[8..16].try_into().unwrap());
-        let bloom_filter_size = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-        let bloom_filter_offset = u64::from_le_bytes(payload[24..32].try_into().unwrap());
-        let ns_offset_size = u64::from_le_bytes(payload[32..40].try_into().unwrap());
-        let block_offset_size = u64::from_le_bytes(payload[40..48].try_into().unwrap());
+        let id = u64::from_le_bytes(value[0..8].try_into().unwrap());
+        let bloom_filter_seed = i64::from_le_bytes(value[8..16].try_into().unwrap());
+        let bloom_filter_size = u64::from_le_bytes(value[16..24].try_into().unwrap());
+        let bloom_filter_offset = u64::from_le_bytes(value[24..32].try_into().unwrap());
+        let ns_offset_size = u64::from_le_bytes(value[32..40].try_into().unwrap());
+        let block_offset_size = u64::from_le_bytes(value[40..48].try_into().unwrap());
         let block_starting_keys_hash_offsets_size =
-            u64::from_le_bytes(payload[48..56].try_into().unwrap());
+            u64::from_le_bytes(value[48..56].try_into().unwrap());
 
         // extract data sections using computed offsets
         let header_size = 56;
         let block_starting_key_hash_offsets = BytesMut::from(
-            &payload[header_size..header_size + block_starting_keys_hash_offsets_size as usize],
+            &value[header_size..header_size + block_starting_keys_hash_offsets_size as usize],
         );
 
         let block_offsets_start = header_size + block_starting_keys_hash_offsets_size as usize;
         let block_offsets_end = block_offsets_start + block_offset_size as usize * 8;
-        let block_offsets = BytesMut::from(&payload[block_offsets_start..block_offsets_end]);
+        let block_offsets = BytesMut::from(&value[block_offsets_start..block_offsets_end]);
 
         let ns_offsets = BytesMut::from(
-            &payload[block_offsets_end..block_offsets_end + ns_offset_size as usize * 8],
+            &value[block_offsets_end..block_offsets_end + ns_offset_size as usize * 8],
         );
 
         // extract bloom filter data
         let bloom_data =
-            if bloom_filter_offset as usize + bloom_filter_size as usize <= payload.len() {
+            if bloom_filter_offset as usize + bloom_filter_size as usize <= value.len() {
                 Bytes::copy_from_slice(
-                    &payload[bloom_filter_offset as usize..
+                    &value[bloom_filter_offset as usize..
                         bloom_filter_offset as usize + bloom_filter_size as usize],
                 )
             } else {
@@ -440,7 +553,7 @@ mod tests {
         index.add_ns_offset(2000);
 
         // serialize
-        let serialized = index.serialize();
+        let serialized = index.to_bytes();
 
         // check that we got some data
         assert!(!serialized.is_empty());
@@ -480,10 +593,15 @@ mod tests {
             create_test_key(70),
         ];
 
+        // Store the expected block lookup results before serialization
+        let mut expected_block_results = Vec::new();
+
         for key in &block_keys {
             original.add_block(key);
-            // Make sure items in block_keys are also in the bloom filter
             original.add_item(key);
+
+            // Save the expected result for later comparison
+            expected_block_results.push((key.clone(), original.find_block(key)));
         }
 
         // add namespace offsets
@@ -491,16 +609,20 @@ mod tests {
         original.add_ns_offset(200);
         original.add_ns_offset(300);
 
-        // serialize
-        let serialized = original.serialize();
+        let id = original.id();
+        let block_count = original.block_count();
+        let ns_offset_count = original.ns_offset_count();
+
+        // serialize - this consumes original
+        let serialized = Bytes::from(original);
 
         // deserialize into a new index
-        let deserialized = Index::deserialize(serialized);
+        let deserialized = Index::from(serialized);
 
         // verify the indexes match
-        assert_eq!(deserialized.id(), original.id());
-        assert_eq!(deserialized.block_count(), original.block_count());
-        assert_eq!(deserialized.ns_offset_count(), original.ns_offset_count());
+        assert_eq!(deserialized.id(), id);
+        assert_eq!(deserialized.block_count(), block_count);
+        assert_eq!(deserialized.ns_offset_count(), ns_offset_count);
 
         // verify all added keys are found in the deserialized index
         for key in &added_keys {
@@ -510,9 +632,13 @@ mod tests {
             );
         }
 
-        // verify block lookup works after deserialization
-        for key in &block_keys {
-            assert_eq!(deserialized.find_block(key), original.find_block(key));
+        // Compare against the saved expected results
+        for (key, expected_result) in expected_block_results {
+            assert_eq!(
+                deserialized.find_block(&key),
+                expected_result,
+                "Block lookup result doesn't match for key"
+            );
         }
     }
 
@@ -542,10 +668,10 @@ mod tests {
     fn test_empty_index_serialization() {
         // test serializing an empty index
         let empty_index = Index::new(1, 100);
-        let serialized = empty_index.serialize();
+        let serialized = empty_index.to_bytes();
 
         // deserialize and check it's still empty
-        let deserialized = Index::deserialize(serialized);
+        let deserialized = Index::from(serialized);
 
         assert_eq!(deserialized.id(), 1);
         assert_eq!(deserialized.block_count(), 0);
@@ -573,14 +699,17 @@ mod tests {
         let expected_block_count = 10;
         assert_eq!(index.block_count(), expected_block_count);
         assert_eq!(index.ns_offset_count(), expected_block_count);
+        
+        let block_count = index.block_count();
+        let ns_offset_count = index.ns_offset_count();
 
         // serialize and deserialize
-        let serialized = index.serialize();
-        let deserialized = Index::deserialize(serialized);
+        let serialized = Bytes::from(index);
+        let deserialized = Index::from(serialized);
 
         // verify everything is preserved
-        assert_eq!(deserialized.block_count(), index.block_count());
-        assert_eq!(deserialized.ns_offset_count(), index.ns_offset_count());
+        assert_eq!(deserialized.block_count(), block_count);
+        assert_eq!(deserialized.ns_offset_count(), ns_offset_count);
 
         // check a few random lookups
         for i in (0..1000).step_by(137) {
@@ -639,7 +768,7 @@ mod tests {
         let index = Index::new(0x0102030405060708, 0x0102030405060708);
 
         // serialize
-        let bytes = index.serialize();
+        let bytes = index.to_bytes();
 
         // check id byte order (little-endian)
         assert_eq!(bytes[0], 0x08);
@@ -717,8 +846,8 @@ mod tests {
         // don't add any items, so bloom filter will be empty
 
         // serialize and deserialize
-        let serialized = index.serialize();
-        let deserialized = Index::deserialize(serialized);
+        let serialized = index.to_bytes();
+        let deserialized = Index::from(serialized);
 
         // check a key that wasn't added
         assert!(!deserialized.may_contain(&create_test_key(1)));
@@ -737,8 +866,8 @@ mod tests {
         assert!(original.may_contain(&test_key));
 
         // Serialize and deserialize
-        let serialized = original.serialize();
-        let deserialized = Index::deserialize(serialized);
+        let serialized = Bytes::from(original);
+        let deserialized = Index::from(serialized);
 
         // Test specific keys
         assert!(

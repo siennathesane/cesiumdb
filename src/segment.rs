@@ -1,15 +1,11 @@
-use std::{
-    fmt::Display,
-    mem,
-    sync::{
-        Arc,
-        atomic::{
-            AtomicU64,
-            Ordering::Relaxed,
-        },
+use std::{fmt::Display, mem, ptr, sync::{
+    Arc,
+    atomic::{
+        AtomicU64,
+        Ordering::Relaxed,
     },
-};
-
+}};
+use bytes::{Bytes, BytesMut};
 use crate::{
     block::{
         Block,
@@ -50,6 +46,120 @@ impl Display for BlockType {
         match self {
             | Key => write!(f, "key"),
             | Value => write!(f, "value"),
+        }
+    }
+}
+
+pub(crate) struct Metadata {
+    id: u64,
+    block_count: u64,
+    index_size: u64,
+    index_start: u64,
+}
+
+impl Metadata {
+    pub(crate) fn new(id: u64, block_count: u64, index_size: u64, index_start: u64) -> Self {
+        Self {
+            id,
+            block_count,
+            index_size,
+            index_start,
+        }
+    }
+
+    pub(crate) fn serialized_size(&self) -> usize {
+        // 4 fields, each is a u64 (8 bytes)
+        4 * size_of::<u64>()
+    }
+
+    /// Finalizes the Metadata by writing it directly to a memory location.
+    ///
+    /// # Safety
+    ///
+    /// - `dst` must be valid for at least `self.serialized_size()` bytes (32 bytes)
+    /// - `dst` must be properly aligned for u64 values
+    /// - `dst` must not overlap with any source data
+    pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
+        let mut offset = 0;
+
+        // Write id
+        ptr::copy_nonoverlapping(
+            self.id.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // Write block_count
+        ptr::copy_nonoverlapping(
+            self.block_count.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // Write index_size
+        ptr::copy_nonoverlapping(
+            self.index_size.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+        offset += size_of::<u64>();
+
+        // Write index_start
+        ptr::copy_nonoverlapping(
+            self.index_start.to_le_bytes().as_ptr(),
+            dst.add(offset),
+            size_of::<u64>(),
+        );
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    pub(crate) fn index_size(&self) -> u64 {
+        self.index_size
+    }
+
+    pub(crate) fn index_start(&self) -> u64 {
+        self.index_start
+    }
+}
+
+impl From<Metadata> for Bytes {
+    fn from(metadata: Metadata) -> Bytes {
+        let size = metadata.serialized_size();
+        let mut buffer = BytesMut::with_capacity(size);
+        buffer.resize(size, 0);
+
+        // SAFETY: we just allocated enough space
+        unsafe {
+            metadata.finalize(buffer.as_mut_ptr());
+        }
+
+        buffer.freeze()
+    }
+}
+
+impl From<Bytes> for Metadata {
+    fn from(bytes: Bytes) -> Self {
+        assert!(bytes.len() >= 32, "Metadata requires at least 32 bytes");
+
+        let id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let block_count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let index_size = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let index_start = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+
+        Self {
+            id,
+            block_count,
+            index_size,
+            index_start,
         }
     }
 }

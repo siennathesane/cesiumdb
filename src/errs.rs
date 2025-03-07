@@ -68,6 +68,10 @@ pub enum SegmentError {
     MissingKey,
     #[error("corrupted block")]
     CorruptedBlock,
+    #[error("segment is closing, no more blocks can be written")]
+    Closing,
+    #[error("segment is not closing")]
+    NotClosing,
     #[error("io error")]
     IoError(io::Error),
 }

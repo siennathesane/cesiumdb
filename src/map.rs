@@ -128,6 +128,46 @@ impl Map {
 
         Ok(())
     }
+    
+    pub fn shrink(&self, new_size: u64) -> Result<(), SegmentError> {
+        let _guard = self.resize_lock.lock();
+
+        {
+            let file = self.file.lock();
+            match file.set_len(new_size) {
+                | Ok(_) => {},
+                | Err(e) => return Err(IoError(e)),
+            };
+
+            let size_metadata = match file.metadata() {
+                Ok(v) => v.len(),
+                Err(e) => return Err(IoError(e)),
+            };
+
+            self.current_size.store(size_metadata, Release);
+        }
+
+        let new_mmap = {
+            let file = self.file.lock();
+
+            // SAFETY: none, this is an unsafe operation
+            SyncUnsafeCell::new(unsafe {
+                match MmapMut::map_mut(&*file) {
+                    | Ok(v) => v,
+                    | Err(e) => return Err(IoError(e)),
+                }
+            })
+        };
+
+        // swap the pointers and remove the old one to prevent use after free
+        let old_ptr = self.inner.swap(Box::into_raw(Box::new(new_mmap)), AcqRel);
+        // SAFETY: this is just a drop
+        unsafe {
+            drop(Box::from_raw(old_ptr));
+        }
+
+        Ok(())
+    }
 
     /// Write to a specific range.
     pub fn write_to_range(
@@ -169,6 +209,23 @@ impl Map {
             let inner = &*mmap.get();
             inner.advise_range(WillNeed, range.start, range.end - range.start);
         }
+    }
+    
+    pub fn close(&self) -> Result<(), SegmentError> {
+        let _guard = self.resize_lock.lock();
+
+        let ptr = self.inner.load(Acquire);
+        // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer
+        unsafe {
+            let mmap = &*ptr;
+            let inner = &mut *mmap.get();
+            match inner.flush().map_err(|e| IoError(e)) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
+
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -257,7 +314,6 @@ impl Drop for Map {
         unsafe {
             drop(Box::from_raw(ptr));
         }
-        self.file.lock().sync_all();
     }
 }
 

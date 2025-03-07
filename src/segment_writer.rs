@@ -27,15 +27,27 @@ use crate::{
         BLOCK_SIZE,
         Block,
     },
-    errs::SegmentError,
-    map::Map,
+    errs::{
+        SegmentError,
+        SegmentError::{
+            Closing,
+            NotClosing,
+        },
+    },
+    index::Index,
+    map::{
+        MAX_GROWTH_INCREMENT,
+        Map,
+    },
+    segment::Metadata,
     stats::STATS,
 };
-use crate::map::MAX_GROWTH_INCREMENT;
 
 pub struct SegmentWriter {
     pub(crate) map: Arc<Map>,
     current_offset: Mutex<usize>,
+    closing: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl SegmentWriter {
@@ -43,6 +55,8 @@ impl SegmentWriter {
         Ok(Self {
             map,
             current_offset: Mutex::new(0),
+            closing: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -56,8 +70,9 @@ impl SegmentWriter {
             // round up to the next multiple of MAX_GROWTH_INCREMENT
             new_size = new_size.div_ceil(MAX_GROWTH_INCREMENT) * MAX_GROWTH_INCREMENT;
         } else {
-            // required size is already more than current + 4MiB, just use that exact size
-            // this handles cases where a very large batch of blocks is being written
+            // required size is already more than current + 4MiB, just use that
+            // exact size this handles cases where a very large
+            // batch of blocks is being written
         }
 
         // ensure we don't shrink
@@ -65,6 +80,10 @@ impl SegmentWriter {
     }
 
     pub(crate) fn write_block(&mut self, block: Block) -> Result<(), SegmentError> {
+        if self.closing.load(Relaxed) {
+            return Err(Closing);
+        }
+
         let mut current_offset = self.current_offset.lock();
         let required_size = *current_offset + BLOCK_SIZE;
 
@@ -101,6 +120,10 @@ impl SegmentWriter {
 
     /// Write multiple blocks in a batch
     pub(crate) fn write_blocks(&self, blocks: &[Block]) -> Result<(), SegmentError> {
+        if self.closing.load(Relaxed) {
+            return Err(Closing);
+        }
+
         if blocks.is_empty() {
             return Ok(());
         }
@@ -143,8 +166,106 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Write the index to the map. Once the index has been written, no more
+    /// blocks can be written.
+    pub(crate) fn write_index(&self, index: Index) -> Result<(), SegmentError> {
+        self.closing.store(true, Relaxed);
+
+        let mut current_offset = self.current_offset.lock();
+        let index_size = *current_offset + index.serialized_size();
+
+        // check if we need to grow the map
+        if index_size > self.map.len() {
+            let new_size = self.calculate_new_size(index_size);
+            match self.map.grow(new_size) {
+                | Ok(_) => {},
+                | Err(e) => {
+                    return Err(e);
+                },
+            };
+        }
+
+        let index_range = *current_offset..(*current_offset + index_size);
+
+        // SAFETY: We know the block is exactly BLOCK_SIZE bytes, and we also know the
+        // space is available
+        match self.map.write_to_range(index_range, |slice| unsafe {
+            index.finalize(slice.as_mut_ptr());
+        }) {
+            | Ok(_) => {},
+            | Err(e) => {
+                return Err(e);
+            },
+        };
+
+        *current_offset += index_size;
+
+        Ok(())
+    }
+
+    pub(crate) fn write_metadata(&self, metadata: Metadata) -> Result<(), SegmentError> {
+        if !self.closing.load(Relaxed) {
+            return Err(NotClosing);
+        }
+
+        let mut current_offset = self.current_offset.lock();
+        let metadata_size = *current_offset + metadata.serialized_size();
+
+        // check if we need to grow the map
+        if metadata_size > self.map.len() {
+            let new_size = self.calculate_new_size(metadata_size);
+            match self.map.grow(new_size) {
+                | Ok(_) => {},
+                | Err(e) => {
+                    return Err(e);
+                },
+            };
+        }
+
+        let metadata_range = *current_offset..(*current_offset + metadata_size);
+
+        // SAFETY: We know the exact size that needs to be written.
+        match self.map.write_to_range(metadata_range, |slice| unsafe {
+            metadata.finalize(slice.as_mut_ptr());
+        }) {
+            | Ok(_) => {},
+            | Err(e) => {
+                return Err(e);
+            },
+        };
+
+        *current_offset += metadata_size;
+        let final_offset = *current_offset;
+
+        if *current_offset > self.map.len() {
+            match self.map.shrink(final_offset as u64) {
+                | Ok(_) => {},
+                | Err(e) => {
+                    return Err(e);
+                },
+            }
+        };
+
+        self.closed.store(true, Relaxed);
+
+        Ok(())
+    }
+
     pub(crate) fn current_offset(&self) -> usize {
         *self.current_offset.lock()
+    }
+
+    /// Close the segment writer. This will flush any remaining data to the map,
+    /// and it is now safe to `drop`.
+    pub(crate) fn close(&self) -> Result<(), SegmentError> {
+        if self.closed.load(Relaxed) {
+            return Ok(());
+        }
+
+        match self.map.close() {
+            | Ok(_) => Ok(()),
+            | Err(e) => Err(e),
+        }
     }
 }
 
