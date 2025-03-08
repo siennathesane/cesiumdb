@@ -658,18 +658,17 @@ impl Segment {
             },
         }
     }
-    
-    fn close(&mut self) -> Result<(), SegmentError> {
+
+    pub(crate) fn close(&mut self) -> Result<(), SegmentError> {
         if self.key_writer.is_none() {
             return Err(ReadOnly);
         }
-        
+
         match self.flush() {
             | Ok(_) => {},
             | Err(e) => return Err(e),
         }
 
-        
         if let Some(writer) = &self.key_writer {
             let index_size = self.key_index.serialized_size();
             let index_start = match writer.write_index(&self.key_index) {
@@ -698,8 +697,8 @@ impl Segment {
                 | Err(e) => return Err(e),
             };
             match writer.write_metadata(Metadata::new(
-                self.key_id,
-                self.key_block_count.load(Relaxed),
+                self.val_id,
+                self.val_block_count.load(Relaxed),
                 index_size as u64,
                 index_start,
             )) {

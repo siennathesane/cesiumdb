@@ -172,11 +172,12 @@ impl SegmentWriter {
         self.closing.store(true, Relaxed);
 
         let mut current_offset = self.current_offset.lock();
-        let index_size = *current_offset + index.serialized_size();
+        let index_start = *current_offset;
+        let index_end = *current_offset + index.serialized_size();
 
         // check if we need to grow the map
-        if index_size > self.map.len() {
-            let new_size = self.calculate_new_size(index_size);
+        if index_end > self.map.len() {
+            let new_size = self.calculate_new_size(index_end);
             match self.map.grow(new_size) {
                 | Ok(_) => {},
                 | Err(e) => {
@@ -185,8 +186,7 @@ impl SegmentWriter {
             };
         }
 
-        let index_start = *current_offset;
-        let index_range = *current_offset..(*current_offset + index_size);
+        let index_range = index_start..index_end;
 
         // SAFETY: We know the block is exactly BLOCK_SIZE bytes, and we also know the
         // space is available
@@ -199,7 +199,7 @@ impl SegmentWriter {
             },
         };
 
-        *current_offset += index_size;
+        *current_offset += index_end;
 
         Ok(index_start as u64)
     }
@@ -209,12 +209,13 @@ impl SegmentWriter {
             return Err(NotClosing);
         }
 
-        let mut current_offset = self.current_offset.lock();
-        let metadata_size = *current_offset + metadata.serialized_size();
+        let current_offset = self.current_offset.lock();
+        let metadata_start = *current_offset;
+        let metadata_end = *current_offset + metadata.serialized_size();
 
         // check if we need to grow the map
-        if metadata_size > self.map.len() {
-            let new_size = self.calculate_new_size(metadata_size);
+        if metadata_end > self.map.len() {
+            let new_size = self.calculate_new_size(metadata_end);
             match self.map.grow(new_size) {
                 | Ok(_) => {},
                 | Err(e) => {
@@ -223,7 +224,7 @@ impl SegmentWriter {
             };
         }
 
-        let metadata_range = *current_offset..(*current_offset + metadata_size);
+        let metadata_range = metadata_start..metadata_end;
 
         // SAFETY: We know the exact size that needs to be written.
         match self.map.write_to_range(metadata_range, |slice| unsafe {
@@ -235,11 +236,8 @@ impl SegmentWriter {
             },
         };
 
-        *current_offset += metadata_size;
-        let final_offset = *current_offset;
-
-        if *current_offset > self.map.len() {
-            match self.map.shrink(final_offset as u64) {
+        if metadata_end < self.map.len() {
+            match self.map.shrink(metadata_end as u64) {
                 | Ok(_) => {},
                 | Err(e) => {
                     return Err(e);

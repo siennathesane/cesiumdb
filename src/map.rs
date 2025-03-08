@@ -52,6 +52,13 @@ pub struct Map {
 
 impl Map {
     pub fn new(path: PathBuf, initial_size: u64) -> Result<Self, SegmentError> {
+        if initial_size == 0 {
+            return Err(SegmentError::InvalidSize);
+        }
+        if initial_size % 4096 != 0 {
+            return Err(SegmentError::InvalidSize);
+        }
+
         let file = match OpenOptions::new()
             .read(true)
             .write(true)

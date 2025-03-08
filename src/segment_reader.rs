@@ -97,15 +97,6 @@ impl<'a> SegmentReader<'a> {
         config: ReadConfig,
     ) -> Result<Self, SegmentError> {
         let segment_size = key_handle.len();
-
-        if segment_size % BLOCK_SIZE != 0 {
-            return Err(InvalidSize);
-        }
-
-        if config.read_ahead == 0 {
-            return Err(InvalidSize);
-        }
-
         let num_blocks = segment_size / BLOCK_SIZE;
 
         let visible_key_blocks = num_blocks;
