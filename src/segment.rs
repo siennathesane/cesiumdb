@@ -718,7 +718,7 @@ impl Segment {
 impl Drop for Segment {
     fn drop(&mut self) {
         let res = self.close();
-        if let Err(e) = res {
+        if let Err(e) = res && !matches!(e, ReadOnly) {
             // TODO(@siennathesane): log this error instead of panicking
             panic!("Failed to close segment: {:?}", e);
         }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 #![feature(sync_unsafe_cell)]
+#![feature(let_chains)]
 #![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
 #![allow(dead_code)]
 #![allow(unused)]
