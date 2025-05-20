@@ -42,6 +42,7 @@ use crate::errs::{
 /// The maximum amount of disk space that can be allocated at once.
 pub const MAX_GROWTH_INCREMENT: u64 = 8 * 1024 * 1024;
 
+#[derive(Debug)]
 pub struct Map {
     inner: AtomicPtr<SyncUnsafeCell<MmapMut>>,
     file: Mutex<File>,
@@ -52,13 +53,7 @@ pub struct Map {
 
 impl Map {
     pub fn new(path: PathBuf, initial_size: u64) -> Result<Self, SegmentError> {
-        if initial_size == 0 {
-            return Err(SegmentError::InvalidSize);
-        }
-        if initial_size % 4096 != 0 {
-            return Err(SegmentError::InvalidSize);
-        }
-
+        println!("[Map::new] Path: {:?}, initial_size: {}", path, initial_size);
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -248,6 +243,8 @@ impl Map {
 
     pub fn close(&self) -> Result<(), SegmentError> {
         let _guard = self.resize_lock.lock();
+
+        println!("Closing map of size {}", self.len());
 
         let ptr = self.inner.load(Acquire);
         // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer

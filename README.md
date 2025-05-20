@@ -76,52 +76,19 @@ not stored separately than other namespaced data. Namespaces are ultimately glor
 lookups across a large set of internal data, and a bit of a way to make it easy for users to manage their data. I would
 argue namespaces are closer to tables than column families.
 
-## MVCC is... Not Here
+## Hybrid Logical Clocks
 
-CesiumDB doesn't contain MVCC semantics due to the use of a hybrid linear clock (HLC). This provides guaranteed
-operation ordering based on the database's view of the data after it enters the boundary; operations are linear and
-non-collidable. This removes a transaction API and pushes the responsibility of correct ordering to the application
-via "last write wins". This is a tradeoff between ergonomics & maintainability for everyone. Application owners know
-their application best, and it's easier to reason about the ordering of data operations in the application layer.
-
-While the HLC is monotonic, it is also exceedingly performant with nanosecond precision. This allows for a high degree
-of concurrency and parallelism. As an example, on @siennathesane's Macbook Pro M1 Pro chipset, the clock has a general
-resolution of about 2 nanoseconds.
-
-If you have your heart set on transactions, you can wrap the database in a `MutexGuard` or `RwLock` to provide
-transactional semantics. Like this:
-
-```rust
-use std::sync::{Mutex, MutexGuard};
-let db = Mutex::new(CesiumDB::new());
-{
-let mut tx: MutexGuard < CesiumDB > = db.lock().unwrap();
-tx.put("key", "value");
-tx.sync();
-}
-// other non-tx operations
-```
-
-### BYOHLC
-
-CesiumDB does let you bring your own hybrid logical clock implementation. This is useful if you have a specific HLC
-implementation you want to use, or if you want to use a different clock entirely. This is done by implementing the `HLC`
-trait and passing it to the `CesiumDB` constructor. However, if you can provide a more precise clock than the provided
-one, please submit an issue or PR so we can all benefit from it.
+CesiumDB does let you bring your own hybrid logical clock implementation for key versioning. This is useful if you have
+a specific HLC implementation you want to use, or if you want to use a different clock entirely. This is done by
+implementing the `HLC` trait and passing it to the `CesiumDB` constructor. However, if you can provide a more precise
+clock than the provided one, please submit an issue or PR so we can all benefit from it.
 
 ## Unsafety: Or... How To Do Dangerous Things Safely
 
-There is a non-trivial amount of `unsafe` code. Most of it is related to the internal filesystem implementation with
-`mmap` (which cannot be made safe) and it's entrypoints (the handlers and such).
-
-Internally, the filesystem I built for CesiumDB is a lock-free, thread-safe portable filesystem since one of my use
-cases is an embedded system that doesn't have a filesystem, only a device driver. LMDB is a huge inspiration for this
-project, so I wanted to utilize a lot of the same methodologies around `mmap`, but to make it as safe as possible. The
-nifty part is that Linux doesn't distinguish between a file and a block device for `mmap`, so I can `mmap` a block
-device and treat it like a file. The perk is that we get native write speeds for the device, we have a bin-packing
-filesystem that is portable across devices, and if all else fails, we can just `fallocate` a file and use that. The
-downside is that writing directly to device memory is dangerous and is inherently "unsafe", so a lot of the
-optimizations are `unsafe` because of this.
+There is a non-trivial amount of `unsafe` code. Most of it is related to the internal implementation with `mmap` (which
+cannot be made safe) and it's entrypoints (the handlers and such). I also make use of pointer arithmetic on
+memory-mapped file locations. This is one of the areas where safety comes at the cost of performance. However, if you
+can find a way to make it safe, please submit an issue or PR. I would love to see it!
 
 There is :sparkles: __EXTENSIVE__ :sparkles: testing around the `unsafe` code, and I am confident in its correctness. My
 goal is to keep this project at a high degree of code coverage with tests to help continue to ensure said confidence.
@@ -132,9 +99,6 @@ However, if you find a bug, please submit an issue or PR.
 Contributions are welcome! Please submit a PR with your changes. If you're unsure about the changes, please submit an
 issue first.
 
-I will only accept `async` code if it is in the hot path for compaction or flushing, and it can't be handled with a
-thread.
-
 ## To Do's
 
 An alphabetical list of things I'd like to actually do for the long-term safety and stability of the project.
@@ -142,7 +106,6 @@ An alphabetical list of things I'd like to actually do for the long-term safety 
 - [ ] Add `loom` integration tests.
 - [ ] Add `miri` integration tests.
 - [ ] Add more granular `madvise` commands to the filesystem to give the kernel some hints.
-- [ ] Add some kind of `fallocate` automation or growth strategy for the filesystem when it's not a block device.
 - [ ] Add some kind of `fsck` and block checksums since journaling is already present. There are basic unit tests for
   this but no supported tool for it.
 - [ ] Bloom filter size is currently hardcoded. I'd like to make it configurable.

@@ -46,6 +46,7 @@ pub enum EntryFlag {
 /// 1. The offsets: a list of 4-byte integers that point to the start of each
 ///    entry in the block.
 /// 2. The entries: the actual data stored in the block.
+#[derive(Debug)]
 pub(crate) struct Block {
     /// The number of entries in the block.
     num_entries: u16,

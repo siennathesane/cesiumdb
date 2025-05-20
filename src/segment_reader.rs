@@ -12,7 +12,7 @@ use bytes::{
     BytesMut,
 };
 use crossbeam_queue::ArrayQueue;
-
+use tracing::instrument;
 use crate::{
     block::{
         BLOCK_SIZE,
@@ -63,10 +63,11 @@ impl Default for ReadConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct SegmentReader<'a> {
     key_handle: Arc<Map>,
     val_handle: Arc<Map>,
-    key_index: &'a Index,
+    pub(crate) key_index: &'a Index,
     pub(crate) val_index: &'a Index,
     pub(crate) visible_key_blocks: usize,
     visible_val_blocks: usize,
@@ -74,6 +75,7 @@ pub struct SegmentReader<'a> {
 }
 
 impl<'a> SegmentReader<'a> {
+    #[instrument(level = "trace")]
     pub fn new(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
@@ -89,6 +91,7 @@ impl<'a> SegmentReader<'a> {
         )
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn with_config(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
@@ -97,6 +100,11 @@ impl<'a> SegmentReader<'a> {
         config: ReadConfig,
     ) -> Result<Self, SegmentError> {
         let segment_size = key_handle.len();
+
+        if segment_size % BLOCK_SIZE != 0 {
+            return Err(InvalidSize);
+        }
+        
         let num_blocks = segment_size / BLOCK_SIZE;
 
         let visible_key_blocks = num_blocks;
@@ -113,6 +121,7 @@ impl<'a> SegmentReader<'a> {
         })
     }
 
+    #[instrument(level = "trace")]
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, SegmentError> {
         // First check the bloom filter - quick reject if not present
         if !self.key_index.may_contain(key) {
@@ -120,7 +129,7 @@ impl<'a> SegmentReader<'a> {
         }
 
         // Find which block might contain this key
-        let key_block_offset = match self.key_index.find_block(key) {
+        let key_block_offset = match self.key_index.get_block(key) {
             | Some(v) => v,
             | None => {
                 return Ok(None);
@@ -167,7 +176,7 @@ impl<'a> SegmentReader<'a> {
             // If key matches, read the value
             if key_matches {
                 // Use val_index to find the value block for this key
-                let val_block_offset = match self.val_index.find_block(key) {
+                let val_block_offset = match self.val_index.get_block(key) {
                     | Some(v) => v,
                     | None => {
                         return Ok(None);
@@ -184,6 +193,7 @@ impl<'a> SegmentReader<'a> {
         Ok(None)
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn read_key_block(&self, block_index: usize) -> Result<Block, SegmentError> {
         if block_index >= self.visible_key_blocks {
             return Err(ReadOutOfBounds);
@@ -198,6 +208,7 @@ impl<'a> SegmentReader<'a> {
         Ok(block)
     }
 
+    #[instrument(level = "trace")]
     fn read_key(&self, key_block_index: usize, entry_index: usize) -> Result<Bytes, SegmentError> {
         let block = match self.read_key_block(key_block_index) {
             | Ok(v) => v,
@@ -259,6 +270,7 @@ impl<'a> SegmentReader<'a> {
         }
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn read_value(
         &self,
         val_block_index: usize,
@@ -419,14 +431,17 @@ impl<'a> SegmentReader<'a> {
         (self.visible_key_blocks, self.visible_val_blocks)
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn iter(&'a mut self) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator::new(self)
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn seeking_iter(&'a mut self) -> SeekingBlockIterator<'a> {
         SeekingBlockIterator::new(self, 0, self.num_blocks)
     }
 
+    #[instrument(level = "trace")]
     /// Internal method to read a single block without caching
     fn read_block_at(
         &self,
@@ -464,6 +479,7 @@ impl<'a> SegmentReader<'a> {
     ///   Included, exclusive if Excluded)
     /// * `upper_bound` - The upper bound of the key range (inclusive if
     ///   Included, exclusive if Excluded)
+    #[instrument(level = "trace")]
     pub fn scan(
         &'a self,
         lower_bound: Bound<&[u8]>,
@@ -473,7 +489,7 @@ impl<'a> SegmentReader<'a> {
         let start_block = match lower_bound {
             | Bound::Included(key) | Bound::Excluded(key) => {
                 // Use the index to find the block that would contain this key
-                match self.key_index.find_block(key) {
+                match self.key_index.get_block(key) {
                     | Some(block_offset) => block_offset as usize,
                     | None => 0, // Start from the beginning if not found
                 }
@@ -812,10 +828,11 @@ mod tests {
         write_block_to_mapfor_get(&val_map, 0, &val_block);
 
         // update indexes
-        key_index.add_item(key);
-        key_index.add_block(key);
-        val_index.add_item(key);
-        val_index.add_block(key);
+        key_index.inc_block_count(1);
+        key_index.insert_item(key);
+        
+        key_index.inc_block_count(1);
+        val_index.insert_item(key);
 
         // create segment reader
         let reader =
@@ -873,10 +890,11 @@ mod tests {
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2);
 
         // update indexes
-        key_index.add_item(key);
-        key_index.add_block(key);
-        val_index.add_item(key);
-        val_index.add_block(key);
+        key_index.inc_block_count(1);
+        key_index.insert_item(key);
+        
+        key_index.inc_block_count(1);
+        val_index.insert_item(key);
 
         // create segment reader
         let reader =
@@ -920,14 +938,15 @@ mod tests {
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2);
 
         // Update indexes - make sure the same exact key is used
-        key_index.add_item(key);
-        key_index.add_block(key);
-        val_index.add_item(key);
-        val_index.add_block(key);
+        key_index.inc_block_count(1);
+        key_index.insert_item(key);
+        
+        key_index.inc_block_count(1);
+        val_index.insert_item(key);
 
         // Debug: Verify the key is in the index
         assert!(key_index.may_contain(key), "Key should be in bloom filter");
-        let block_offset = key_index.find_block(key);
+        let block_offset = key_index.get_block(key);
         assert!(
             block_offset.is_some(),
             "Block for key should be found in index"
@@ -954,8 +973,8 @@ mod tests {
         let (dir, key_map, val_map, mut key_index, val_index) = prepare_test_segment_for_get();
 
         // add some other keys to the index but not our test key
-        key_index.add_item(b"other_key1");
-        key_index.add_item(b"other_key2");
+        key_index.insert_item(b"other_key1");
+        key_index.insert_item(b"other_key2");
 
         // create segment reader
         let reader =
@@ -974,7 +993,7 @@ mod tests {
 
         // create test key and add to bloom filter, but don't add blocks
         let key = b"test_key";
-        key_index.add_item(key);
+        key_index.insert_item(key);
 
         // create segment reader
         let reader =
@@ -1005,10 +1024,11 @@ mod tests {
         write_block_to_mapfor_get(&val_map, 0, &val_block);
 
         // update indexes
-        key_index.add_item(key);
-        key_index.add_block(key);
-        val_index.add_item(key);
-        val_index.add_block(key);
+        key_index.inc_block_count(1);
+        key_index.insert_item(key);
+
+        key_index.inc_block_count(1);
+        val_index.insert_item(key);
 
         // create segment reader
         let reader =
@@ -1063,23 +1083,23 @@ mod tests {
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE * 2, &val_block3); // Block 2
 
         // Add to indexes - each will be assigned sequential block IDs
-        key_index.add_item(key1);
-        key_index.add_block(key1); // This will be block 0
+        key_index.inc_block_count(1); // This will be block 1
+        key_index.insert_item(key1);
 
-        key_index.add_item(key2);
-        key_index.add_block(key2); // This will be block 1
+        key_index.inc_block_count(1); // This will be block 2
+        key_index.insert_item(key2);
 
-        key_index.add_item(key3);
-        key_index.add_block(key3); // This will be block 2
+        key_index.inc_block_count(1); // This will be block 3
+        key_index.insert_item(key3);
 
-        val_index.add_item(key1);
-        val_index.add_block(key1); // This will be block 0
+        key_index.inc_block_count(1); // This will be block 4
+        val_index.insert_item(key1);
 
-        val_index.add_item(key2);
-        val_index.add_block(key2); // This will be block 1
+        key_index.inc_block_count(1); // This will be block 5
+        val_index.insert_item(key2);
 
-        val_index.add_item(key3);
-        val_index.add_block(key3); // This will be block 2
+        key_index.inc_block_count(1); // This will be block 6
+        val_index.insert_item(key3);
 
         // Create reader
         let reader =

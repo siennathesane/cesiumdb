@@ -65,6 +65,7 @@ impl Display for BlockType {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Metadata {
     id: u64,
     block_count: u64,
@@ -225,8 +226,8 @@ impl Segment {
         // is the first namespace" without doing this. so even if the
         // first seen namespace isn't the default one, it will still
         // be a pointer to the same record.
-        key_index.add_ns_offset(DEFAULT_NS);
-        val_index.add_ns_offset(DEFAULT_NS);
+        key_index.insert_ns_offset(DEFAULT_NS);
+        val_index.insert_ns_offset(DEFAULT_NS);
 
         Self {
             key_writer: Some(key_writer),
@@ -281,8 +282,8 @@ impl Segment {
         let ns = u64::from_le_bytes(key[0..8].as_ref().try_into().unwrap());
         if ns != self.current_ns.load(Relaxed) {
             self.current_ns.store(ns, Relaxed);
-            self.key_index.add_ns_offset(ns);
-            self.val_index.add_ns_offset(ns);
+            self.key_index.insert_ns_offset(ns);
+            self.val_index.insert_ns_offset(ns);
         }
 
         // Write key to key block
@@ -317,7 +318,7 @@ impl Segment {
                 },
             },
         };
-        self.key_index.add_item(key);
+        self.key_index.insert_item(key);
 
         // Write value to value block - FIXED
         match self.current_val_block.add_entry(val, Complete) {
@@ -351,7 +352,7 @@ impl Segment {
                 },
             },
         };
-        self.val_index.add_item(key);
+        self.val_index.insert_item(key);
 
         Ok(())
     }
@@ -425,7 +426,8 @@ impl Segment {
 
                     match self.current_key_block.add_entry(chunk, Start) {
                         | Ok(_) => {
-                            self.key_index.add_block(data);
+                            self.key_index.inc_block_count(1);
+                            self.key_index.insert_item(data);
                             match self.write_block(&Key) {
                                 | Ok(_) => {},
                                 | Err(e) => return Err(e),
@@ -452,7 +454,8 @@ impl Segment {
 
                     match self.current_val_block.add_entry(chunk, Start) {
                         | Ok(_) => {
-                            self.val_index.add_block(data);
+                            self.val_index.inc_block_count(1);
+                            self.val_index.insert_item(data);
                             match self.write_block(&Value) {
                                 | Ok(_) => {},
                                 | Err(e) => return Err(e),
@@ -619,7 +622,7 @@ impl Segment {
                 // Add to index if we have a starting key
                 if result.is_ok() {
                     if let Some(key_data) = starting_key_data {
-                        self.key_index.add_block(&key_data);
+                        self.key_index.insert_item(&key_data);
                     }
                 }
 
@@ -650,7 +653,7 @@ impl Segment {
                 // Add to index if we have a starting key
                 if result.is_ok() {
                     if let Some(key_data) = starting_key_data {
-                        self.val_index.add_block(&key_data);
+                        self.val_index.insert_item(&key_data);
                     }
                 }
 
@@ -670,7 +673,7 @@ impl Segment {
         }
 
         if let Some(writer) = &self.key_writer {
-            let index_size = self.key_index.serialized_size();
+            let index_size = self.key_index.size();
             let index_start = match writer.write_index(&self.key_index) {
                 | Ok(v) => v,
                 | Err(e) => return Err(e),
@@ -691,7 +694,7 @@ impl Segment {
         }
 
         if let Some(writer) = &self.val_writer {
-            let index_size = self.val_index.serialized_size();
+            let index_size = self.val_index.size();
             let index_start = match writer.write_index(&self.val_index) {
                 | Ok(v) => v,
                 | Err(e) => return Err(e),

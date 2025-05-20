@@ -341,7 +341,7 @@ impl<'a> SegmentScanIterator<'a> {
     /// Reads the value for a key.
     fn read_value_for_key(&self, key: &Bytes) -> Result<Option<Bytes>, SegmentError> {
         // Use val_index to find the value block for this key
-        let val_block_offset = match self.reader.val_index.find_block(key) {
+        let val_block_offset = match self.reader.val_index.get_block(key) {
             | Some(offset) => offset,
             | None => return Ok(None), // No value block found for this key
         };
@@ -566,8 +566,8 @@ mod tests {
             .expect("Failed to write val_block2");
 
         // Update indexes
-        key_index.add_item(&key0);
-        key_index.add_block(&key0);
+        key_index.inc_block_count(1);
+        key_index.insert_item(&key0);
 
         // For multi-block key, we need to update the index with the combined key
         let mut multi_key = Vec::new();
@@ -576,14 +576,14 @@ mod tests {
         multi_key.extend_from_slice(b"multi_key_part2");
         multi_key.extend_from_slice(&[0u8; 16]); // timestamp (zeros)
 
-        key_index.add_item(&multi_key);
-        key_index.add_block(&multi_key);
+        key_index.inc_block_count(1);
+        key_index.insert_item(&multi_key);
 
         // Same for values
-        val_index.add_item(&key0);
-        val_index.add_block(&key0);
-        val_index.add_item(&multi_key);
-        val_index.add_block(&multi_key);
+        val_index.inc_block_count(1);
+        val_index.insert_item(&key0);
+        val_index.inc_block_count(1);
+        val_index.insert_item(&multi_key);
 
         let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
             .expect("Failed to create segment reader");
@@ -660,10 +660,11 @@ mod tests {
                 .expect("Failed to write value block");
 
             // Update indexes
-            key_index.add_item(&full_key);
-            key_index.add_block(&full_key);
-            val_index.add_item(&full_key);
-            val_index.add_block(&full_key);
+            key_index.inc_block_count(1);
+            key_index.insert_item(&full_key);
+            
+            val_index.inc_block_count(1);
+            val_index.insert_item(&full_key);
         }
 
         let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
@@ -1263,7 +1264,7 @@ mod tests {
 
         // Try to find the block that would contain this key
         assert!(
-            key_index.find_block(non_existent_key).is_none(),
+            key_index.get_block(non_existent_key).is_none(),
             "Should not find block for non-existent key"
         );
     }

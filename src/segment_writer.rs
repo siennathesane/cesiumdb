@@ -15,13 +15,16 @@ use std::{
     time::Duration,
 };
 
-use bytes::BufMut;
+use bytes::{
+    BufMut,
+    Bytes,
+};
 use crossbeam_queue::SegQueue;
 use parking_lot::{
     Condvar,
     Mutex,
 };
-
+use tracing::instrument;
 use crate::{
     block::{
         BLOCK_SIZE,
@@ -31,6 +34,7 @@ use crate::{
         SegmentError,
         SegmentError::{
             Closing,
+            CorruptedBlock,
             NotClosing,
         },
     },
@@ -51,6 +55,7 @@ pub struct SegmentWriter {
 }
 
 impl SegmentWriter {
+    #[instrument(level = "trace")]
     pub fn new(map: Arc<Map>) -> Result<Self, SegmentError> {
         Ok(Self {
             map,
@@ -60,6 +65,7 @@ impl SegmentWriter {
         })
     }
 
+    #[instrument(level = "trace")]
     fn calculate_new_size(&self, required_size: usize) -> u64 {
         // start with the minimum required size
         let mut new_size = required_size as u64;
@@ -79,6 +85,7 @@ impl SegmentWriter {
         new_size.max(current_size)
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn write_block(&mut self, block: Block) -> Result<(), SegmentError> {
         if self.closing.load(Relaxed) {
             return Err(Closing);
@@ -119,6 +126,7 @@ impl SegmentWriter {
     }
 
     /// Write multiple blocks in a batch
+    #[instrument(level = "trace")]
     pub(crate) fn write_blocks(&self, blocks: &[Block]) -> Result<(), SegmentError> {
         if self.closing.load(Relaxed) {
             return Err(Closing);
@@ -168,12 +176,20 @@ impl SegmentWriter {
 
     /// Write the index to the map. Once the index has been written, no more
     /// blocks can be written.
+    #[instrument(level = "trace")]
     pub(crate) fn write_index(&self, index: &Index) -> Result<u64, SegmentError> {
         self.closing.store(true, Relaxed);
 
         let mut current_offset = self.current_offset.lock();
         let index_start = *current_offset;
-        let index_end = *current_offset + index.serialized_size();
+        let index_end = *current_offset + index.size();
+
+        let index_bytes = Bytes::from(index.clone());
+        let index_size = index_bytes.len();
+
+        if index_size == 0 || index_size < 56 {
+            return Err(CorruptedBlock);
+        }
 
         // check if we need to grow the map
         if index_end > self.map.len() {
@@ -204,45 +220,38 @@ impl SegmentWriter {
         Ok(index_start as u64)
     }
 
+    #[instrument(level = "trace")]
     pub(crate) fn write_metadata(&self, metadata: Metadata) -> Result<(), SegmentError> {
         if !self.closing.load(Relaxed) {
             return Err(NotClosing);
         }
 
-        let current_offset = self.current_offset.lock();
-        let metadata_start = *current_offset;
-        let metadata_end = *current_offset + metadata.serialized_size();
+        // Always write at the end of the file
+        let metadata_size = metadata.serialized_size();
+        let map_size = self.map.len();
 
-        // check if we need to grow the map
-        if metadata_end > self.map.len() {
-            let new_size = self.calculate_new_size(metadata_end);
-            match self.map.grow(new_size) {
-                | Ok(_) => {},
-                | Err(e) => {
-                    return Err(e);
-                },
-            };
-        }
+        // Calculate position at the end
+        let metadata_start = map_size - metadata_size;
 
-        let metadata_range = metadata_start..metadata_end;
+        println!("Writing metadata at END of file: offset={}, size={}, map_size={}, id={}, block_count={}, index_size={}, index_start={}",
+                 metadata_start, metadata_size, map_size,
+                 metadata.id(), metadata.block_count(),
+                 metadata.index_size(), metadata.index_start());
 
-        // SAFETY: We know the exact size that needs to be written.
+        let metadata_range = metadata_start..map_size;
+
+        // Write metadata
+        // SAFETY: we know this memory range will exist
         match self.map.write_to_range(metadata_range, |slice| unsafe {
             metadata.finalize(slice.as_mut_ptr());
         }) {
-            | Ok(_) => {},
+            | Ok(_) => {
+                println!("Metadata written successfully");
+            },
             | Err(e) => {
+                println!("Error writing metadata: {:?}", e);
                 return Err(e);
             },
-        };
-
-        if metadata_end < self.map.len() {
-            match self.map.shrink(metadata_end as u64) {
-                | Ok(_) => {},
-                | Err(e) => {
-                    return Err(e);
-                },
-            }
         };
 
         self.closed.store(true, Relaxed);
@@ -256,6 +265,7 @@ impl SegmentWriter {
 
     /// Close the segment writer. This will flush any remaining data to the map,
     /// and it is now safe to `drop`.
+    #[instrument(level = "trace")]
     pub(crate) fn close(&self) -> Result<(), SegmentError> {
         if self.closed.load(Relaxed) {
             return Ok(());
