@@ -150,9 +150,9 @@ impl Index {
     #[instrument(level = "trace")]
     pub fn get_namespace_block(&self, ns: u64) -> Option<u64> {
         self.ns_offset_entries
-            .binary_search_by_key(&ns, |(n, b)| *b)
+            .binary_search_by_key(&ns, |(n, b)| *n)
             .ok()
-            .map(|idx| self.block_offset_entries[idx].1)
+            .map(|idx| self.ns_offset_entries[idx].1)
     }
 
     /// Get a block offset by hash from the in-memory block index
