@@ -780,4 +780,369 @@ mod tests {
             "After serialization, non-existent key should return None"
         );
     }
+
+    // Regression tests for get_namespace_block() bug fix
+    // Bug: The function was searching by block offset (*b) instead of namespace (*n)
+    // and returning from block_offset_entries instead of ns_offset_entries
+
+    #[test]
+    fn test_get_namespace_block_basic() {
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Insert namespace offsets for different namespaces
+        // Each namespace is mapped to a specific block
+        let ns1 = 100u64;
+        let ns2 = 200u64;
+        let ns3 = 300u64;
+
+        // Namespace 100 starts at block 1
+        index.insert_ns_offset(ns1);
+        index.inc_block_count(1);
+
+        // Namespace 200 starts at block 2
+        index.insert_ns_offset(ns2);
+        index.inc_block_count(1);
+
+        // Namespace 300 starts at block 3
+        index.insert_ns_offset(ns3);
+        index.inc_block_count(1);
+
+        // Verify we can find each namespace's starting block
+        assert_eq!(
+            index.get_namespace_block(ns1),
+            Some(1),
+            "Namespace 100 should start at block 1"
+        );
+        assert_eq!(
+            index.get_namespace_block(ns2),
+            Some(2),
+            "Namespace 200 should start at block 2"
+        );
+        assert_eq!(
+            index.get_namespace_block(ns3),
+            Some(3),
+            "Namespace 300 should start at block 3"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_not_found() {
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Insert a single namespace
+        let ns = 100u64;
+        index.insert_ns_offset(ns);
+
+        // Look for a namespace that doesn't exist
+        assert_eq!(
+            index.get_namespace_block(999),
+            None,
+            "Non-existent namespace should return None"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_empty_index() {
+        let seed = 100;
+        let index = Index::new(1, seed);
+
+        // Try to find namespace in empty index
+        assert_eq!(
+            index.get_namespace_block(100),
+            None,
+            "Empty index should return None for any namespace"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_searches_by_namespace_not_block() {
+        // This test specifically validates that the function searches by namespace
+        // and not by block offset, which was the bug.
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Create a scenario where namespace values and block offsets differ significantly
+        // This ensures the binary search is using the right field
+
+        // Namespace 50 maps to block 1
+        index.insert_ns_offset(50);
+
+        // Namespace 150 maps to block 2 (increment block count first)
+        index.inc_block_count(1);
+        index.insert_ns_offset(150);
+
+        // Namespace 300 maps to block 3
+        index.inc_block_count(1);
+        index.insert_ns_offset(300);
+
+        // If the bug existed, searching for namespace 50 would fail
+        // because it would try to search by block offset instead of namespace
+        assert_eq!(
+            index.get_namespace_block(50),
+            Some(1),
+            "Should find namespace 50 at block 1"
+        );
+        assert_eq!(
+            index.get_namespace_block(150),
+            Some(2),
+            "Should find namespace 150 at block 2"
+        );
+        assert_eq!(
+            index.get_namespace_block(300),
+            Some(3),
+            "Should find namespace 300 at block 3"
+        );
+
+        // These should not be found (proving we're searching by namespace, not block offset)
+        assert_eq!(
+            index.get_namespace_block(1),
+            None,
+            "Block offset 1 should not be found as a namespace"
+        );
+        assert_eq!(
+            index.get_namespace_block(2),
+            None,
+            "Block offset 2 should not be found as a namespace"
+        );
+        assert_eq!(
+            index.get_namespace_block(3),
+            None,
+            "Block offset 3 should not be found as a namespace"
+        );
+
+        // More specifically, test that we're NOT finding by block values
+        // If the bug existed and we searched by the second field (block offset),
+        // searching for "1" might incorrectly find the entry for namespace 50
+        assert_eq!(
+            index.get_namespace_block(49),
+            None,
+            "Namespace 49 should not exist"
+        );
+        assert_eq!(
+            index.get_namespace_block(51),
+            None,
+            "Namespace 51 should not exist"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_returns_from_correct_array() {
+        // This test validates that the function returns values from ns_offset_entries
+        // and not from block_offset_entries, which was part of the bug
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Add namespace offsets
+        let ns1 = 1000u64;
+        let ns2 = 2000u64;
+
+        index.insert_ns_offset(ns1);
+        index.inc_block_count(1);
+
+        index.insert_ns_offset(ns2);
+        index.inc_block_count(1);
+
+        // Also add many more block offset entries (for keys) to create a clear difference
+        for i in 0..50 {
+            let key = create_test_key(i);
+            index.insert_item(&key);
+        }
+
+        // Verify that namespace lookups return the correct block offsets
+        // from ns_offset_entries, not from block_offset_entries
+        let result1 = index.get_namespace_block(ns1);
+        let result2 = index.get_namespace_block(ns2);
+
+        assert_eq!(
+            result1,
+            Some(1),
+            "Namespace 1000 should map to block 1 from ns_offset_entries"
+        );
+        assert_eq!(
+            result2,
+            Some(2),
+            "Namespace 2000 should map to block 2 from ns_offset_entries"
+        );
+
+        // Verify the arrays are actually different in size
+        assert_eq!(
+            index.ns_offset_entries.len(),
+            2,
+            "Should have exactly 2 namespace entries"
+        );
+        assert!(
+            index.block_offset_entries.len() >= 50,
+            "Should have at least 50 block offset entries, demonstrating they're distinct arrays"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_multiple_namespaces() {
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Insert many namespaces to test binary search correctness
+        let namespaces = vec![10u64, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+
+        for (i, ns) in namespaces.iter().enumerate() {
+            index.insert_ns_offset(*ns);
+            index.inc_block_count(1);
+        }
+
+        // Verify all namespaces can be found correctly
+        for (i, ns) in namespaces.iter().enumerate() {
+            let expected_block = (i + 1) as u64;
+            assert_eq!(
+                index.get_namespace_block(*ns),
+                Some(expected_block),
+                "Namespace {} should map to block {}",
+                ns,
+                expected_block
+            );
+        }
+
+        // Verify non-existent namespaces return None
+        assert_eq!(index.get_namespace_block(5), None);
+        assert_eq!(index.get_namespace_block(15), None);
+        assert_eq!(index.get_namespace_block(105), None);
+    }
+
+    #[test]
+    fn test_get_namespace_block_boundary_values() {
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Test with boundary values
+        let ns_min = 0u64;
+        let ns_max = u64::MAX;
+        let ns_mid = u64::MAX / 2;
+
+        index.insert_ns_offset(ns_min);
+        index.inc_block_count(1);
+
+        index.insert_ns_offset(ns_mid);
+        index.inc_block_count(1);
+
+        index.insert_ns_offset(ns_max);
+        index.inc_block_count(1);
+
+        assert_eq!(
+            index.get_namespace_block(ns_min),
+            Some(1),
+            "Should handle minimum u64 value"
+        );
+        assert_eq!(
+            index.get_namespace_block(ns_mid),
+            Some(2),
+            "Should handle mid-range u64 value"
+        );
+        assert_eq!(
+            index.get_namespace_block(ns_max),
+            Some(3),
+            "Should handle maximum u64 value"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_after_serialization() {
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Setup namespaces with distinct values from block offsets
+        let ns1 = 1234u64;
+        let ns2 = 5678u64;
+        let ns3 = 9999u64;
+
+        index.insert_ns_offset(ns1);
+        index.inc_block_count(1);
+
+        index.insert_ns_offset(ns2);
+        index.inc_block_count(1);
+
+        index.insert_ns_offset(ns3);
+        index.inc_block_count(1);
+
+        // Serialize and deserialize
+        let serialized = Bytes::from(index);
+        let deserialized = Index::from(serialized);
+
+        // Verify namespace lookups work correctly after deserialization
+        assert_eq!(
+            deserialized.get_namespace_block(ns1),
+            Some(1),
+            "After deserialization, namespace 1234 should map to block 1"
+        );
+        assert_eq!(
+            deserialized.get_namespace_block(ns2),
+            Some(2),
+            "After deserialization, namespace 5678 should map to block 2"
+        );
+        assert_eq!(
+            deserialized.get_namespace_block(ns3),
+            Some(3),
+            "After deserialization, namespace 9999 should map to block 3"
+        );
+
+        // Verify non-existent namespace returns None
+        assert_eq!(
+            deserialized.get_namespace_block(4321),
+            None,
+            "After deserialization, non-existent namespace should return None"
+        );
+    }
+
+    #[test]
+    fn test_get_namespace_block_with_mixed_operations() {
+        // Test namespace lookups in a realistic scenario with mixed operations
+        let seed = 100;
+        let mut index = Index::new(1, seed);
+
+        // Simulate a realistic workload with keys and namespaces
+        let ns1 = 100u64;
+        let ns2 = 200u64;
+
+        // Block 1: namespace 100
+        index.insert_ns_offset(ns1);
+        index.inc_block_count(1);
+
+        // Add some keys
+        for i in 0..10 {
+            let key = create_test_key_ns(i, ns1);
+            index.insert_item(&key);
+        }
+
+        // Block 2: namespace 200
+        index.insert_ns_offset(ns2);
+        index.inc_block_count(1);
+
+        // Add more keys
+        for i in 10..20 {
+            let key = create_test_key_ns(i, ns2);
+            index.insert_item(&key);
+        }
+
+        // Verify namespace lookups work correctly
+        assert_eq!(
+            index.get_namespace_block(ns1),
+            Some(1),
+            "Namespace 100 should be at block 1"
+        );
+        assert_eq!(
+            index.get_namespace_block(ns2),
+            Some(2),
+            "Namespace 200 should be at block 2"
+        );
+
+        // Verify we have entries in both arrays
+        assert!(
+            index.ns_offset_entries.len() >= 2,
+            "Should have at least 2 namespace entries"
+        );
+        assert!(
+            index.block_offset_entries.len() >= 20,
+            "Should have at least 20 block offset entries"
+        );
+    }
 }
