@@ -51,3 +51,196 @@ impl Deserializer for SegmentMetadata {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::SegmentMetadata;
+    use crate::utils::{
+        Deserializer,
+        Serializer,
+    };
+
+    #[test]
+    fn test_segment_metadata_serialization_roundtrip() {
+        let metadata = SegmentMetadata {
+            fname: "segment-001.sst".to_string(),
+            starting_key: Bytes::from("start-key"),
+            seed: 12345,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, metadata.fname);
+        assert_eq!(deserialized.starting_key, metadata.starting_key);
+        assert_eq!(deserialized.seed, metadata.seed);
+    }
+
+    #[test]
+    fn test_segment_metadata_serialize_for_memory() {
+        let metadata = SegmentMetadata {
+            fname: "test.sst".to_string(),
+            starting_key: Bytes::from("key"),
+            seed: 999,
+        };
+
+        let serialized = metadata.serialize_for_memory();
+        let deserialized = SegmentMetadata::deserialize_from_memory(serialized);
+
+        assert_eq!(deserialized.fname, metadata.fname);
+        assert_eq!(deserialized.starting_key, metadata.starting_key);
+        assert_eq!(deserialized.seed, metadata.seed);
+    }
+
+    #[test]
+    fn test_segment_metadata_empty_filename() {
+        let metadata = SegmentMetadata {
+            fname: String::new(),
+            starting_key: Bytes::from("key"),
+            seed: 0,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, "");
+        assert_eq!(deserialized.starting_key, metadata.starting_key);
+        assert_eq!(deserialized.seed, metadata.seed);
+    }
+
+    #[test]
+    fn test_segment_metadata_empty_key() {
+        let metadata = SegmentMetadata {
+            fname: "segment.sst".to_string(),
+            starting_key: Bytes::new(),
+            seed: 42,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, metadata.fname);
+        assert_eq!(deserialized.starting_key.len(), 0);
+        assert_eq!(deserialized.seed, metadata.seed);
+    }
+
+    #[test]
+    fn test_segment_metadata_long_filename() {
+        let long_name = "a".repeat(1000);
+        let metadata = SegmentMetadata {
+            fname: long_name.clone(),
+            starting_key: Bytes::from("key"),
+            seed: 777,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, long_name);
+        assert_eq!(deserialized.starting_key, metadata.starting_key);
+        assert_eq!(deserialized.seed, metadata.seed);
+    }
+
+    #[test]
+    fn test_segment_metadata_large_key() {
+        let large_key = vec![b'k'; 10000];
+        let metadata = SegmentMetadata {
+            fname: "segment.sst".to_string(),
+            starting_key: Bytes::from(large_key.clone()),
+            seed: 123,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, metadata.fname);
+        assert_eq!(deserialized.starting_key.len(), 10000);
+        assert_eq!(deserialized.seed, metadata.seed);
+    }
+
+    #[test]
+    fn test_segment_metadata_negative_seed() {
+        let metadata = SegmentMetadata {
+            fname: "segment.sst".to_string(),
+            starting_key: Bytes::from("key"),
+            seed: -999999,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, metadata.fname);
+        assert_eq!(deserialized.starting_key, metadata.starting_key);
+        assert_eq!(deserialized.seed, -999999);
+    }
+
+    #[test]
+    fn test_segment_metadata_boundary_seeds() {
+        // test with i64::MAX
+        let metadata_max = SegmentMetadata {
+            fname: "max.sst".to_string(),
+            starting_key: Bytes::from("key"),
+            seed: i64::MAX,
+        };
+
+        let serialized = metadata_max.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+        assert_eq!(deserialized.seed, i64::MAX);
+
+        // test with i64::MIN
+        let metadata_min = SegmentMetadata {
+            fname: "min.sst".to_string(),
+            starting_key: Bytes::from("key"),
+            seed: i64::MIN,
+        };
+
+        let serialized = metadata_min.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+        assert_eq!(deserialized.seed, i64::MIN);
+    }
+
+    #[test]
+    fn test_segment_metadata_special_characters_in_filename() {
+        let metadata = SegmentMetadata {
+            fname: "segment-2024_01_01-v1.0.sst".to_string(),
+            starting_key: Bytes::from("start"),
+            seed: 42,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.fname, metadata.fname);
+    }
+
+    #[test]
+    fn test_segment_metadata_unicode_in_key() {
+        let metadata = SegmentMetadata {
+            fname: "segment.sst".to_string(),
+            starting_key: Bytes::from("key-with-émojis-🔑"),
+            seed: 123,
+        };
+
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
+
+        assert_eq!(deserialized.starting_key, metadata.starting_key);
+    }
+
+    #[test]
+    fn test_segment_metadata_serialization_size() {
+        let metadata = SegmentMetadata {
+            fname: "test.sst".to_string(),
+            starting_key: Bytes::from("key"),
+            seed: 100,
+        };
+
+        let serialized = metadata.serialize();
+
+        // size should be: fname_len(8) + fname + seed(8) + key_len(8) + key
+        let expected_size = 8 + "test.sst".len() + 8 + 8 + "key".len();
+        assert_eq!(serialized.len(), expected_size);
+    }
+}

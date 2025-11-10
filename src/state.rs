@@ -102,7 +102,16 @@ impl DbStorageState {
 
 #[cfg(test)]
 mod tests {
-    use crate::state::DbStorageBuilder;
+    use bytes::Bytes;
+
+    use crate::{
+        keypair::{
+            DEFAULT_NS,
+            KeyBytes,
+            ValueBytes,
+        },
+        state::DbStorageBuilder,
+    };
 
     #[test]
     fn test_new_memtable() {
@@ -111,5 +120,124 @@ mod tests {
         assert!(state.lock().frozen_memtables.lock().is_empty());
 
         state.lock().new_memtable();
+    }
+
+    #[test]
+    fn test_memtable_swap() {
+        let state = DbStorageBuilder::default().build();
+
+        let initial_id = state.lock().current_memtable().id();
+        assert_eq!(initial_id, 0, "initial memtable should have id 0");
+
+        // swap to new memtable
+        state.lock().new_memtable();
+
+        let new_id = state.lock().current_memtable().id();
+        assert_eq!(new_id, 1, "new memtable should have id 1");
+
+        // frozen memtables should contain the old one
+        let frozen = state.lock().frozen_memtables.lock().clone();
+        assert_eq!(frozen.len(), 1, "should have 1 frozen memtable");
+        assert_eq!(frozen[0].id(), 0, "frozen memtable should have id 0");
+    }
+
+    #[test]
+    fn test_multiple_memtable_swaps() {
+        let state = DbStorageBuilder::default().build();
+
+        const NUM_SWAPS: u64 = 5;
+
+        for i in 0..NUM_SWAPS {
+            let current_id = state.lock().current_memtable().id();
+            assert_eq!(current_id, i);
+
+            state.lock().new_memtable();
+
+            let new_id = state.lock().current_memtable().id();
+            assert_eq!(new_id, i + 1);
+        }
+
+        // verify all old memtables are frozen
+        let frozen = state.lock().frozen_memtables.lock().clone();
+        assert_eq!(frozen.len(), NUM_SWAPS as usize);
+
+        // verify frozen memtables have correct ids
+        for (idx, memtable) in frozen.iter().enumerate() {
+            assert_eq!(memtable.id(), idx as u64);
+        }
+    }
+
+    #[test]
+    fn test_current_memtable_returns_same_instance() {
+        let state = DbStorageBuilder::default().build();
+
+        let mt1 = state.lock().current_memtable();
+        let mt2 = state.lock().current_memtable();
+
+        // should return the same Arc instance
+        assert_eq!(mt1.id(), mt2.id());
+    }
+
+    #[test]
+    fn test_frozen_memtables_preserve_data() {
+        let state = DbStorageBuilder::default().build();
+
+        // write data to first memtable
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("test-key"), 1000);
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::from("test-value"));
+        {
+            let current = state.lock().current_memtable();
+            assert!(current.put(key.clone(), val.clone()).is_ok());
+        }
+
+        // swap to new memtable
+        state.lock().new_memtable();
+
+        // verify data is still accessible in frozen memtable
+        let frozen = state.lock().frozen_memtables.lock().clone();
+        assert_eq!(frozen.len(), 1);
+
+        let retrieved = frozen[0].get(key);
+        assert!(retrieved.is_some(), "data should be preserved in frozen memtable");
+        assert_eq!(retrieved.unwrap().as_bytes(), val.as_bytes());
+    }
+
+    #[test]
+    fn test_storage_builder_custom_config() {
+        let custom_block_size = 8192;
+        let custom_sst_size = 16384;
+        let custom_memtable_limit = 8;
+
+        let state = DbStorageBuilder::new()
+            .block_size(custom_block_size)
+            .target_sst_size(custom_sst_size)
+            .num_memtable_limit(custom_memtable_limit)
+            .build();
+
+        // verify state is created successfully
+        let current = state.lock().current_memtable();
+        assert_eq!(current.id(), 0);
+    }
+
+    #[test]
+    fn test_storage_builder_chain() {
+        let mut builder = DbStorageBuilder::new();
+        builder.block_size(4096).target_sst_size(8192).num_memtable_limit(6);
+
+        let state = builder.build();
+        assert_eq!(state.lock().current_memtable().id(), 0);
+    }
+
+    #[test]
+    fn test_memtable_id_monotonic_increase() {
+        let state = DbStorageBuilder::default().build();
+
+        let mut prev_id = 0;
+        for _ in 0..10 {
+            state.lock().new_memtable();
+            let current_id = state.lock().current_memtable().id();
+            assert!(current_id > prev_id, "memtable ids should monotonically increase");
+            prev_id = current_id;
+        }
     }
 }
