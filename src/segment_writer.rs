@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{
             AtomicBool,
+            AtomicU64,
             AtomicUsize,
             Ordering::Relaxed,
         },
@@ -50,6 +51,7 @@ use crate::{
 pub struct SegmentWriter {
     pub(crate) map: Arc<Map>,
     current_offset: Mutex<usize>,
+    block_count: AtomicU64,
     closing: AtomicBool,
     closed: AtomicBool,
 }
@@ -60,6 +62,7 @@ impl SegmentWriter {
         Ok(Self {
             map,
             current_offset: Mutex::new(0),
+            block_count: AtomicU64::new(0),
             closing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         })
@@ -122,6 +125,9 @@ impl SegmentWriter {
         // Update offset for the next write
         *current_offset += BLOCK_SIZE;
 
+        // Increment block counter
+        self.block_count.fetch_add(1, Relaxed);
+
         Ok(())
     }
 
@@ -170,6 +176,9 @@ impl SegmentWriter {
 
         // Update offset for the next write
         *current_offset += total_size;
+
+        // Increment block counter
+        self.block_count.fetch_add(blocks.len() as u64, Relaxed);
 
         Ok(())
     }
@@ -263,6 +272,11 @@ impl SegmentWriter {
         *self.current_offset.lock()
     }
 
+    /// Get the number of blocks written
+    pub(crate) fn block_count(&self) -> u64 {
+        self.block_count.load(Relaxed)
+    }
+
     /// Close the segment writer. This will flush any remaining data to the map,
     /// and it is now safe to `drop`.
     #[instrument(level = "trace")]
@@ -282,6 +296,7 @@ impl Debug for SegmentWriter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentWriter")
             .field("current_offset", &self.current_offset())
+            .field("block_count", &self.block_count())
             .field("map_size", &self.map.len())
             .finish()
     }

@@ -496,6 +496,7 @@ mod tests {
                     .expect("Failed to write to segment");
             }
             segment.flush().expect("Failed to flush segment");
+            segment.close().expect("Failed to close segment");
         }
 
         // Step 2: Second builder opens segment and verifies data
@@ -550,6 +551,7 @@ mod tests {
                     .expect("Failed to write to segment");
             }
             segment.flush().expect("Failed to flush segment");
+            segment.close().expect("Failed to close segment");
         }
 
         // Step 2: Reopen each segment and verify data
