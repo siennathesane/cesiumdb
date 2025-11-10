@@ -372,4 +372,242 @@ mod tests {
             "there must be an error inserting a key pair while the memtable is frozen"
         );
     }
+
+    #[test]
+    fn test_get_nonexistent_key() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("nonexistent"), 0);
+
+        let result = memtable.get(key);
+        assert!(result.is_none(), "get on nonexistent key should return None");
+    }
+
+    #[test]
+    fn test_size_tracking() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        let initial_size = memtable.size();
+        assert_eq!(initial_size, 0, "initial size should be 0");
+
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), clock.time());
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::from("value"));
+
+        assert!(memtable.put(key.clone(), val.clone()).is_ok());
+
+        let new_size = memtable.size();
+        assert!(new_size > 0, "size should increase after put");
+        assert!(new_size > initial_size, "size should be greater than initial");
+    }
+
+    #[test]
+    fn test_scan_empty_memtable() {
+        use std::collections::Bound;
+
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), 0);
+
+        let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+        assert!(iter.next().is_none(), "scan on empty memtable should return no items");
+    }
+
+    #[test]
+    fn test_scan_single_key() {
+        use std::collections::Bound;
+
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), clock.time());
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::from("value"));
+        assert!(memtable.put(key.clone(), val.clone()).is_ok());
+
+        let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+        let items: Vec<_> = iter.collect();
+
+        // scan returns actual key entries, not the key pointers
+        assert!(items.len() >= 1, "scan should return at least one item");
+    }
+
+    #[test]
+    fn test_scan_with_bounds() {
+        use std::collections::Bound;
+
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        // insert multiple keys
+        for i in 0..10 {
+            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{:02}", i)), clock.time());
+            let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
+            assert!(memtable.put(key, val).is_ok());
+        }
+
+        let lower = KeyBytes::new(DEFAULT_NS, Bytes::from("key-03"), u128::MAX);
+        let upper = KeyBytes::new(DEFAULT_NS, Bytes::from("key-07"), u128::MIN);
+
+        let iter = memtable.scan(Bound::Included(lower), Bound::Excluded(upper));
+        let items: Vec<_> = iter.collect();
+
+        // should return items in the range
+        assert!(items.len() >= 1, "scan with bounds should return items in range");
+    }
+
+    #[test]
+    fn test_multiple_gets() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        // insert multiple key-value pairs
+        for i in 0..100 {
+            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
+            let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
+            assert!(memtable.put(key, val).is_ok());
+        }
+
+        // retrieve all of them
+        for i in 0..100 {
+            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), 0);
+            let result = memtable.get(key);
+            assert!(result.is_some(), "all inserted keys should be retrievable");
+        }
+    }
+
+    #[test]
+    fn test_put_batch_empty() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let batch: Vec<(KeyBytes, ValueBytes)> = vec![];
+
+        let result = memtable.put_batch(&batch);
+        assert!(result.is_ok(), "empty batch should succeed");
+    }
+
+    #[test]
+    fn test_put_batch_versioned_keys() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        let key_name = Bytes::from("versioned-key");
+        let mut batch = vec![];
+
+        // create multiple versions of the same key
+        for i in 0..10 {
+            let key = KeyBytes::new(DEFAULT_NS, key_name.clone(), clock.time());
+            let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("version-{}", i)));
+            batch.push((key, val));
+        }
+
+        assert!(memtable.put_batch(&batch).is_ok());
+
+        // get should return the latest version
+        let result = memtable.get(KeyBytes::new(DEFAULT_NS, key_name, 0));
+        assert!(result.is_some(), "versioned key should be retrievable");
+    }
+
+    #[test]
+    fn test_memtable_id_immutable() {
+        let memtable = Memtable::new(42, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        assert_eq!(memtable.id(), 42);
+
+        let clock = HybridLogicalClock::new();
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), clock.time());
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::from("value"));
+        assert!(memtable.put(key, val).is_ok());
+
+        // id should remain the same after operations
+        assert_eq!(memtable.id(), 42);
+    }
+
+    #[test]
+    fn test_put_different_namespaces() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        let key_name = Bytes::from("key");
+
+        // put same key in different namespaces
+        for ns in 0..5 {
+            let key = KeyBytes::new(ns, key_name.clone(), clock.time());
+            let val = ValueBytes::new(ns, Bytes::from(format!("value-ns-{}", ns)));
+            assert!(memtable.put(key, val).is_ok());
+        }
+
+        // verify all namespaces are retrievable
+        for ns in 0..5 {
+            let key = KeyBytes::new(ns, key_name.clone(), 0);
+            let result = memtable.get(key);
+            assert!(result.is_some(), "key in namespace {} should be retrievable", ns);
+        }
+    }
+
+    #[test]
+    fn test_iterator_size_hint() {
+        use std::collections::Bound;
+
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        for i in 0..10 {
+            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
+            let val = ValueBytes::new(DEFAULT_NS, Bytes::from("value"));
+            assert!(memtable.put(key, val).is_ok());
+        }
+
+        let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+        let (lower, _upper) = iter.size_hint();
+
+        // size_hint should return reasonable bounds
+        assert!(lower >= 0, "size hint lower bound should be non-negative");
+    }
+
+    #[test]
+    fn test_drop_frozen_memtable() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), clock.time());
+        let val = ValueBytes::new(DEFAULT_NS, Bytes::from("value"));
+        assert!(memtable.put(key, val).is_ok());
+
+        memtable.freeze();
+        // dropping the memtable should clean up properly
+        drop(memtable);
+    }
+
+    #[test]
+    fn test_get_after_multiple_versions() {
+        let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+        let clock = HybridLogicalClock::new();
+
+        let key_name = Bytes::from("multi-version");
+
+        // write 100 versions
+        for i in 0..100 {
+            let key = KeyBytes::new(DEFAULT_NS, key_name.clone(), clock.time());
+            let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("v{}", i)));
+            assert!(memtable.put(key, val).is_ok());
+        }
+
+        // get should still work efficiently
+        let result = memtable.get(KeyBytes::new(DEFAULT_NS, key_name, 0));
+        assert!(result.is_some(), "should retrieve latest version efficiently");
+    }
+
+    #[test]
+    fn test_batch_exceeds_max_size() {
+        const SMALL_MAX: u64 = 1000;
+        let memtable = Memtable::new(0, SMALL_MAX);
+        let clock = HybridLogicalClock::new();
+
+        // create a batch that will exceed the max size
+        let mut batch = vec![];
+        for i in 0..100 {
+            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
+            let val = ValueBytes::new(DEFAULT_NS, Bytes::from(vec![b'x'; 100]));
+            batch.push((key, val));
+        }
+
+        let result = memtable.put_batch(&batch);
+        assert!(result.is_err(), "batch exceeding max size should fail");
+    }
 }

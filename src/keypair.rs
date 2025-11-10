@@ -423,4 +423,236 @@ mod tests {
         let de_val = ValueBytes::deserialize_from_disk(serialized);
         assert_eq!(val, de_val);
     }
+
+    #[test]
+    fn test_key_ordering_by_namespace() {
+        let key1 = KeyBytes::new(0, Bytes::from("key"), 100);
+        let key2 = KeyBytes::new(1, Bytes::from("key"), 100);
+
+        assert!(key1 < key2, "keys should be ordered by namespace first");
+    }
+
+    #[test]
+    fn test_key_ordering_by_key_bytes() {
+        let key1 = KeyBytes::new(0, Bytes::from("aaa"), 100);
+        let key2 = KeyBytes::new(0, Bytes::from("bbb"), 100);
+
+        assert!(key1 < key2, "keys in same namespace should be ordered by key bytes");
+    }
+
+    #[test]
+    fn test_key_ordering_by_timestamp() {
+        let key1 = KeyBytes::new(0, Bytes::from("key"), 200);
+        let key2 = KeyBytes::new(0, Bytes::from("key"), 100);
+
+        // with same ns and key, newer timestamp (200) should come first (Reverse ordering)
+        assert!(key1 < key2, "keys with same ns and key should be ordered by timestamp in reverse");
+    }
+
+    #[test]
+    fn test_key_ordering_complex() {
+        // test full ordering: ns, then key, then reverse timestamp
+        let mut keys = vec![
+            KeyBytes::new(1, Bytes::from("zzz"), 100),
+            KeyBytes::new(0, Bytes::from("bbb"), 100),
+            KeyBytes::new(0, Bytes::from("aaa"), 200),
+            KeyBytes::new(0, Bytes::from("aaa"), 100),
+            KeyBytes::new(1, Bytes::from("aaa"), 100),
+        ];
+
+        keys.sort();
+
+        // expected order:
+        // (0, aaa, 200) - ns=0, key=aaa, newest timestamp
+        // (0, aaa, 100) - ns=0, key=aaa, older timestamp
+        // (0, bbb, 100) - ns=0, key=bbb
+        // (1, aaa, 100) - ns=1, key=aaa
+        // (1, zzz, 100) - ns=1, key=zzz
+
+        assert_eq!(keys[0].ns(), 0);
+        assert_eq!(keys[0].as_bytes(), Bytes::from("aaa"));
+        assert_eq!(keys[0].ts(), 200);
+
+        assert_eq!(keys[1].ns(), 0);
+        assert_eq!(keys[1].as_bytes(), Bytes::from("aaa"));
+        assert_eq!(keys[1].ts(), 100);
+
+        assert_eq!(keys[2].ns(), 0);
+        assert_eq!(keys[2].as_bytes(), Bytes::from("bbb"));
+
+        assert_eq!(keys[3].ns(), 1);
+        assert_eq!(keys[3].as_bytes(), Bytes::from("aaa"));
+
+        assert_eq!(keys[4].ns(), 1);
+        assert_eq!(keys[4].as_bytes(), Bytes::from("zzz"));
+    }
+
+    #[test]
+    fn test_key_empty() {
+        let key = KeyBytes::new(0, Bytes::new(), 0);
+        assert!(key.is_empty());
+        assert_eq!(key.key_len(), 0);
+
+        let serialized = key.serialize_for_memory();
+        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        assert!(deserialized.is_empty());
+    }
+
+    #[test]
+    fn test_key_large() {
+        let large_key = vec![b'k'; 10000];
+        let key = KeyBytes::new(0, Bytes::from(large_key.clone()), 999999);
+
+        assert_eq!(key.key_len(), 10000);
+        assert_eq!(key.raw_len(), 10000 + size_of::<u64>() + size_of::<u128>());
+
+        let serialized = key.serialize_for_memory();
+        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+
+        assert_eq!(deserialized.key_len(), 10000);
+        assert_eq!(deserialized.as_bytes().len(), 10000);
+    }
+
+    #[test]
+    fn test_value_empty() {
+        let val = ValueBytes::new(0, Bytes::new());
+        assert_eq!(val.as_bytes().len(), 0);
+
+        let serialized = val.serialize_for_memory();
+        let deserialized = ValueBytes::deserialize_from_memory(serialized);
+        assert_eq!(deserialized.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_value_large() {
+        let large_value = vec![b'v'; 100000];
+        let val = ValueBytes::new(42, Bytes::from(large_value.clone()));
+
+        assert_eq!(val.as_bytes().len(), 100000);
+
+        let serialized = val.serialize_for_storage();
+        let deserialized = ValueBytes::deserialize_from_disk(serialized);
+
+        assert_eq!(deserialized.ns(), 42);
+        assert_eq!(deserialized.as_bytes().len(), 100000);
+    }
+
+    #[test]
+    fn test_key_default() {
+        let key = KeyBytes::default();
+        assert_eq!(key.ns(), 0);
+        assert_eq!(key.ts(), 0);
+        assert!(key.is_empty());
+    }
+
+    #[test]
+    fn test_value_default() {
+        let val = ValueBytes::default();
+        assert_eq!(val.ns(), 0);
+        assert_eq!(val.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_key_setters() {
+        let mut key = KeyBytes::new(0, Bytes::from("original"), 100);
+
+        key.set_ns(5);
+        assert_eq!(key.ns(), 5);
+
+        key.set_ts(200);
+        assert_eq!(key.ts(), 200);
+
+        key.set_key(Bytes::from("modified"));
+        assert_eq!(key.as_bytes(), Bytes::from("modified"));
+    }
+
+    #[test]
+    fn test_value_setters() {
+        let mut val = ValueBytes::new(0, Bytes::from("original"));
+
+        val.set_ns(10);
+        assert_eq!(val.ns(), 10);
+    }
+
+    #[test]
+    fn test_value_from_slice() {
+        let data = b"test data";
+        let val = ValueBytes::from_slice(3, data);
+
+        assert_eq!(val.ns(), 3);
+        assert_eq!(val.as_bytes(), Bytes::from(&data[..]));
+    }
+
+    #[test]
+    fn test_value_ordering() {
+        let val1 = ValueBytes::new(0, Bytes::from("aaa"));
+        let val2 = ValueBytes::new(0, Bytes::from("bbb"));
+        let val3 = ValueBytes::new(1, Bytes::from("aaa"));
+
+        assert!(val1 < val2, "values should be ordered by value bytes in same namespace");
+        assert!(val1 < val3, "values should be ordered by namespace first");
+        assert!(val2 < val3, "namespace ordering should take precedence");
+    }
+
+    #[test]
+    fn test_map_key_bound() {
+        use std::collections::Bound;
+
+        use crate::keypair::map_key_bound;
+
+        let key = KeyBytes::new(0, Bytes::from("test"), 100);
+        let bound = Bound::Included(key.clone());
+        let mapped = map_key_bound(bound);
+
+        match mapped {
+            | Bound::Included(bytes) => {
+                let deserialized = KeyBytes::deserialize_from_memory(bytes);
+                assert_eq!(deserialized, key);
+            },
+            | _ => panic!("expected Included bound"),
+        }
+
+        let bound = Bound::Excluded(key.clone());
+        let mapped = map_key_bound(bound);
+        match mapped {
+            | Bound::Excluded(_) => {},
+            | _ => panic!("expected Excluded bound"),
+        }
+
+        let bound: Bound<KeyBytes> = Bound::Unbounded;
+        let mapped = map_key_bound(bound);
+        match mapped {
+            | Bound::Unbounded => {},
+            | _ => panic!("expected Unbounded bound"),
+        }
+    }
+
+    #[test]
+    fn test_timestamp_boundary_values() {
+        // test with u128::MAX timestamp
+        let key_max = KeyBytes::new(0, Bytes::from("key"), u128::MAX);
+        let serialized = key_max.serialize_for_memory();
+        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        assert_eq!(deserialized.ts(), u128::MAX);
+
+        // test with 0 timestamp
+        let key_zero = KeyBytes::new(0, Bytes::from("key"), 0);
+        let serialized = key_zero.serialize_for_memory();
+        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        assert_eq!(deserialized.ts(), 0);
+    }
+
+    #[test]
+    fn test_namespace_boundary_values() {
+        // test with u64::MAX namespace
+        let key = KeyBytes::new(u64::MAX, Bytes::from("key"), 100);
+        let serialized = key.serialize_for_memory();
+        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        assert_eq!(deserialized.ns(), u64::MAX);
+
+        let val = ValueBytes::new(u64::MAX, Bytes::from("value"));
+        let serialized = val.serialize_for_memory();
+        let deserialized = ValueBytes::deserialize_from_memory(serialized);
+        assert_eq!(deserialized.ns(), u64::MAX);
+    }
 }
