@@ -151,19 +151,32 @@ impl<'a> SegmentReader<'a> {
                 | None => continue,
             };
 
+            // Extract metadata from key entry
+            // Format: [value_block_num:u64][value_entry_index:u16][key_data]
+            if data.len() < 10 {
+                continue; // Invalid entry, skip
+            }
+
+            let value_block_num = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            let value_entry_index = u16::from_le_bytes(data[8..10].try_into().unwrap());
+            let actual_key_data = &data[10..];
+
             // Handle based on entry flag
             let key_matches = match flag {
                 | EntryFlag::Complete => {
                     // Simple comparison for complete entries
-                    let matches = data == key;
-                    matches
+                    actual_key_data == key
                 },
                 | EntryFlag::Start => {
                     // For multi-block keys, read the full key and compare
                     match self.read_key(key_block_offset as usize, entry_index) {
                         | Ok(full_key_data) => {
-                            let matches = full_key_data.as_ref() == key;
-                            matches
+                            // Strip metadata from full key data
+                            if full_key_data.len() < 10 {
+                                continue;
+                            }
+                            let full_actual_key = &full_key_data[10..];
+                            full_actual_key == key
                         },
                         | Err(e) => {
                             continue;
@@ -173,18 +186,10 @@ impl<'a> SegmentReader<'a> {
                 | _ => continue, // Skip middle or end entries
             };
 
-            // If key matches, read the value
+            // If key matches, read the value using embedded metadata
             if key_matches {
-                // Use val_index to find the value block for this key
-                let val_block_offset = match self.val_index.get_block(key) {
-                    | Some(v) => v,
-                    | None => {
-                        return Ok(None);
-                    },
-                };
-
-                // Read the value from the found block
-                return match self.read_value(val_block_offset as usize, 0) {
+                // Use the embedded value block and entry index for O(1) lookup
+                return match self.read_value(value_block_num as usize, value_entry_index as usize) {
                     | Ok(v) => Ok(Some(v)),
                     | Err(e) => Err(e),
                 };
@@ -589,6 +594,16 @@ mod tests {
         .unwrap();
     }
 
+    // helper to add metadata to key for tests
+    // Format: [value_block_num:u64][value_entry_index:u16][key_data]
+    fn add_key_metadata(key: &[u8], value_block: u64, value_entry: u16) -> Vec<u8> {
+        let mut result = Vec::with_capacity(10 + key.len());
+        result.extend_from_slice(&value_block.to_le_bytes());
+        result.extend_from_slice(&value_entry.to_le_bytes());
+        result.extend_from_slice(key);
+        result
+    }
+
     #[test]
     fn test_new_segment_reader() {
         let size = BLOCK_SIZE * 4;
@@ -816,9 +831,12 @@ mod tests {
         let key = b"test_key";
         let value = b"test_value";
 
+        // Value is at block 0, entry 0
+        let key_with_metadata = add_key_metadata(key, 0, 0);
+
         // create blocks
         let mut key_block = Block::new();
-        key_block.add_entry(key, EntryFlag::Complete).unwrap();
+        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
 
         let mut val_block = Block::new();
         val_block.add_entry(value, EntryFlag::Complete).unwrap();
@@ -827,12 +845,12 @@ mod tests {
         write_block_to_mapfor_get(&key_map, 0, &key_block);
         write_block_to_mapfor_get(&val_map, 0, &val_block);
 
-        // update indexes
-        key_index.inc_block_count(1);
+        // update indexes (index the original key without metadata)
         key_index.insert_item(key);
-        
         key_index.inc_block_count(1);
+
         val_index.insert_item(key);
+        val_index.inc_block_count(1);
 
         // create segment reader
         let reader =
@@ -869,9 +887,12 @@ mod tests {
         // Using a much smaller fixed size to avoid any size calculation issues
         let large_value = vec![b'v'; 1000]; // 1000 bytes is safe and still tests the functionality
 
+        // Value starts at block 0, entry 0
+        let key_with_metadata = add_key_metadata(key, 0, 0);
+
         // create and prepare key block
         let mut key_block = Block::new();
-        key_block.add_entry(key, EntryFlag::Complete).unwrap();
+        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
 
         // create and prepare value blocks (start, end)
         let mut val_block1 = Block::new();
@@ -889,12 +910,12 @@ mod tests {
         write_block_to_mapfor_get(&val_map, 0, &val_block1);
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2);
 
-        // update indexes
-        key_index.inc_block_count(1);
+        // update indexes (index the original key without metadata)
         key_index.insert_item(key);
-        
         key_index.inc_block_count(1);
+
         val_index.insert_item(key);
+        val_index.inc_block_count(2);  // Value spans 2 blocks
 
         // create segment reader
         let reader =
@@ -919,9 +940,12 @@ mod tests {
         // Create smaller value that spans blocks but is easier to debug
         let value = vec![b'v'; 800];
 
+        // Value starts at block 0, entry 0
+        let key_with_metadata = add_key_metadata(key, 0, 0);
+
         // Create key block - just use a simple single-block key
         let mut key_block = Block::new();
-        key_block.add_entry(key, EntryFlag::Complete).unwrap();
+        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
 
         // Create value blocks with smaller chunks
         let mut val_block1 = Block::new();
@@ -938,11 +962,11 @@ mod tests {
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2);
 
         // Update indexes - make sure the same exact key is used
-        key_index.inc_block_count(1);
         key_index.insert_item(key);
-        
         key_index.inc_block_count(1);
+
         val_index.insert_item(key);
+        val_index.inc_block_count(2);  // Value spans 2 blocks
 
         // Debug: Verify the key is in the index
         assert!(key_index.may_contain(key), "Key should be in bloom filter");
@@ -1011,9 +1035,12 @@ mod tests {
         // create test key
         let key = b"test_key";
 
+        // Value starts at block 0, entry 0
+        let key_with_metadata = add_key_metadata(key, 0, 0);
+
         // create key block with valid entry
         let mut key_block = Block::new();
-        key_block.add_entry(key, EntryFlag::Complete).unwrap();
+        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
 
         // add corrupted value block (with wrong flag sequence)
         let mut val_block = Block::new();
@@ -1023,12 +1050,12 @@ mod tests {
         write_block_to_mapfor_get(&key_map, 0, &key_block);
         write_block_to_mapfor_get(&val_map, 0, &val_block);
 
-        // update indexes
-        key_index.inc_block_count(1);
+        // update indexes (index the original key without metadata)
         key_index.insert_item(key);
-
         key_index.inc_block_count(1);
+
         val_index.insert_item(key);
+        val_index.inc_block_count(1);
 
         // create segment reader
         let reader =
@@ -1053,15 +1080,20 @@ mod tests {
         let val2 = b"value2";
         let val3 = b"value3";
 
+        // Add metadata: key1 -> val_block 0, entry 0; key2 -> val_block 1, entry 0; key3 -> val_block 2, entry 0
+        let key1_with_metadata = add_key_metadata(key1, 0, 0);
+        let key2_with_metadata = add_key_metadata(key2, 1, 0);
+        let key3_with_metadata = add_key_metadata(key3, 2, 0);
+
         // Create individual blocks for each key
         let mut key_block1 = Block::new();
-        key_block1.add_entry(key1, EntryFlag::Complete).unwrap();
+        key_block1.add_entry(&key1_with_metadata, EntryFlag::Complete).unwrap();
 
         let mut key_block2 = Block::new();
-        key_block2.add_entry(key2, EntryFlag::Complete).unwrap();
+        key_block2.add_entry(&key2_with_metadata, EntryFlag::Complete).unwrap();
 
         let mut key_block3 = Block::new();
-        key_block3.add_entry(key3, EntryFlag::Complete).unwrap();
+        key_block3.add_entry(&key3_with_metadata, EntryFlag::Complete).unwrap();
 
         // Create individual blocks for each value
         let mut val_block1 = Block::new();
@@ -1082,24 +1114,24 @@ mod tests {
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2); // Block 1
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE * 2, &val_block3); // Block 2
 
-        // Add to indexes - each will be assigned sequential block IDs
-        key_index.inc_block_count(1); // This will be block 1
-        key_index.insert_item(key1);
+        // Add to indexes - index the original keys (without metadata)
+        key_index.insert_item(key1);  // Block 0
+        key_index.inc_block_count(1);
 
-        key_index.inc_block_count(1); // This will be block 2
-        key_index.insert_item(key2);
+        key_index.insert_item(key2);  // Block 1
+        key_index.inc_block_count(1);
 
-        key_index.inc_block_count(1); // This will be block 3
-        key_index.insert_item(key3);
+        key_index.insert_item(key3);  // Block 2
+        key_index.inc_block_count(1);
 
-        key_index.inc_block_count(1); // This will be block 4
-        val_index.insert_item(key1);
+        val_index.insert_item(key1);  // Block 0
+        val_index.inc_block_count(1);
 
-        key_index.inc_block_count(1); // This will be block 5
-        val_index.insert_item(key2);
+        val_index.insert_item(key2);  // Block 1
+        val_index.inc_block_count(1);
 
-        key_index.inc_block_count(1); // This will be block 6
-        val_index.insert_item(key3);
+        val_index.insert_item(key3);  // Block 2
+        val_index.inc_block_count(1);
 
         // Create reader
         let reader =

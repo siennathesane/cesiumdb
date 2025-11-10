@@ -103,11 +103,6 @@ impl Index {
     pub fn insert_item(&mut self, key: &[u8]) {
         let hash = gxhash64(key, self.bloom_filter_seed);
 
-        // if no blocks exist, we need to increment the block counter.
-        if self.num_blocks == 0 {
-            self.inc_block_count(1);
-        }
-
         self.bloom_filter.insert(&hash);
         match self
             .block_offset_entries
@@ -128,9 +123,6 @@ impl Index {
     /// Insert a namespace offset to the most recent block.
     #[instrument(level = "trace")]
     pub fn insert_ns_offset(&mut self, ns: u64) {
-        if self.num_blocks == 0 {
-            self.num_blocks += 1;
-        }
         match self
             .ns_offset_entries
             .binary_search_by_key(&ns, |(h, _)| *h)
@@ -151,7 +143,9 @@ impl Index {
     pub fn get_namespace_block(&self, ns: u64) -> Option<u64> {
         self.ns_offset_entries
             .binary_search_by_key(&ns, |(n, b)| *n)
+            .binary_search_by_key(&ns, |(n, b)| *n)
             .ok()
+            .map(|idx| self.ns_offset_entries[idx].1)
             .map(|idx| self.ns_offset_entries[idx].1)
     }
 
@@ -178,7 +172,7 @@ impl Index {
 
     /// Get the total number of namespace offsets in the index
     pub fn ns_offset_count(&self) -> u64 {
-        (self.ns_offset_entries.len() / 16) as u64
+        self.ns_offset_entries.len() as u64
     }
 
     /// Returns the total size in bytes this index will occupy when serialized.
@@ -540,7 +534,7 @@ mod tests {
 
         index.insert_ns_offset(test_ns);
 
-        assert_eq!((test_ns, 1), index.ns_offset_entries[0]);
+        assert_eq!((test_ns, 0), index.ns_offset_entries[0]);
     }
 
     #[test]
@@ -595,7 +589,7 @@ mod tests {
         ); // block_offset_size
         assert_eq!(
             u64::from_le_bytes(serialized[40..48].try_into().unwrap()),
-            11
+            10
         ); // num_blocks
     }
 
@@ -636,7 +630,7 @@ mod tests {
         assert_eq!(id, deserialized.id);
         assert_eq!(seed, deserialized.bloom_filter_seed);
         assert_eq!(ns_offsets, deserialized.ns_offset_entries.len());
-        assert_eq!(blocks + 1, deserialized.block_count());
+        assert_eq!(blocks, deserialized.block_count());
 
         // verify all added keys are found in the deserialized index
         for key in &keys {
@@ -731,7 +725,7 @@ mod tests {
         let key2 = create_test_key(202);
         let key3 = create_test_key(303);
 
-        // First block
+        // First block (0-indexed)
         index.insert_item(&key1);
         index.inc_block_count(1);
 
@@ -742,10 +736,10 @@ mod tests {
         // Third block
         index.insert_item(&key3);
 
-        // Verify we can find each key in its respective block
-        assert_eq!(index.get_block(&key1), Some(1), "Key1 should be in block 1");
-        assert_eq!(index.get_block(&key2), Some(2), "Key2 should be in block 2");
-        assert_eq!(index.get_block(&key3), Some(3), "Key3 should be in block 3");
+        // Verify we can find each key in its respective block (0-indexed)
+        assert_eq!(index.get_block(&key1), Some(0), "Key1 should be in block 0");
+        assert_eq!(index.get_block(&key2), Some(1), "Key2 should be in block 1");
+        assert_eq!(index.get_block(&key3), Some(2), "Key3 should be in block 2");
 
         // Test that a non-existent key returns None
         let nonexistent_key = create_test_key(999);
@@ -761,18 +755,18 @@ mod tests {
 
         assert_eq!(
             deserialized.get_block(&key1),
-            Some(1),
-            "After serialization, key1 should be in block 1"
+            Some(0),
+            "After serialization, key1 should be in block 0"
         );
         assert_eq!(
             deserialized.get_block(&key2),
-            Some(2),
-            "After serialization, key2 should be in block 2"
+            Some(1),
+            "After serialization, key2 should be in block 1"
         );
         assert_eq!(
             deserialized.get_block(&key3),
-            Some(3),
-            "After serialization, key3 should be in block 3"
+            Some(2),
+            "After serialization, key3 should be in block 2"
         );
         assert_eq!(
             deserialized.get_block(&nonexistent_key),
@@ -796,33 +790,33 @@ mod tests {
         let ns2 = 200u64;
         let ns3 = 300u64;
 
-        // Namespace 100 starts at block 1
+        // Namespace 100 starts at block 0 (0-indexed)
         index.insert_ns_offset(ns1);
         index.inc_block_count(1);
 
-        // Namespace 200 starts at block 2
+        // Namespace 200 starts at block 1
         index.insert_ns_offset(ns2);
         index.inc_block_count(1);
 
-        // Namespace 300 starts at block 3
+        // Namespace 300 starts at block 2
         index.insert_ns_offset(ns3);
         index.inc_block_count(1);
 
-        // Verify we can find each namespace's starting block
+        // Verify we can find each namespace's starting block (0-indexed)
         assert_eq!(
             index.get_namespace_block(ns1),
-            Some(1),
-            "Namespace 100 should start at block 1"
+            Some(0),
+            "Namespace 100 should start at block 0"
         );
         assert_eq!(
             index.get_namespace_block(ns2),
-            Some(2),
-            "Namespace 200 should start at block 2"
+            Some(1),
+            "Namespace 200 should start at block 1"
         );
         assert_eq!(
             index.get_namespace_block(ns3),
-            Some(3),
-            "Namespace 300 should start at block 3"
+            Some(2),
+            "Namespace 300 should start at block 2"
         );
     }
 
@@ -866,14 +860,14 @@ mod tests {
         // Create a scenario where namespace values and block offsets differ significantly
         // This ensures the binary search is using the right field
 
-        // Namespace 50 maps to block 1
+        // Namespace 50 maps to block 0
         index.insert_ns_offset(50);
 
-        // Namespace 150 maps to block 2 (increment block count first)
+        // Namespace 150 maps to block 1 (increment block count first)
         index.inc_block_count(1);
         index.insert_ns_offset(150);
 
-        // Namespace 300 maps to block 3
+        // Namespace 300 maps to block 2
         index.inc_block_count(1);
         index.insert_ns_offset(300);
 
@@ -881,35 +875,35 @@ mod tests {
         // because it would try to search by block offset instead of namespace
         assert_eq!(
             index.get_namespace_block(50),
-            Some(1),
-            "Should find namespace 50 at block 1"
+            Some(0),
+            "Should find namespace 50 at block 0"
         );
         assert_eq!(
             index.get_namespace_block(150),
-            Some(2),
-            "Should find namespace 150 at block 2"
+            Some(1),
+            "Should find namespace 150 at block 1"
         );
         assert_eq!(
             index.get_namespace_block(300),
-            Some(3),
-            "Should find namespace 300 at block 3"
+            Some(2),
+            "Should find namespace 300 at block 2"
         );
 
         // These should not be found (proving we're searching by namespace, not block offset)
         assert_eq!(
             index.get_namespace_block(1),
             None,
-            "Block offset 1 should not be found as a namespace"
+            "Block offset 0 should not be found as a namespace"
         );
         assert_eq!(
             index.get_namespace_block(2),
             None,
-            "Block offset 2 should not be found as a namespace"
+            "Block offset 1 should not be found as a namespace"
         );
         assert_eq!(
             index.get_namespace_block(3),
             None,
-            "Block offset 3 should not be found as a namespace"
+            "Block offset 2 should not be found as a namespace"
         );
 
         // More specifically, test that we're NOT finding by block values
@@ -957,13 +951,13 @@ mod tests {
 
         assert_eq!(
             result1,
-            Some(1),
-            "Namespace 1000 should map to block 1 from ns_offset_entries"
+            Some(0),
+            "Namespace 1000 should map to block 0 from ns_offset_entries"
         );
         assert_eq!(
             result2,
-            Some(2),
-            "Namespace 2000 should map to block 2 from ns_offset_entries"
+            Some(1),
+            "Namespace 2000 should map to block 1 from ns_offset_entries"
         );
 
         // Verify the arrays are actually different in size
@@ -993,7 +987,7 @@ mod tests {
 
         // Verify all namespaces can be found correctly
         for (i, ns) in namespaces.iter().enumerate() {
-            let expected_block = (i + 1) as u64;
+            let expected_block = i as u64;
             assert_eq!(
                 index.get_namespace_block(*ns),
                 Some(expected_block),
@@ -1030,17 +1024,17 @@ mod tests {
 
         assert_eq!(
             index.get_namespace_block(ns_min),
-            Some(1),
+            Some(0),
             "Should handle minimum u64 value"
         );
         assert_eq!(
             index.get_namespace_block(ns_mid),
-            Some(2),
+            Some(1),
             "Should handle mid-range u64 value"
         );
         assert_eq!(
             index.get_namespace_block(ns_max),
-            Some(3),
+            Some(2),
             "Should handle maximum u64 value"
         );
     }
@@ -1071,18 +1065,18 @@ mod tests {
         // Verify namespace lookups work correctly after deserialization
         assert_eq!(
             deserialized.get_namespace_block(ns1),
-            Some(1),
-            "After deserialization, namespace 1234 should map to block 1"
+            Some(0),
+            "After deserialization, namespace 1234 should map to block 0"
         );
         assert_eq!(
             deserialized.get_namespace_block(ns2),
-            Some(2),
-            "After deserialization, namespace 5678 should map to block 2"
+            Some(1),
+            "After deserialization, namespace 5678 should map to block 1"
         );
         assert_eq!(
             deserialized.get_namespace_block(ns3),
-            Some(3),
-            "After deserialization, namespace 9999 should map to block 3"
+            Some(2),
+            "After deserialization, namespace 9999 should map to block 2"
         );
 
         // Verify non-existent namespace returns None
@@ -1126,13 +1120,13 @@ mod tests {
         // Verify namespace lookups work correctly
         assert_eq!(
             index.get_namespace_block(ns1),
-            Some(1),
-            "Namespace 100 should be at block 1"
+            Some(0),
+            "Namespace 100 should be at block 0"
         );
         assert_eq!(
             index.get_namespace_block(ns2),
-            Some(2),
-            "Namespace 200 should be at block 2"
+            Some(1),
+            "Namespace 200 should be at block 1"
         );
 
         // Verify we have entries in both arrays
