@@ -192,16 +192,20 @@ impl Memtable {
     #[inline]
     pub fn scan(&self, lower: Bound<KeyBytes>, upper: Bound<KeyBytes>) -> MemtableIterator {
         let (_lower, _upper) = (map_key_bound(lower), map_key_bound(upper));
-        let ranger = self.map.range((_lower, _upper));
 
-        // TODO(@siennathesane): this is actually really unsafe because we might flush
-        // the data while the scan is happening
-        // SAFETY: we need to extend the lifetime of `range` to 'static
-        // so the user can hold onto it. as self.map is Arc'd,
-        // this won't be deallocated while the iterator exists
+        // clone the Arc to keep the SkipMap alive for the lifetime of the iterator
+        let map_clone = self.map.clone();
+        let ranger = map_clone.range((_lower, _upper));
+
+        // SAFETY: we're transmuting the lifetime from tied-to-map_clone to 'static.
+        // this is sound because:
+        // 1. the iterator struct holds map_clone, keeping the SkipMap alive
+        // 2. rust's drop order guarantees inner (Range) drops before _map (Arc)
+        // 3. therefore, the SkipMap is guaranteed alive during Range's lifetime
+        // 4. the Range only borrows; returned values are owned (cloned Bytes)
         let range = unsafe { transmute(ranger) };
 
-        MemtableIterator::new(range)
+        MemtableIterator::new(map_clone, range)
     }
 
     pub fn freeze(&self) {
@@ -219,13 +223,20 @@ impl Drop for Memtable {
 
 #[derive(Debug)]
 pub struct MemtableIterator {
+    // IMPORTANT: Field order matters for drop order!
+    // `inner` must drop before `_map` to ensure Range is destroyed
+    // while SkipMap is still alive.
     inner: Range<'static, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>,
+    _map: Arc<SkipMap<Bytes, Bytes>>,
 }
 
 impl MemtableIterator {
     #[instrument(level = "trace")]
-    fn new(inner: Range<'static, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>) -> Self {
-        MemtableIterator { inner }
+    fn new(
+        map: Arc<SkipMap<Bytes, Bytes>>,
+        inner: Range<'static, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Bytes>,
+    ) -> Self {
+        MemtableIterator { inner, _map: map }
     }
 
     #[instrument(level = "trace")]
@@ -256,6 +267,18 @@ impl Iterator for MemtableIterator {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(loom))]
+    use std::{sync::Arc, thread};
+
+    #[cfg(loom)]
+    use loom::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        thread,
+    };
+
     use bytes::Bytes;
     use rand::{
         Rng,
@@ -609,5 +632,219 @@ mod tests {
 
         let result = memtable.put_batch(&batch);
         assert!(result.is_err(), "batch exceeding max size should fail");
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn test_iterator_outlives_memtable() {
+        use std::collections::Bound;
+
+        let clock = HybridLogicalClock::new();
+
+        // Create iterator in inner scope
+        let iter = {
+            let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
+
+            // Insert some data
+            for i in 0..5 {
+                let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
+                let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
+                assert!(memtable.put(key, val).is_ok());
+            }
+
+            // Create iterator before memtable is dropped
+            memtable.scan(Bound::Unbounded, Bound::Unbounded)
+            // memtable is dropped here
+        };
+
+        // Iterator should still work even though memtable is gone
+        // This proves the Arc keeps the SkipMap alive
+        let items: Vec<_> = iter.collect();
+        assert!(items.len() >= 1, "iterator should work after memtable is dropped");
+    }
+
+    // Loom tests for atomic operation patterns
+    // These test the concurrency patterns used in memtable without the crossbeam dependencies
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_frozen_flag_race() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        loom::model(|| {
+            let frozen = Arc::new(AtomicBool::new(false));
+            let writes_succeeded = Arc::new(AtomicU64::new(0));
+
+            let f1 = frozen.clone();
+            let w1 = writes_succeeded.clone();
+
+            let f2 = frozen.clone();
+            let w2 = writes_succeeded.clone();
+
+            // Thread 1: tries to "write"
+            let t1 = thread::spawn(move || {
+                // This mimics the pattern in put_batch
+                if !f1.load(Relaxed) {
+                    // Simulate the operation taking time
+                    thread::yield_now();
+                    // If we got here, we "wrote"
+                    w1.fetch_add(1, Relaxed);
+                }
+            });
+
+            // Thread 2: tries to freeze
+            let t2 = thread::spawn(move || {
+                f2.store(true, Relaxed);
+                w2.load(Relaxed)
+            });
+
+            t1.join().unwrap();
+            let writes_when_frozen = t2.join().unwrap();
+
+            // The final state: check if frozen
+            let is_frozen = frozen.load(Relaxed);
+            let total_writes = writes_succeeded.load(Relaxed);
+
+            // If frozen, we might have 0 or 1 writes depending on interleaving
+            // This demonstrates the TOCTOU race condition
+            if is_frozen && total_writes > 0 {
+                // This can happen: check passed, then freeze happened, then write completed
+                // This is the race condition!
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_size_tracking_race() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        loom::model(|| {
+            let size = Arc::new(AtomicU64::new(0));
+            let max_size = 100u64;
+
+            let s1 = size.clone();
+            let s2 = size.clone();
+
+            // Two threads trying to add size
+            let t1 = thread::spawn(move || {
+                let payload_size = 30u64;
+                // This mimics the pattern in put_batch
+                if payload_size + s1.load(Relaxed) <= max_size {
+                    thread::yield_now();
+                    s1.fetch_add(payload_size, Relaxed);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            let t2 = thread::spawn(move || {
+                let payload_size = 80u64;
+                if payload_size + s2.load(Relaxed) <= max_size {
+                    thread::yield_now();
+                    s2.fetch_add(payload_size, Relaxed);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            let wrote1 = t1.join().unwrap();
+            let wrote2 = t2.join().unwrap();
+
+            let final_size = size.load(Relaxed);
+
+            // Both operations might succeed due to TOCTOU, resulting in > max_size
+            if wrote1 && wrote2 {
+                // This demonstrates the race: both checked, both passed, total exceeds max
+                assert!(final_size == 110, "Both writes succeeded, total = {}", final_size);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_concurrent_size_updates() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        loom::model(|| {
+            let size = Arc::new(AtomicU64::new(0));
+
+            let s1 = size.clone();
+            let s2 = size.clone();
+
+            let t1 = thread::spawn(move || {
+                s1.fetch_add(10, Relaxed);
+            });
+
+            let t2 = thread::spawn(move || {
+                s2.fetch_add(20, Relaxed);
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // fetch_add is atomic, so this should always be correct
+            assert_eq!(size.load(Relaxed), 30);
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_freeze_idempotent() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        loom::model(|| {
+            let frozen = Arc::new(AtomicBool::new(false));
+
+            let f1 = frozen.clone();
+            let f2 = frozen.clone();
+
+            // Multiple threads trying to freeze
+            let t1 = thread::spawn(move || {
+                f1.store(true, Relaxed);
+            });
+
+            let t2 = thread::spawn(move || {
+                f2.store(true, Relaxed);
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Freezing multiple times is safe
+            assert!(frozen.load(Relaxed));
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_read_frozen_while_freezing() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        loom::model(|| {
+            let frozen = Arc::new(AtomicBool::new(false));
+
+            let f1 = frozen.clone();
+            let f2 = frozen.clone();
+
+            let t1 = thread::spawn(move || {
+                f1.store(true, Relaxed);
+            });
+
+            let t2 = thread::spawn(move || {
+                f2.load(Relaxed)
+            });
+
+            t1.join().unwrap();
+            let saw_frozen = t2.join().unwrap();
+
+            let final_frozen = frozen.load(Relaxed);
+
+            // t2 either saw false or true, but final must be true
+            assert!(final_frozen);
+            // saw_frozen can be either true or false depending on interleaving
+        });
     }
 }

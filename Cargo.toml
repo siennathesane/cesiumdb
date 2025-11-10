@@ -1,8 +1,11 @@
 [package]
 name = "cesiumdb"
-authors = ["Sienna Satterwhite <sienna@linux.com>", "CesiumDB Authors"]
-version = "0.0.4"
+authors = ["Sienna Meridian Satterwhite <sienna@r3t.io>"]
+version = "0.0.5"
 edition = "2024"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
 default_features = []
@@ -18,14 +21,15 @@ crossbeam-channel = "0.5" # no_std might be supported soon?
 crossbeam-queue = "0.3"# no_std support, i think
 crossbeam-skiplist = "0.1" # no_std support, i think
 gxhash = "3.4.1"# no_std support
+lazy_static = "1.5.0"
+loom = { version = "0.7" }
 memmap2 = "0.9.5" # there would need to be a functional replacement of the filesystem library, but it might be possible
 mimalloc = { version = "0.1.43" } # maybe there's no_std support? big question mark
+once_cell = "1.20.2"
 parking_lot = { version = "0.12.3", features = ["deadlock_detection"] } # we would need to find a replacement for this, maybe lock_api?
 rand = "0.9.0" # has no_std support
-thiserror = "1.0" # it looks like there is no_std support
+thiserror = "2.0" # it looks like there is no_std support
 tracing = "0.1"
-lazy_static = "1.5.0"
-once_cell = "1.20.2"
 
 [dev-dependencies]
 criterion = "0.5"

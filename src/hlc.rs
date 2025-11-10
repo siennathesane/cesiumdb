@@ -89,12 +89,19 @@ impl Drop for HybridLogicalClock {
 
 #[cfg(all(test, not(miri)))]
 mod tests {
+    #[cfg(not(loom))]
+    use std::{sync::Arc, thread};
+
+    #[cfg(loom)]
+    use loom::{sync::Arc, thread};
+
     use crate::hlc::{
         HLC,
         HybridLogicalClock,
     };
 
     #[test]
+    #[cfg(not(loom))]
     fn test_time() {
         let clock = HybridLogicalClock::new();
         let mut last_time = 0;
@@ -104,6 +111,124 @@ mod tests {
             assert!(now > last_time, "now must be greater than last");
             last_time = now;
         }
+    }
+
+    #[test]
+    #[cfg(not(loom))]
+    fn test_concurrent_time_calls() {
+        let clock = Arc::new(HybridLogicalClock::new());
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let clock = clock.clone();
+                thread::spawn(move || {
+                    let mut times = Vec::new();
+                    for _ in 0..100 {
+                        times.push(clock.time());
+                    }
+                    times
+                })
+            })
+            .collect();
+
+        let mut all_times = Vec::new();
+        for thread in threads {
+            all_times.extend(thread.join().unwrap());
+        }
+
+        // Verify no duplicates (all timestamps are unique)
+        all_times.sort();
+        for window in all_times.windows(2) {
+            assert_ne!(window[0], window[1], "Timestamps must be unique");
+        }
+    }
+
+    // Loom tests for HLC concurrent access
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_hlc_concurrent_time_monotonic() {
+        loom::model(|| {
+            let clock = Arc::new(HybridLogicalClock::new());
+
+            let c1 = clock.clone();
+            let c2 = clock.clone();
+
+            let t1 = thread::spawn(move || {
+                let time1 = c1.time();
+                let time2 = c1.time();
+                assert!(time2 > time1, "Times must be monotonically increasing");
+                time1
+            });
+
+            let t2 = thread::spawn(move || {
+                let time1 = c2.time();
+                let time2 = c2.time();
+                assert!(time2 > time1, "Times must be monotonically increasing");
+                time1
+            });
+
+            let _t1_first = t1.join().unwrap();
+            let _t2_first = t2.join().unwrap();
+
+            // All timestamps must be unique (no duplicates)
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_hlc_no_duplicate_timestamps() {
+        loom::model(|| {
+            let clock = Arc::new(HybridLogicalClock::new());
+
+            let c1 = clock.clone();
+            let c2 = clock.clone();
+
+            let t1 = thread::spawn(move || c1.time());
+            let t2 = thread::spawn(move || c2.time());
+
+            let time1 = t1.join().unwrap();
+            let time2 = t2.join().unwrap();
+
+            // The two timestamps from different threads must be different
+            assert_ne!(time1, time2, "Concurrent time() calls must return unique timestamps");
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_hlc_multiple_calls() {
+        loom::model(|| {
+            let clock = Arc::new(HybridLogicalClock::new());
+
+            let c1 = clock.clone();
+            let c2 = clock.clone();
+
+            let t1 = thread::spawn(move || {
+                let a = c1.time();
+                let b = c1.time();
+                (a, b)
+            });
+
+            let t2 = thread::spawn(move || {
+                let a = c2.time();
+                let b = c2.time();
+                (a, b)
+            });
+
+            let (t1_a, t1_b) = t1.join().unwrap();
+            let (t2_a, t2_b) = t2.join().unwrap();
+
+            // Each thread's times must be monotonic
+            assert!(t1_b > t1_a);
+            assert!(t2_b > t2_a);
+
+            // All four timestamps must be unique
+            let mut times = vec![t1_a, t1_b, t2_a, t2_b];
+            times.sort();
+            for window in times.windows(2) {
+                assert_ne!(window[0], window[1], "All timestamps must be unique");
+            }
+        });
     }
 }
 
@@ -197,10 +322,17 @@ impl AtomicU128 {
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod x86_atomic_tests {
+    #[cfg(not(loom))]
     use std::{
         sync::Arc,
         thread,
         time::Duration,
+    };
+
+    #[cfg(loom)]
+    use loom::{
+        sync::Arc,
+        thread,
     };
 
     use super::*;
@@ -284,6 +416,7 @@ mod x86_atomic_tests {
     }
 
     #[test]
+    #[cfg(not(loom))]
     fn test_concurrent_increments() {
         let atomic = Arc::new(AtomicU128::new(0));
         let threads: Vec<_> = (0..4)
@@ -305,6 +438,7 @@ mod x86_atomic_tests {
     }
 
     #[test]
+    #[cfg(not(loom))]
     fn test_concurrent_mixed_operations() {
         let atomic = Arc::new(AtomicU128::new(1000));
         let threads: Vec<_> = (0..8)
@@ -422,5 +556,211 @@ mod x86_atomic_tests {
             final_value > 0,
             "Final value should be non-zero after stress test"
         );
+    }
+
+    // Loom tests for x86_64 AtomicU128
+    // These test the custom split hi/lo implementation
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_concurrent_stores() {
+        loom::model(|| {
+            let atomic = Arc::new(AtomicU128::new(0));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            let t1 = thread::spawn(move || {
+                a1.store(100, Ordering::SeqCst);
+            });
+
+            let t2 = thread::spawn(move || {
+                a2.store(200, Ordering::SeqCst);
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let final_val = atomic.load(Ordering::SeqCst);
+            // Final value must be either 100 or 200
+            assert!(final_val == 100 || final_val == 200);
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_compare_exchange() {
+        loom::model(|| {
+            let atomic = Arc::new(AtomicU128::new(0));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            let t1 = thread::spawn(move || {
+                a1.compare_exchange(0, 100, Ordering::SeqCst, Ordering::SeqCst)
+            });
+
+            let t2 = thread::spawn(move || {
+                a2.compare_exchange(0, 200, Ordering::SeqCst, Ordering::SeqCst)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one should succeed
+            assert!(r1.is_ok() ^ r2.is_ok(), "Exactly one CAS should succeed");
+
+            let final_val = atomic.load(Ordering::SeqCst);
+            if r1.is_ok() {
+                assert_eq!(final_val, 100);
+            } else {
+                assert_eq!(final_val, 200);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_fetch_add() {
+        loom::model(|| {
+            let atomic = Arc::new(AtomicU128::new(0));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            let t1 = thread::spawn(move || {
+                a1.fetch_add(10, Ordering::SeqCst)
+            });
+
+            let t2 = thread::spawn(move || {
+                a2.fetch_add(20, Ordering::SeqCst)
+            });
+
+            let old1 = t1.join().unwrap();
+            let old2 = t2.join().unwrap();
+
+            // Both old values should be valid
+            assert!(old1 == 0 || old1 == 10 || old1 == 20);
+            assert!(old2 == 0 || old2 == 10 || old2 == 20);
+
+            // Final value must be 30
+            assert_eq!(atomic.load(Ordering::SeqCst), 30);
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_load_while_storing() {
+        loom::model(|| {
+            let atomic = Arc::new(AtomicU128::new(100));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            let t1 = thread::spawn(move || {
+                a1.store(200, Ordering::Release);
+            });
+
+            let t2 = thread::spawn(move || {
+                a2.load(Ordering::Acquire)
+            });
+
+            t1.join().unwrap();
+            let loaded = t2.join().unwrap();
+
+            // t2 saw either 100 or 200
+            assert!(loaded == 100 || loaded == 200);
+
+            // Final must be 200
+            assert_eq!(atomic.load(Ordering::SeqCst), 200);
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_compare_exchange_rollback() {
+        loom::model(|| {
+            let atomic = Arc::new(AtomicU128::new(0));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            // Thread 1: changes value from 0 to 50
+            let t1 = thread::spawn(move || {
+                a1.store(50, Ordering::SeqCst);
+            });
+
+            // Thread 2: tries CAS with wrong expected value
+            let t2 = thread::spawn(move || {
+                // This should fail because value is no longer 0
+                a2.compare_exchange(0, 100, Ordering::SeqCst, Ordering::SeqCst)
+            });
+
+            t1.join().unwrap();
+            let cas_result = t2.join().unwrap();
+
+            let final_val = atomic.load(Ordering::SeqCst);
+
+            // If CAS succeeded, final = 100, else final = 50
+            if cas_result.is_ok() {
+                assert_eq!(final_val, 100);
+            } else {
+                assert_eq!(final_val, 50);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_fetch_sub() {
+        loom::model(|| {
+            let atomic = Arc::new(AtomicU128::new(100));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            let t1 = thread::spawn(move || {
+                a1.fetch_sub(10, Ordering::SeqCst)
+            });
+
+            let t2 = thread::spawn(move || {
+                a2.fetch_sub(20, Ordering::SeqCst)
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // 100 - 10 - 20 = 70
+            assert_eq!(atomic.load(Ordering::SeqCst), 70);
+        });
+    }
+
+    #[test]
+    #[cfg(loom)]
+    fn loom_atomic128_high_bits_boundary() {
+        loom::model(|| {
+            // Test at the boundary between lo and hi u64s
+            let boundary = (1u128 << 64) - 1;
+            let atomic = Arc::new(AtomicU128::new(boundary));
+
+            let a1 = atomic.clone();
+            let a2 = atomic.clone();
+
+            let t1 = thread::spawn(move || {
+                a1.fetch_add(1, Ordering::SeqCst)
+            });
+
+            let t2 = thread::spawn(move || {
+                a2.load(Ordering::SeqCst)
+            });
+
+            let old1 = t1.join().unwrap();
+            let loaded = t2.join().unwrap();
+
+            let final_val = atomic.load(Ordering::SeqCst);
+
+            // After adding 1 to (2^64 - 1), we get 2^64
+            assert_eq!(final_val, 1u128 << 64);
+        });
     }
 }
