@@ -103,7 +103,6 @@ impl SegmentBuilder {
 
         // Get file size for validation
         let key_file_size = key_mmap.len();
-        println!("Opened key file: size={}", key_file_size);
 
         if key_file_size < 32 {
             return Err(SegmentError::IoError(std::io::Error::new(
@@ -115,21 +114,9 @@ impl SegmentBuilder {
         // load the metadata from the end of the key mmap
         let mdata_size = size_of::<Metadata>();
         let metadata_offset = key_file_size - mdata_size;
-        println!(
-            "Reading key metadata from end of file: offset={}, size={}",
-            metadata_offset, mdata_size
-        );
 
         let key_mdata_payload = key_mmap[metadata_offset..key_file_size].as_ref();
         let key_metadata = Metadata::from(Bytes::copy_from_slice(key_mdata_payload));
-
-        println!(
-            "Key metadata read: id={}, block_count={}, index_size={}, index_start={}",
-            key_metadata.id(),
-            key_metadata.block_count(),
-            key_metadata.index_size(),
-            key_metadata.index_start()
-        );
 
         // Validate index location
         let index_start = key_metadata.index_start();
@@ -155,14 +142,9 @@ impl SegmentBuilder {
             )));
         }
 
-        println!(
-            "Reading key index: start={}, size={}",
-            index_start, index_size
-        );
         let key_index_payload =
             key_mmap[index_start as usize..(index_start + index_size) as usize].as_ref();
 
-        println!("Key index payload size: {}", key_index_payload.len());
         if key_index_payload.len() < 56 {
             return Err(SegmentError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -188,7 +170,6 @@ impl SegmentBuilder {
         };
 
         let val_file_size = val_mmap.len();
-        println!("Opened value file: size={}", val_file_size);
 
         if val_file_size < 32 {
             return Err(SegmentError::IoError(std::io::Error::new(
@@ -198,21 +179,9 @@ impl SegmentBuilder {
         }
 
         let val_metadata_offset = val_file_size - mdata_size;
-        println!(
-            "Reading value metadata from end of file: offset={}, size={}",
-            val_metadata_offset, mdata_size
-        );
 
         let val_mdata_payload = val_mmap[val_metadata_offset..val_file_size].as_ref();
         let val_metadata = Metadata::from(Bytes::copy_from_slice(val_mdata_payload));
-
-        println!(
-            "Value metadata read: id={}, block_count={}, index_size={}, index_start={}",
-            val_metadata.id(),
-            val_metadata.block_count(),
-            val_metadata.index_size(),
-            val_metadata.index_start()
-        );
 
         // Value segments no longer have indices - value locations are stored in key metadata
         // So we skip reading the value index entirely

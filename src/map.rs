@@ -53,7 +53,6 @@ pub struct Map {
 
 impl Map {
     pub fn new(path: PathBuf, initial_size: u64) -> Result<Self, SegmentError> {
-        println!("[Map::new] Path: {:?}, initial_size: {}", path, initial_size);
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -243,8 +242,6 @@ impl Map {
 
     pub fn close(&self) -> Result<(), SegmentError> {
         let _guard = self.resize_lock.lock();
-
-        println!("Closing map of size {}", self.len());
 
         let ptr = self.inner.load(Acquire);
         // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer

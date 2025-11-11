@@ -249,11 +249,6 @@ impl SegmentWriter {
         // Calculate position at the end
         let metadata_start = map_size - metadata_size;
 
-        println!("Writing metadata at END of file: offset={}, size={}, map_size={}, id={}, block_count={}, index_size={}, index_start={}",
-                 metadata_start, metadata_size, map_size,
-                 metadata.id(), metadata.block_count(),
-                 metadata.index_size(), metadata.index_start());
-
         let metadata_range = metadata_start..map_size;
 
         // Write metadata
@@ -261,13 +256,8 @@ impl SegmentWriter {
         match self.map.write_to_range(metadata_range, |slice| unsafe {
             metadata.finalize(slice.as_mut_ptr());
         }) {
-            | Ok(_) => {
-                println!("Metadata written successfully");
-            },
-            | Err(e) => {
-                println!("Error writing metadata: {:?}", e);
-                return Err(e);
-            },
+            | Ok(_) => {},
+            | Err(e) => return Err(e),
         };
 
         self.closed.store(true, Relaxed);
