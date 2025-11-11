@@ -214,47 +214,8 @@ impl SegmentBuilder {
             val_metadata.index_start()
         );
 
-        // Validate value index location
-        let val_index_start = val_metadata.index_start();
-        let val_index_size = val_metadata.index_size();
-
-        if val_index_start == 0 || val_index_size == 0 {
-            return Err(SegmentError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid value index location: start={}, size={}",
-                    val_index_start, val_index_size
-                ),
-            )));
-        }
-
-        if val_index_start >= val_file_size || val_index_start + val_index_size > val_file_size {
-            return Err(SegmentError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Value index location out of bounds: start={}, size={}, file_size={}",
-                    val_index_start, val_index_size, val_file_size
-                ),
-            )));
-        }
-
-        println!(
-            "Reading value index: start={}, size={}",
-            val_index_start, val_index_size
-        );
-        let val_index_payload = val_mmap
-            [val_index_start as usize..(val_index_start + val_index_size) as usize]
-            .as_ref();
-
-        println!("Value index payload size: {}", val_index_payload.len());
-        if val_index_payload.len() < 56 {
-            return Err(SegmentError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Value index data too small: {}", val_index_payload.len()),
-            )));
-        }
-
-        let val_index = Index::from(Bytes::copy_from_slice(val_index_payload));
+        // Value segments no longer have indices - value locations are stored in key metadata
+        // So we skip reading the value index entirely
 
         let key_handle = Arc::new(key_mmap);
         let val_handle = Arc::new(val_mmap);
@@ -264,7 +225,6 @@ impl SegmentBuilder {
             key_index,
             key_metadata.id(),
             val_handle,
-            val_index,
             val_metadata.id(),
         )
     }

@@ -62,6 +62,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod block;
 mod block_alloc;
+pub mod compact;
 pub mod errs;
 mod hash;
 pub mod hlc;

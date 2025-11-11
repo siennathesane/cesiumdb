@@ -64,29 +64,26 @@ impl Default for ReadConfig {
 }
 
 #[derive(Debug)]
-pub struct SegmentReader<'a> {
+pub struct SegmentReader {
     key_handle: Arc<Map>,
     val_handle: Arc<Map>,
-    pub(crate) key_index: &'a Index,
-    pub(crate) val_index: &'a Index,
+    pub(crate) key_index: Arc<parking_lot::Mutex<Index>>,
     pub(crate) visible_key_blocks: usize,
     visible_val_blocks: usize,
     pub(crate) num_blocks: usize,
 }
 
-impl<'a> SegmentReader<'a> {
+impl SegmentReader {
     #[instrument(level = "trace")]
     pub fn new(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
-        key_index: &'a Index,
-        val_index: &'a Index,
+        key_index: Arc<parking_lot::Mutex<Index>>,
     ) -> Result<Self, SegmentError> {
         Self::with_config(
             key_handle,
             val_handle,
             key_index,
-            val_index,
             ReadConfig::default(),
         )
     }
@@ -95,8 +92,7 @@ impl<'a> SegmentReader<'a> {
     pub(crate) fn with_config(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
-        key_index: &'a Index,
-        val_index: &'a Index,
+        key_index: Arc<parking_lot::Mutex<Index>>,
         config: ReadConfig,
     ) -> Result<Self, SegmentError> {
         let segment_size = key_handle.len();
@@ -104,7 +100,7 @@ impl<'a> SegmentReader<'a> {
         if segment_size % BLOCK_SIZE != 0 {
             return Err(InvalidSize);
         }
-        
+
         let num_blocks = segment_size / BLOCK_SIZE;
 
         let visible_key_blocks = num_blocks;
@@ -114,7 +110,6 @@ impl<'a> SegmentReader<'a> {
             key_handle,
             val_handle,
             key_index,
-            val_index,
             visible_key_blocks,
             visible_val_blocks,
             num_blocks,
@@ -124,12 +119,12 @@ impl<'a> SegmentReader<'a> {
     #[instrument(level = "trace")]
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, SegmentError> {
         // First check the bloom filter - quick reject if not present
-        if !self.key_index.may_contain(key) {
+        if !self.key_index.lock().may_contain(key) {
             return Ok(None);
         }
 
         // Find which block might contain this key
-        let key_block_offset = match self.key_index.get_block(key) {
+        let key_block_offset = match self.key_index.lock().get_block(key) {
             | Some(v) => v,
             | None => {
                 return Ok(None);
@@ -437,12 +432,12 @@ impl<'a> SegmentReader<'a> {
     }
 
     #[instrument(level = "trace")]
-    pub(crate) fn iter(&'a mut self) -> SegmentBlockIterator<'a> {
+    pub(crate) fn iter<'a>(&'a mut self) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator::new(self)
     }
 
     #[instrument(level = "trace")]
-    pub(crate) fn seeking_iter(&'a mut self) -> SeekingBlockIterator<'a> {
+    pub(crate) fn seeking_iter<'a>(&'a mut self) -> SeekingBlockIterator<'a> {
         SeekingBlockIterator::new(self, 0, self.num_blocks)
     }
 
@@ -485,7 +480,7 @@ impl<'a> SegmentReader<'a> {
     /// * `upper_bound` - The upper bound of the key range (inclusive if
     ///   Included, exclusive if Excluded)
     #[instrument(level = "trace")]
-    pub fn scan(
+    pub fn scan<'a>(
         &'a self,
         lower_bound: Bound<&[u8]>,
         upper_bound: Bound<&[u8]>,
@@ -494,7 +489,7 @@ impl<'a> SegmentReader<'a> {
         let start_block = match lower_bound {
             | Bound::Included(key) | Bound::Excluded(key) => {
                 // Use the index to find the block that would contain this key
-                match self.key_index.get_block(key) {
+                match self.key_index.lock().get_block(key) {
                     | Some(block_offset) => block_offset as usize,
                     | None => 0, // Start from the beginning if not found
                 }
@@ -613,7 +608,7 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let reader = SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index);
+        let reader = SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index)));
         assert!(reader.is_ok());
 
         let reader = reader.unwrap();
@@ -630,7 +625,7 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let result = SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index);
+        let result = SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index)));
         assert!(result.is_err());
         assert!(matches!(result.err().unwrap(), InvalidSize));
     }
@@ -644,7 +639,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // Read each block and verify contents
         for i in 0..4 {
@@ -663,7 +658,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         let result = reader.read_key_block(2); // Only 2 blocks exist (0 and 1)
         assert!(result.is_err());
@@ -679,7 +674,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // First read
         let block0 = reader.read_key_block(0).unwrap();
@@ -707,7 +702,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // Access blocks in non-sequential order
         let indices = [3, 1, 5, 0, 7, 2];
@@ -727,7 +722,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         let blocks: Vec<Block> = reader.iter().map(|result| result.unwrap()).collect();
 
@@ -747,7 +742,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
         let mut iter = reader.seeking_iter();
 
         // Start at beginning
@@ -780,7 +775,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // Test regular iterator
         let iter = reader.iter();
@@ -788,8 +783,12 @@ mod tests {
         assert_eq!(min, 5);
         assert_eq!(max, Some(5));
 
+        // Create new indices for second reader
+        let key_index2 = Index::new(1, 1234);
+        let val_index2 = Index::new(1, 1234);
+
         let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index2))).unwrap();
 
         // Test seeking iterator
         let mut seeking_iter = reader.seeking_iter();
@@ -809,7 +808,7 @@ mod tests {
         let val_index = Index::new(1, 1234);
 
         let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
         let mut iter = reader.seeking_iter();
 
         assert_eq!(iter.blocks_remaining(), 5);
@@ -854,7 +853,7 @@ mod tests {
 
         // create segment reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // test get
         let result = reader.get(key).unwrap();
@@ -868,7 +867,7 @@ mod tests {
 
         // create segment reader without any data
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // test get with non-existent key
         let nonexistent_key = b"nonexistent_key";
@@ -919,7 +918,7 @@ mod tests {
 
         // create segment reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // test get with large value
         let result = reader.get(key).unwrap();
@@ -978,7 +977,7 @@ mod tests {
 
         // Create segment reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // Test get with the key
         let result = reader.get(key);
@@ -1002,7 +1001,7 @@ mod tests {
 
         // create segment reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // our test key should not be in the bloom filter
         let test_key = b"test_key";
@@ -1021,7 +1020,7 @@ mod tests {
 
         // create segment reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // key is in bloom filter but not in any block
         let result = reader.get(key).unwrap();
@@ -1059,7 +1058,7 @@ mod tests {
 
         // create segment reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // should return error due to corrupted blocks (missing End flag)
         let result = reader.get(key);
@@ -1135,7 +1134,7 @@ mod tests {
 
         // Create reader
         let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), &key_index, &val_index).unwrap();
+            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
 
         // Test get for each key
         let result1 = reader.get(key1).unwrap();

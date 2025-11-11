@@ -183,11 +183,18 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Mark the segment as closing. This must be called before write_metadata.
+    /// For segments with an index, write_index calls this automatically.
+    #[instrument(level = "trace")]
+    pub(crate) fn begin_close(&self) {
+        self.closing.store(true, Relaxed);
+    }
+
     /// Write the index to the map. Once the index has been written, no more
     /// blocks can be written.
     #[instrument(level = "trace")]
     pub(crate) fn write_index(&self, index: &Index) -> Result<u64, SegmentError> {
-        self.closing.store(true, Relaxed);
+        self.begin_close();
 
         let mut current_offset = self.current_offset.lock();
         let index_start = *current_offset;

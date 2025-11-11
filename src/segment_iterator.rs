@@ -32,12 +32,12 @@ pub(crate) fn convert_bound_to_bytes(bound: Bound<&[u8]>) -> Bound<Bytes> {
 }
 
 pub(crate) struct SegmentBlockIterator<'a> {
-    reader: &'a mut SegmentReader<'a>,
+    reader: &'a mut SegmentReader,
     current_block: usize,
 }
 
 impl SegmentBlockIterator<'_> {
-    pub(crate) fn new<'a>(reader: &'a mut SegmentReader<'a>) -> SegmentBlockIterator<'a> {
+    pub(crate) fn new<'a>(reader: &'a mut SegmentReader) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator {
             reader,
             current_block: 0,
@@ -68,12 +68,12 @@ pub(crate) struct SeekingBlockIterator<'a> {
     start: usize,
     end: usize,
     current: usize,
-    reader: &'a mut SegmentReader<'a>,
+    reader: &'a mut SegmentReader,
 }
 
 impl<'a> SeekingBlockIterator<'a> {
     pub(crate) fn new<'b>(
-        reader: &'b mut SegmentReader<'b>,
+        reader: &'b mut SegmentReader,
         start: usize,
         end: usize,
     ) -> SeekingBlockIterator<'b> {
@@ -122,7 +122,7 @@ impl<'a> Iterator for SeekingBlockIterator<'a> {
 
 /// Iterator for scanning a range of keys in a segment.
 pub struct SegmentScanIterator<'a> {
-    reader: &'a SegmentReader<'a>,
+    reader: &'a SegmentReader,
     current_block_index: usize,
     current_key_block: Option<Block>,
     current_key_index: usize,
@@ -210,7 +210,7 @@ impl<'a> SegmentScanIterator<'a> {
     /// # Arguments
     /// * `reader` - The segment reader to scan
     /// * `range` - Range of keys to scan
-    pub fn new(reader: &'a SegmentReader<'a>, range: (Bound<&[u8]>, Bound<&[u8]>)) -> Self {
+    pub fn new(reader: &'a SegmentReader, range: (Bound<&[u8]>, Bound<&[u8]>)) -> Self {
         let lower_bound = convert_bound_to_bytes(range.0);
         let upper_bound = convert_bound_to_bytes(range.1);
 
@@ -339,15 +339,19 @@ impl<'a> SegmentScanIterator<'a> {
     }
 
     /// Reads the value for a key.
+    /// The key format is: [value_block_num:u64][value_entry_index:u16][actual_key_data]
     fn read_value_for_key(&self, key: &Bytes) -> Result<Option<Bytes>, SegmentError> {
-        // Use val_index to find the value block for this key
-        let val_block_offset = match self.reader.val_index.get_block(key) {
-            | Some(offset) => offset,
-            | None => return Ok(None), // No value block found for this key
-        };
+        // Extract value location metadata from the first 10 bytes of the key
+        if key.len() < 10 {
+            return Ok(None); // Invalid key format
+        }
 
-        // Read the value from the found block
-        match self.reader.read_value(val_block_offset as usize, 0) {
+        // Parse the value location from the key
+        let value_block_num = u64::from_le_bytes(key[0..8].try_into().unwrap());
+        let value_entry_index = u16::from_le_bytes(key[8..10].try_into().unwrap());
+
+        // Read the value from the value segment at the specified location
+        match self.reader.read_value(value_block_num as usize, value_entry_index as usize) {
             | Ok(value) => Ok(Some(value)),
             | Err(e) => Err(e),
         }
@@ -396,12 +400,12 @@ mod tests {
     // Helper functions for test setup
 
     /// Creates test SegmentReader with specified number of blocks
-    fn create_test_segment_reader<'a>(
+    fn create_test_segment_reader(
         num_key_blocks: usize,
         num_val_blocks: usize,
-        key_index: &'a Index,
-        val_index: &'a Index,
-    ) -> (SegmentReader<'a>, tempfile::TempDir) {
+        key_index: Index,
+        val_index: Index,
+    ) -> (SegmentReader, tempfile::TempDir) {
         let dir = tempdir().expect("failed to create temp dir");
 
         // Create key map
@@ -453,17 +457,21 @@ mod tests {
                 .expect("Failed to write value block");
         }
 
-        let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
-            .expect("Failed to create segment reader");
+        let reader = SegmentReader::new(
+            key_map,
+            val_map,
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .expect("Failed to create segment reader");
 
         (reader, dir)
     }
 
     /// Creates a test segment with multi-block entries
-    fn create_multi_block_segment<'a>(
-        key_index: &'a mut Index,
-        val_index: &'a mut Index,
-    ) -> (SegmentReader<'a>, tempfile::TempDir) {
+    fn create_multi_block_segment(
+        mut key_index: Index,
+        mut val_index: Index,
+    ) -> (SegmentReader, tempfile::TempDir) {
         let dir = tempdir().expect("failed to create temp dir");
 
         // Create key and value maps
@@ -585,17 +593,21 @@ mod tests {
         val_index.inc_block_count(1);
         val_index.insert_item(&multi_key);
 
-        let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
-            .expect("Failed to create segment reader");
+        let reader = SegmentReader::new(
+            key_map,
+            val_map,
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .expect("Failed to create segment reader");
 
         (reader, dir)
     }
 
     /// Creates a segment with key-value pairs for testing SegmentScanIterator
-    fn create_scan_test_segment<'a>(
-        key_index: &'a mut Index,
-        val_index: &'a mut Index,
-    ) -> (SegmentReader<'a>, tempfile::TempDir) {
+    fn create_scan_test_segment(
+        mut key_index: Index,
+        mut val_index: Index,
+    ) -> (SegmentReader, tempfile::TempDir) {
         let dir = tempdir().expect("failed to create temp dir");
 
         // Create key and value maps
@@ -667,8 +679,12 @@ mod tests {
             val_index.insert_item(&full_key);
         }
 
-        let reader = SegmentReader::new(key_map, val_map, key_index, val_index)
-            .expect("Failed to create segment reader");
+        let reader = SegmentReader::new(
+            key_map,
+            val_map,
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .expect("Failed to create segment reader");
 
         (reader, dir)
     }
@@ -710,7 +726,7 @@ mod tests {
         let key_index = Index::new(1, seed);
         let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_test_segment_reader(0, 0, &key_index, &val_index);
+        let (mut reader, _dir) = create_test_segment_reader(0, 0, key_index, val_index);
 
         let iter = SegmentBlockIterator::new(&mut reader);
         let blocks: Vec<_> = iter.collect();
@@ -724,7 +740,7 @@ mod tests {
         let key_index = Index::new(1, seed);
         let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_test_segment_reader(1, 1, &key_index, &val_index);
+        let (mut reader, _dir) = create_test_segment_reader(1, 1, key_index, val_index);
 
         let iter = SegmentBlockIterator::new(&mut reader);
         let blocks: Vec<_> = iter.collect();
@@ -752,7 +768,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         let iter = SegmentBlockIterator::new(&mut reader);
         let blocks: Vec<_> = iter.collect();
@@ -793,7 +809,7 @@ mod tests {
 
         let num_blocks = 3;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         let mut iter = SegmentBlockIterator::new(&mut reader);
 
@@ -834,7 +850,7 @@ mod tests {
         let val_index = Index::new(2, seed);
 
         // Create a reader with visibility less than actual blocks to force errors
-        let (mut reader, _dir) = create_test_segment_reader(5, 5, &key_index, &val_index);
+        let (mut reader, _dir) = create_test_segment_reader(5, 5, key_index, val_index);
 
         // Set visible blocks to 0 to simulate errors
         reader.visible_key_blocks = 0;
@@ -858,7 +874,7 @@ mod tests {
         let key_index = Index::new(1, seed);
         let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_test_segment_reader(5, 5, &key_index, &val_index);
+        let (mut reader, _dir) = create_test_segment_reader(5, 5, key_index, val_index);
 
         // Create an empty range iterator (start == end)
         let iter = SeekingBlockIterator::new(&mut reader, 2, 2);
@@ -875,7 +891,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         // Create iterator over full range
         let iter = SeekingBlockIterator::new(&mut reader, 0, num_blocks);
@@ -907,7 +923,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         // Create iterator over blocks 1-3 (exclusive end)
         let iter = SeekingBlockIterator::new(&mut reader, 1, 4);
@@ -944,7 +960,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         let mut iter = SeekingBlockIterator::new(&mut reader, 0, num_blocks);
 
@@ -1009,7 +1025,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         let mut iter = SeekingBlockIterator::new(&mut reader, 0, num_blocks);
 
@@ -1039,7 +1055,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         let mut iter = SeekingBlockIterator::new(&mut reader, 0, num_blocks);
 
@@ -1075,7 +1091,7 @@ mod tests {
 
         let num_blocks = 5;
         let (mut reader, _dir) =
-            create_test_segment_reader(num_blocks, num_blocks, &key_index, &val_index);
+            create_test_segment_reader(num_blocks, num_blocks, key_index, val_index);
 
         let mut iter = SeekingBlockIterator::new(&mut reader, 0, num_blocks);
 
@@ -1117,10 +1133,10 @@ mod tests {
     #[test]
     fn test_segment_scan_iterator_empty_range() {
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Use a key range where lower > upper, making sure to include namespace prefix
         let lower = &[0u8, 0, 0, 0, 0, 0, 0, 0, b'k', b'e', b'y', b'_', b'z'][..];
@@ -1136,10 +1152,10 @@ mod tests {
     fn test_segment_scan_iterator_inclusive_bounds() {
         // Simplified test that just verifies we can read blocks directly
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Verify the setup - we should be able to read at least 3 blocks
         assert!(
@@ -1160,10 +1176,10 @@ mod tests {
     fn test_segment_scan_iterator_exclusive_bounds() {
         // Simplified to avoid scanning issues
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Verify we can get information about the stored blocks
         assert!(reader.num_blocks() > 0, "Should have blocks available");
@@ -1176,10 +1192,10 @@ mod tests {
     fn test_segment_scan_iterator_mixed_bounds() {
         // Simplified to verify basic iterator properties
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (mut reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Test block iterator instead of scan
         let blocks: Vec<_> = reader.iter().collect();
@@ -1193,10 +1209,10 @@ mod tests {
     fn test_segment_scan_seeking_iterator_mixed_bounds() {
         // Simplified to verify basic iterator properties
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (mut reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Test seeking iterator
         let mut seeker = reader.seeking_iter();
@@ -1210,10 +1226,10 @@ mod tests {
     fn test_segment_scan_iterator_unbounded() {
         // Simplified to test direct block access
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Direct access to blocks should work
         let block0 = reader.read_key_block(0);
@@ -1227,44 +1243,42 @@ mod tests {
     #[test]
     fn test_segment_scan_iterator_namespace_filtering() {
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Instead of trying to scan, we'll just verify our test data setup
         // This verifies that we can create properly formatted test segments
         // with different namespaces
-        assert!(key_index.block_count() > 0, "Expected blocks in key index");
-        assert!(
-            val_index.block_count() > 0,
-            "Expected blocks in value index"
-        );
+        // Note: indices are now owned by the reader, so we can't check them directly
+        assert!(reader.num_blocks() > 0, "Expected blocks in segment");
     }
 
     #[test]
     fn test_segment_scan_iterator_non_existent_keys() {
         // Test if we can use the index to search for keys
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
+        // Note: indices are now owned by the reader
         // Create a key that doesn't exist in the index
         let non_existent_key = &[
             0u8, 0, 0, 0, 0, 0, 0, 0, b'n', b'o', b't', b'_', b'f', b'o', b'u', b'n', b'd',
         ][..];
 
-        // Check if it might be in the index
+        // Check if it might be in the index (via reader)
         assert!(
-            !key_index.may_contain(non_existent_key),
+            !reader.key_index.lock().may_contain(non_existent_key),
             "Bloom filter should not contain non-existent key"
         );
 
         // Try to find the block that would contain this key
         assert!(
-            key_index.get_block(non_existent_key).is_none(),
+            reader.key_index.lock().get_block(non_existent_key).is_none(),
             "Should not find block for non-existent key"
         );
     }
@@ -1273,27 +1287,24 @@ mod tests {
     fn test_is_in_range() {
         // Simplified test that just verifies that keys contain namespace
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
-        // Just verify basic properties of our test setup
-        assert!(key_index.block_count() > 0, "Expected blocks in key index");
-        assert!(
-            val_index.block_count() > 0,
-            "Expected blocks in value index"
-        );
+        // Just verify basic properties of our test setup (key index is owned by reader)
+        assert!(reader.key_index.lock().block_count() > 0, "Expected blocks in key index");
+        // Note: We no longer have a val_index since value locations are stored in key metadata
     }
 
     #[test]
     fn test_is_past_upper_bound() {
         // Simplified test since we're having issues with the scanner
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (mut reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // We'll just verify reader visibility settings work
         reader.visible_key_blocks = 2; // Limit to first 2 blocks
@@ -1335,10 +1346,10 @@ mod tests {
     #[test]
     fn test_segment_scan_iterator_errors() {
         let seed = 42i64;
-        let mut key_index = Index::new(1, seed);
-        let mut val_index = Index::new(2, seed);
+        let key_index = Index::new(1, seed);
+        let val_index = Index::new(2, seed);
 
-        let (mut reader, _dir) = create_scan_test_segment(&mut key_index, &mut val_index);
+        let (mut reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Set visible blocks to 0 to force errors on scan
         reader.visible_key_blocks = 0;
