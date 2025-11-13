@@ -104,34 +104,49 @@ impl Block {
     ///
     /// # Safety
     /// - dst must be valid for BLOCK_SIZE bytes
-    /// - dst must be properly aligned
+    /// - dst must be properly aligned for u16 writes (2-byte alignment)
     /// - dst must not overlap with any source data
+    /// - Caller must ensure exclusive access to the dst memory region
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
-        // write num_entries
-        ptr::copy_nonoverlapping(
-            self.num_entries.to_le_bytes().as_ptr(),
-            dst,
-            size_of::<u16>(),
+        // SAFETY: Verify alignment invariants in debug builds
+        debug_assert!(
+            !dst.is_null(),
+            "Destination pointer must not be null"
+        );
+        debug_assert!(
+            dst as usize % std::mem::align_of::<u16>() == 0,
+            "Destination pointer must be 2-byte aligned for u16 writes"
         );
 
-        // write offsets
-        ptr::copy_nonoverlapping(
-            self.offsets.as_ptr(),
-            dst.add(size_of::<u16>()),
-            self.offsets.len(),
-        );
+        // SAFETY: All writes stay within BLOCK_SIZE bytes.
+        // Each write uses non-overlapping offsets.
+        unsafe {
+            // write num_entries
+            ptr::copy_nonoverlapping(
+                self.num_entries.to_le_bytes().as_ptr(),
+                dst,
+                size_of::<u16>(),
+            );
 
-        // write entries
-        ptr::copy_nonoverlapping(
-            self.entries.as_ptr(),
-            dst.add(size_of::<u16>() + self.offsets.len()),
-            self.entries.len(),
-        );
+            // write offsets
+            ptr::copy_nonoverlapping(
+                self.offsets.as_ptr(),
+                dst.add(size_of::<u16>()),
+                self.offsets.len(),
+            );
 
-        // zero remaining space
-        let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
-        if written < BLOCK_SIZE {
-            ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
+            // write entries
+            ptr::copy_nonoverlapping(
+                self.entries.as_ptr(),
+                dst.add(size_of::<u16>() + self.offsets.len()),
+                self.entries.len(),
+            );
+
+            // zero remaining space
+            let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
+            if written < BLOCK_SIZE {
+                ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
+            }
         }
     }
 

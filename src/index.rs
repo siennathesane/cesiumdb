@@ -217,11 +217,22 @@ impl Index {
     ///
     /// # Safety
     ///
-    /// - `dst` must be valid for at least `self.serialized_size()` bytes
-    /// - `dst` must be properly aligned
+    /// - `dst` must be valid for at least `self.size()` bytes
+    /// - `dst` must be properly aligned for u64 writes (8-byte alignment)
     /// - `dst` must not overlap with any source data
+    /// - Caller must ensure exclusive access to the dst memory region
     #[instrument(level = "trace", skip(dst))]
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
+        // SAFETY: Verify alignment invariants in debug builds
+        debug_assert!(
+            !dst.is_null(),
+            "Destination pointer must not be null"
+        );
+        debug_assert!(
+            dst as usize % std::mem::align_of::<u64>() == 0,
+            "Destination pointer must be 8-byte aligned for u64 writes"
+        );
+
         // write header fields
         let mut offset = 0;
 
@@ -246,72 +257,78 @@ impl Index {
         let bloom_data = self.bloom_filter.bitmap().clone().freeze();
         let bloom_filter_size = bloom_data.len() as u64;
 
-        // write id
-        ptr::copy_nonoverlapping(
-            self.id.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+        // SAFETY: All writes stay within the allocated buffer size (verified by caller).
+        // Each write advances the offset to ensure non-overlapping writes.
+        unsafe {
+            // write id
+            ptr::copy_nonoverlapping(
+                self.id.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        // write bloom_filter_seed
-        ptr::copy_nonoverlapping(
-            self.bloom_filter_seed.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<i64>(),
-        );
-        offset += size_of::<i64>();
+            // write bloom_filter_seed
+            ptr::copy_nonoverlapping(
+                self.bloom_filter_seed.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<i64>(),
+            );
+            offset += size_of::<i64>();
 
-        // write bloom_size
-        ptr::copy_nonoverlapping(
-            bloom_filter_size.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+            // write bloom_size
+            ptr::copy_nonoverlapping(
+                bloom_filter_size.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        ptr::copy_nonoverlapping(
-            ns_offset_entries.len().to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+            // write ns_offset_entries length
+            ptr::copy_nonoverlapping(
+                ns_offset_entries.len().to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        // write block_offset_size
-        ptr::copy_nonoverlapping(
-            block_offset_entries.len().to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+            // write block_offset_size
+            ptr::copy_nonoverlapping(
+                block_offset_entries.len().to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        ptr::copy_nonoverlapping(
-            self.num_blocks.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+            // write num_blocks
+            ptr::copy_nonoverlapping(
+                self.num_blocks.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        // write data sections
+            // write data sections
 
-        // write block_offsets
-        ptr::copy_nonoverlapping(
-            block_offset_entries.as_ptr(),
-            dst.add(offset),
-            block_offset_entries.len(),
-        );
-        offset += block_offset_entries.len();
+            // write block_offsets
+            ptr::copy_nonoverlapping(
+                block_offset_entries.as_ptr(),
+                dst.add(offset),
+                block_offset_entries.len(),
+            );
+            offset += block_offset_entries.len();
 
-        // write ns_offsets
-        ptr::copy_nonoverlapping(
-            ns_offset_entries.as_ptr(),
-            dst.add(offset),
-            ns_offset_entries.len(),
-        );
-        offset += ns_offset_entries.len();
+            // write ns_offsets
+            ptr::copy_nonoverlapping(
+                ns_offset_entries.as_ptr(),
+                dst.add(offset),
+                ns_offset_entries.len(),
+            );
+            offset += ns_offset_entries.len();
 
-        // write bloom_filter data
-        ptr::copy_nonoverlapping(bloom_data.as_ptr(), dst.add(offset), bloom_data.len());
+            // write bloom_filter data
+            ptr::copy_nonoverlapping(bloom_data.as_ptr(), dst.add(offset), bloom_data.len());
+        }
     }
 }
 

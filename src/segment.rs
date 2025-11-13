@@ -97,41 +97,56 @@ impl Metadata {
     ///
     /// - `dst` must be valid for at least `self.serialized_size()` bytes (32
     ///   bytes)
-    /// - `dst` must be properly aligned for u64 values
+    /// - `dst` must be properly aligned for u64 values (8-byte alignment)
     /// - `dst` must not overlap with any source data
+    /// - Caller must ensure exclusive access to the dst memory region
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
+        // SAFETY: Verify alignment invariants in debug builds
+        debug_assert!(
+            !dst.is_null(),
+            "Destination pointer must not be null"
+        );
+        debug_assert!(
+            dst as usize % std::mem::align_of::<u64>() == 0,
+            "Destination pointer must be 8-byte aligned for u64 writes"
+        );
+
         let mut offset = 0;
 
-        // Write id
-        ptr::copy_nonoverlapping(
-            self.id.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+        // SAFETY: All writes stay within the allocated buffer size (32 bytes).
+        // Each write advances the offset to ensure non-overlapping writes.
+        unsafe {
+            // Write id
+            ptr::copy_nonoverlapping(
+                self.id.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        // Write block_count
-        ptr::copy_nonoverlapping(
-            self.block_count.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+            // Write block_count
+            ptr::copy_nonoverlapping(
+                self.block_count.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        // Write index_size
-        ptr::copy_nonoverlapping(
-            self.index_size.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
-        offset += size_of::<u64>();
+            // Write index_size
+            ptr::copy_nonoverlapping(
+                self.index_size.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+            offset += size_of::<u64>();
 
-        // Write index_start
-        ptr::copy_nonoverlapping(
-            self.index_start.to_le_bytes().as_ptr(),
-            dst.add(offset),
-            size_of::<u64>(),
-        );
+            // Write index_start
+            ptr::copy_nonoverlapping(
+                self.index_start.to_le_bytes().as_ptr(),
+                dst.add(offset),
+                size_of::<u64>(),
+            );
+        }
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -867,8 +882,14 @@ impl Drop for Segment {
     fn drop(&mut self) {
         let res = self.close();
         if let Err(e) = res && !matches!(e, ReadOnly) {
-            // TODO(@siennathesane): log this error instead of panicking
-            panic!("Failed to close segment: {:?}", e);
+            // Log the error instead of panicking during Drop to avoid double-panic situations
+            // and unwinding issues. This error indicates that segment metadata may not have
+            // been flushed properly, which could lead to data loss on reopening.
+            eprintln!(
+                "CRITICAL: Failed to close segment {} cleanly during drop: {:?}",
+                self.key_id, e
+            );
+            eprintln!("This may result in data loss or corruption when the segment is reopened.");
         }
     }
 }
