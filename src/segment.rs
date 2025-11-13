@@ -728,6 +728,57 @@ impl Segment {
 
         Ok(())
     }
+
+    /// Returns the segment ID (key_id)
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.key_id
+    }
+
+    /// Returns the approximate size of this segment in bytes
+    ///
+    /// This includes both key and value files plus index overhead.
+    /// The actual size may be slightly different due to alignment.
+    pub fn size_in_bytes(&self) -> u64 {
+        let key_size = if let Some(ref handle) = self.key_handle {
+            handle.len() as u64
+        } else {
+            // Estimate based on writer if still open
+            0 // TODO: Track bytes written
+        };
+
+        let val_size = if let Some(ref handle) = self.val_handle {
+            handle.len() as u64
+        } else {
+            // Estimate based on writer if still open
+            0 // TODO: Track bytes written
+        };
+
+        key_size + val_size
+    }
+
+    /// Creates a SegmentReader for this segment
+    ///
+    /// This can only be called on read-only segments (opened from disk).
+    pub fn reader(&self) -> Result<crate::segment_reader::SegmentReader, SegmentError> {
+        if !self.is_read_only() {
+            return Err(SegmentError::ReadOnly);
+        }
+
+        let key_handle = self.key_handle.as_ref()
+            .ok_or(SegmentError::ReadOnly)?
+            .clone();
+        let val_handle = self.val_handle.as_ref()
+            .ok_or(SegmentError::ReadOnly)?
+            .clone();
+        let key_index = self.key_index.clone();
+
+        crate::segment_reader::SegmentReader::new(
+            key_handle,
+            val_handle,
+            key_index,
+        )
+    }
 }
 
 impl Drop for Segment {

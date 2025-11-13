@@ -12,6 +12,7 @@ use crate::memtable::{
     DEFAULT_MEMTABLE_SIZE_IN_BYTES,
     Memtable,
 };
+use crate::version::VersionManager;
 
 pub const DEFAULT_BLOCK_SIZE: u64 = 4096;
 pub const DEFAULT_TARGET_SST_SIZE: u64 = 4096;
@@ -64,11 +65,16 @@ impl Default for DbStorageBuilder {
     }
 }
 
+/// Default number of LSM-tree levels (L1-L7)
+pub const DEFAULT_NUM_LEVELS: usize = 7;
+
 // TODO(@siennathesane): all universal ids (memtable, sstable, etc.) need to be
 // monotonically increasing
 pub struct DbStorageState {
     curr_memtable: RwLock<Arc<Memtable>>,
     frozen_memtables: Mutex<Vec<Arc<Memtable>>>,
+    /// Version manager for LSM-tree level coordination
+    pub version_manager: Arc<VersionManager>,
 }
 
 impl DbStorageState {
@@ -77,6 +83,7 @@ impl DbStorageState {
             // TODO(@siennathesane): add config hook here
             curr_memtable: RwLock::new(Arc::new(Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES))),
             frozen_memtables: Mutex::new(vec![]),
+            version_manager: Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS)),
         }
     }
 

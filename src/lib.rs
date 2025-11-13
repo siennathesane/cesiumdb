@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 #![feature(sync_unsafe_cell)]
-#![feature(let_chains)]
 #![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
 #![allow(dead_code)]
 #![allow(unused)]
@@ -63,11 +62,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub mod block;
 mod block_alloc;
 pub mod compact;
+pub mod compaction;
 pub mod errs;
 mod hash;
 pub mod hlc;
 mod index;
 pub mod keypair;
+pub mod levels;
 mod manifest;
 pub mod map;
 pub mod memtable;
@@ -81,6 +82,7 @@ pub mod segment_writer;
 pub(crate) mod state;
 mod stats;
 pub mod utils;
+pub mod version;
 
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
