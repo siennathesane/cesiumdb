@@ -193,6 +193,11 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
                     // Parse the value
                     let value = ValueBytes::deserialize_from_memory(val_bytes);
 
+                    // Skip tombstones
+                    if value.is_tombstone() {
+                        continue;
+                    }
+
                     return Some(Ok((key, value)));
                 },
                 | None => {

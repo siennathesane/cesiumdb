@@ -142,7 +142,7 @@ impl Db {
 
     /// Delete a key.
     pub fn delete(&self, key: &[u8]) -> Result<(), CesiumError> {
-        self.put_ns(DEFAULT_NS, key, key)
+        self.delete_ns(DEFAULT_NS, key)
     }
 
     /// Write a batch of records to the database. It is safe to mix namespaced
@@ -275,6 +275,10 @@ impl DbInner {
             let guard = self.state.lock();
             let val = guard.current_memtable().get(key);
             if let Some(val) = val {
+                // Return None for tombstones
+                if val.is_tombstone() {
+                    return Ok(None);
+                }
                 return Ok(Some(val));
             }
         }
@@ -294,7 +298,7 @@ impl DbInner {
                 )),
                 | DeleteNs(ns, k, ts) => Some((
                     KeyBytes::new(*ns, Bytes::from(k.as_ref().to_owned()), *ts),
-                    ValueBytes::new(*ns, Bytes::new()),
+                    ValueBytes::new_tombstone(*ns),
                 )),
                 | _ => None, // filter out invalid enums
             })
@@ -465,8 +469,10 @@ mod tests {
         // delete the key
         assert!(db.delete(key).is_ok());
 
-        // note: delete in this implementation puts the key with itself as value
-        // this is likely a bug in the original code at line 144
+        // verify the key no longer exists (tombstone filters it out)
+        let result = db.get(key);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "deleted key should return None");
     }
 
     #[test]
@@ -544,6 +550,11 @@ mod tests {
 
         // delete from namespace
         assert!(db.delete_ns(ns, key).is_ok());
+
+        // verify the key no longer exists (tombstone filters it out)
+        let result = db.get_ns(ns, key);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "deleted key in namespace should return None");
     }
 
     #[test]

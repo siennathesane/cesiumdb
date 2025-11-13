@@ -82,6 +82,12 @@ where
     let seg = segment_mut;
 
     for (key, value) in merge_iter {
+        // Skip tombstones - they've already done their job of masking older versions
+        // during the merge, no need to persist them to the new segment
+        if value.is_tombstone() {
+            continue;
+        }
+
         // Serialize key and value for storage
         let key_bytes = key.serialize();
         let val_bytes = value.serialize_for_storage();

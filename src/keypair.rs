@@ -234,13 +234,30 @@ impl From<Bytes> for Key<Bytes> {
 pub struct Value<T: AsRef<[u8]>> {
     pub ns: u64,
     pub value: T,
+    pub tombstone: bool,
 }
 
 pub type ValueBytes = Value<Bytes>;
 
 impl ValueBytes {
     pub fn new(ns: u64, val: Bytes) -> Self {
-        ValueBytes { ns, value: val }
+        ValueBytes {
+            ns,
+            value: val,
+            tombstone: false,
+        }
+    }
+
+    pub fn new_tombstone(ns: u64) -> Self {
+        ValueBytes {
+            ns,
+            value: Bytes::new(),
+            tombstone: true,
+        }
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.tombstone
     }
 
     pub fn set_ns(&mut self, ns: u64) {
@@ -255,6 +272,7 @@ impl ValueBytes {
         ValueBytes {
             ns,
             value: Bytes::copy_from_slice(slice),
+            tombstone: false,
         }
     }
 
@@ -263,9 +281,12 @@ impl ValueBytes {
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&bytes[0..8]);
 
+        let tombstone = bytes[8] != 0;
+
         ValueBytes {
             ns: u64::from_le_bytes(ns_arr),
-            value: Bytes::copy_from_slice(&bytes[8..]),
+            tombstone,
+            value: Bytes::copy_from_slice(&bytes[9..]),
         }
     }
 
@@ -275,9 +296,12 @@ impl ValueBytes {
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&slice[8..16]);
 
+        let tombstone = slice[16] != 0;
+
         ValueBytes {
             ns: u64::from_le_bytes(ns_arr),
-            value: Bytes::copy_from_slice(&slice[16..]),
+            tombstone,
+            value: Bytes::copy_from_slice(&slice[17..]),
         }
     }
 
@@ -288,13 +312,14 @@ impl ValueBytes {
         hasher.update(self.value.as_ref());
         let checksum = hasher.finalize();
 
-        // namespace + payload
-        let len = size_of::<u64>() + self.value.as_ref().len();
+        // namespace + tombstone flag + payload
+        let len = size_of::<u64>() + size_of::<u8>() + self.value.as_ref().len();
 
         let mut buf = BytesMut::with_capacity(size_of::<u64>() + len);
         buf.put_u32_le(checksum);
         buf.put_u32_le(len as u32);
         buf.put_u64_le(self.ns);
+        buf.put_u8(if self.tombstone { 1 } else { 0 });
         buf.put_slice(self.value.as_ref());
 
         buf.freeze()
@@ -303,11 +328,12 @@ impl ValueBytes {
     #[instrument(level = "trace")]
     #[inline]
     pub fn serialize_for_memory(&self) -> Bytes {
-        // namespace + payload
-        let len = size_of::<u64>() + self.value.as_ref().len();
+        // namespace + tombstone flag + payload
+        let len = size_of::<u64>() + size_of::<u8>() + self.value.as_ref().len();
 
         let mut buf = BytesMut::with_capacity(len);
         buf.put_u64_le(self.ns);
+        buf.put_u8(if self.tombstone { 1 } else { 0 });
         buf.put_slice(self.value.as_ref());
 
         buf.freeze()
@@ -329,6 +355,7 @@ impl Default for ValueBytes {
         ValueBytes {
             ns: 0,
             value: Bytes::default(),
+            tombstone: false,
         }
     }
 }
@@ -350,9 +377,12 @@ impl From<Bytes> for Value<Bytes> {
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&val[0..8]);
 
+        let tombstone = val[8] != 0;
+
         Value {
             ns: u64::from_le_bytes(ns_arr),
-            value: Bytes::copy_from_slice(&val[16..val.len() - 8]),
+            tombstone,
+            value: Bytes::copy_from_slice(&val[9..]),
         }
     }
 }
@@ -408,18 +438,17 @@ mod tests {
 
     #[test]
     fn test_value_serialization() {
-        let val = ValueBytes {
-            ns: 0,
-            value: Bytes::from("test-value"),
-        };
+        let val = ValueBytes::new(0, Bytes::from("test-value"));
         let serialized = val.serialize_for_memory();
-        assert_eq!(serialized.len(), 18);
+        // namespace (8) + tombstone flag (1) + value (10) = 19
+        assert_eq!(serialized.len(), 19);
 
         let de_val = ValueBytes::deserialize_from_memory(serialized);
         assert_eq!(val, de_val);
 
         let serialized = val.serialize_for_storage();
-        assert_eq!(serialized.len(), 26);
+        // checksum (4) + len (4) + namespace (8) + tombstone (1) + value (10) = 27
+        assert_eq!(serialized.len(), 27);
         let de_val = ValueBytes::deserialize_from_disk(serialized);
         assert_eq!(val, de_val);
     }
@@ -654,5 +683,42 @@ mod tests {
         let serialized = val.serialize_for_memory();
         let deserialized = ValueBytes::deserialize_from_memory(serialized);
         assert_eq!(deserialized.ns(), u64::MAX);
+    }
+
+    #[test]
+    fn test_tombstone_creation() {
+        let tombstone = ValueBytes::new_tombstone(42);
+        assert!(tombstone.is_tombstone());
+        assert_eq!(tombstone.ns(), 42);
+        assert_eq!(tombstone.as_bytes().len(), 0);
+    }
+
+    #[test]
+    fn test_tombstone_serialization() {
+        let tombstone = ValueBytes::new_tombstone(5);
+
+        // Test memory serialization
+        let serialized = tombstone.serialize_for_memory();
+        let deserialized = ValueBytes::deserialize_from_memory(serialized);
+        assert!(deserialized.is_tombstone());
+        assert_eq!(deserialized.ns(), 5);
+
+        // Test storage serialization
+        let serialized = tombstone.serialize_for_storage();
+        let deserialized = ValueBytes::deserialize_from_disk(serialized);
+        assert!(deserialized.is_tombstone());
+        assert_eq!(deserialized.ns(), 5);
+    }
+
+    #[test]
+    fn test_non_tombstone_values() {
+        let value = ValueBytes::new(0, Bytes::from("data"));
+        assert!(!value.is_tombstone());
+
+        let value = ValueBytes::from_slice(1, b"more data");
+        assert!(!value.is_tombstone());
+
+        let value = ValueBytes::default();
+        assert!(!value.is_tombstone());
     }
 }
