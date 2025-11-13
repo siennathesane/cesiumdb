@@ -181,7 +181,7 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
                     }
 
                     // Parse the key
-                    let key = KeyBytes::deserialize_from_memory(key_bytes.clone());
+                    let key = KeyBytes::deserialize(key_bytes.clone());
 
                     // Use val_index to find the value block for this key
                     let val_bytes = match self.read_value_for_key(&key_bytes) {
@@ -191,12 +191,7 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
                     };
 
                     // Parse the value
-                    let value = ValueBytes::deserialize_from_memory(val_bytes);
-
-                    // Skip tombstones
-                    if value.is_tombstone() {
-                        continue;
-                    }
+                    let value = ValueBytes::deserialize(val_bytes);
 
                     return Some(Ok((key, value)));
                 },

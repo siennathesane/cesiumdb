@@ -29,11 +29,11 @@ pub const DEFAULT_NS: u64 = 0;
 pub fn map_key_bound(bound: Bound<KeyBytes>) -> Bound<Bytes> {
     match bound {
         | Bound::Included(x) => {
-            let mem_key = x.serialize_for_memory();
+            let mem_key = x.serialize();
             Bound::Included(mem_key)
         },
         | Bound::Excluded(x) => {
-            let mem_key = x.serialize_for_memory();
+            let mem_key = x.serialize();
             Bound::Excluded(mem_key)
         },
         | Bound::Unbounded => Bound::Unbounded,
@@ -61,6 +61,10 @@ impl Key<Bytes> {
         self.key = val;
     }
 
+    pub fn key(&self) -> &Bytes {
+        &self.key
+    }
+
     pub fn key_len(&self) -> usize {
         self.key.as_ref().len()
     }
@@ -81,6 +85,11 @@ impl Key<Bytes> {
         self.ts
     }
 
+    /// Returns true if this is a "latest" pointer key (timestamp inverts to 0)
+    pub fn is_pointer_key(&self) -> bool {
+        self.ts == 0
+    }
+
     pub fn set_ns(&mut self, ns: u64) {
         self.ns = ns;
     }
@@ -96,7 +105,7 @@ impl Key<Bytes> {
     #[instrument(level = "trace")]
     #[inline]
     pub fn serialize_for_latest(&self) -> Bytes {
-        let original = self.serialize_for_memory();
+        let original = self.serialize();
         let mut bytes = BytesMut::from(original.as_ref());
         for idx in 0..size_of::<u128>() {
             bytes[original.len() - idx - 1] = 0xff;
@@ -108,34 +117,11 @@ impl Key<Bytes> {
 impl Serializer for Key<Bytes> {
     #[instrument(level = "trace")]
     #[inline]
-    fn serialize_for_memory(&self) -> Bytes {
+    fn serialize(&self) -> Bytes {
         let mut bytes =
             BytesMut::with_capacity(size_of::<u64>() + self.key.as_ref().len() + size_of::<u128>());
 
         // this is the serialized key
-        bytes.put_u64_le(self.ns);
-        bytes.put_slice(self.key.as_ref());
-        bytes.put_u128_le(u128::MAX - self.ts);
-
-        bytes.freeze()
-    }
-
-    #[instrument(level = "trace")]
-    #[inline]
-    fn serialize(&self) -> Bytes {
-        // TODO(@siennathesane): add secure flag
-        let mut hasher = Hasher::new();
-        hasher.update(self.key.as_ref());
-        let checksum = hasher.finalize();
-
-        // namespace + key + timestamp
-        let len = size_of::<u64>() + self.key.as_ref().len() + size_of::<u64>();
-
-        let mut bytes = BytesMut::with_capacity(size_of::<u32>() + size_of::<u32>() + len);
-
-        // this is the serialized key
-        bytes.put_u32_le(checksum);
-        bytes.put_u32_le(len as u32);
         bytes.put_u64_le(self.ns);
         bytes.put_slice(self.key.as_ref());
         bytes.put_u128_le(u128::MAX - self.ts);
@@ -147,7 +133,7 @@ impl Serializer for Key<Bytes> {
 impl Deserializer for Key<Bytes> {
     #[instrument(level = "trace")]
     #[inline]
-    fn deserialize_from_memory(slice: Bytes) -> Self {
+    fn deserialize(slice: Bytes) -> Self {
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&slice[0..8]);
 
@@ -157,22 +143,6 @@ impl Deserializer for Key<Bytes> {
         KeyBytes {
             ns: u64::from_le_bytes(ns_arr),
             key: Bytes::copy_from_slice(&slice[8..slice.len() - 16]),
-            ts: u128::MAX - u128::from_le_bytes(ts_arr),
-        }
-    }
-
-    #[instrument(level = "trace")]
-    #[inline]
-    fn deserialize(slice: Bytes) -> Self {
-        let mut ns_arr = [0u8; 8];
-        ns_arr.copy_from_slice(&slice[8..16]);
-
-        let mut ts_arr = [0u8; 16];
-        ts_arr.copy_from_slice(&slice[slice.len() - 16..]);
-
-        KeyBytes {
-            ns: u64::from_le_bytes(ns_arr),
-            key: Bytes::copy_from_slice(&slice[16..slice.len() - 8]),
             ts: u128::MAX - u128::from_le_bytes(ts_arr),
         }
     }
@@ -277,7 +247,7 @@ impl ValueBytes {
     }
 
     #[instrument(level = "trace")]
-    pub fn deserialize_from_memory(bytes: Bytes) -> Self {
+    pub fn deserialize(bytes: Bytes) -> Self {
         let mut ns_arr = [0u8; 8];
         ns_arr.copy_from_slice(&bytes[0..8]);
 
@@ -290,44 +260,10 @@ impl ValueBytes {
         }
     }
 
-    #[instrument(level = "trace")]
-    #[inline]
-    pub fn deserialize_from_disk(slice: Bytes) -> Self {
-        let mut ns_arr = [0u8; 8];
-        ns_arr.copy_from_slice(&slice[8..16]);
-
-        let tombstone = slice[16] != 0;
-
-        ValueBytes {
-            ns: u64::from_le_bytes(ns_arr),
-            tombstone,
-            value: Bytes::copy_from_slice(&slice[17..]),
-        }
-    }
 
     #[instrument(level = "trace")]
     #[inline]
-    pub fn serialize_for_storage(&self) -> Bytes {
-        let mut hasher = Hasher::new();
-        hasher.update(self.value.as_ref());
-        let checksum = hasher.finalize();
-
-        // namespace + tombstone flag + payload
-        let len = size_of::<u64>() + size_of::<u8>() + self.value.as_ref().len();
-
-        let mut buf = BytesMut::with_capacity(size_of::<u64>() + len);
-        buf.put_u32_le(checksum);
-        buf.put_u32_le(len as u32);
-        buf.put_u64_le(self.ns);
-        buf.put_u8(if self.tombstone { 1 } else { 0 });
-        buf.put_slice(self.value.as_ref());
-
-        buf.freeze()
-    }
-
-    #[instrument(level = "trace")]
-    #[inline]
-    pub fn serialize_for_memory(&self) -> Bytes {
+    pub fn serialize(&self) -> Bytes {
         // namespace + tombstone flag + payload
         let len = size_of::<u64>() + size_of::<u8>() + self.value.as_ref().len();
 
@@ -409,20 +345,13 @@ mod tests {
             key: Bytes::from("test"),
             ts: 0,
         };
-        let memory_serialized = key.serialize_for_memory();
+        let memory_serialized = key.serialize();
 
         // 8 + 4 + 16
         // ns + payload + ts
         assert_eq!(memory_serialized.clone().len(), 28);
 
-        let de_key = KeyBytes::deserialize_from_memory(memory_serialized.clone());
-        assert_eq!(key, de_key);
-
-        // 4 + 4 + 8 + 4 + 16
-        let storage_serialized = key.serialize();
-        assert_eq!(storage_serialized.len(), 36);
-        let de_key =
-            KeyBytes::deserialize_from_memory(Bytes::copy_from_slice(&storage_serialized[8..]));
+        let de_key = KeyBytes::deserialize(memory_serialized.clone());
         assert_eq!(key, de_key);
 
         let mut latest_key = de_key.clone();
@@ -439,17 +368,11 @@ mod tests {
     #[test]
     fn test_value_serialization() {
         let val = ValueBytes::new(0, Bytes::from("test-value"));
-        let serialized = val.serialize_for_memory();
+        let serialized = val.serialize();
         // namespace (8) + tombstone flag (1) + value (10) = 19
         assert_eq!(serialized.len(), 19);
 
-        let de_val = ValueBytes::deserialize_from_memory(serialized);
-        assert_eq!(val, de_val);
-
-        let serialized = val.serialize_for_storage();
-        // checksum (4) + len (4) + namespace (8) + tombstone (1) + value (10) = 27
-        assert_eq!(serialized.len(), 27);
-        let de_val = ValueBytes::deserialize_from_disk(serialized);
+        let de_val = ValueBytes::deserialize(serialized);
         assert_eq!(val, de_val);
     }
 
@@ -522,8 +445,8 @@ mod tests {
         assert!(key.is_empty());
         assert_eq!(key.key_len(), 0);
 
-        let serialized = key.serialize_for_memory();
-        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        let serialized = key.serialize();
+        let deserialized = KeyBytes::deserialize(serialized);
         assert!(deserialized.is_empty());
     }
 
@@ -535,8 +458,8 @@ mod tests {
         assert_eq!(key.key_len(), 10000);
         assert_eq!(key.raw_len(), 10000 + size_of::<u64>() + size_of::<u128>());
 
-        let serialized = key.serialize_for_memory();
-        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        let serialized = key.serialize();
+        let deserialized = KeyBytes::deserialize(serialized);
 
         assert_eq!(deserialized.key_len(), 10000);
         assert_eq!(deserialized.as_bytes().len(), 10000);
@@ -547,8 +470,8 @@ mod tests {
         let val = ValueBytes::new(0, Bytes::new());
         assert_eq!(val.as_bytes().len(), 0);
 
-        let serialized = val.serialize_for_memory();
-        let deserialized = ValueBytes::deserialize_from_memory(serialized);
+        let serialized = val.serialize();
+        let deserialized = ValueBytes::deserialize(serialized);
         assert_eq!(deserialized.as_bytes().len(), 0);
     }
 
@@ -559,8 +482,8 @@ mod tests {
 
         assert_eq!(val.as_bytes().len(), 100000);
 
-        let serialized = val.serialize_for_storage();
-        let deserialized = ValueBytes::deserialize_from_disk(serialized);
+        let serialized = val.serialize();
+        let deserialized = ValueBytes::deserialize(serialized);
 
         assert_eq!(deserialized.ns(), 42);
         assert_eq!(deserialized.as_bytes().len(), 100000);
@@ -635,7 +558,7 @@ mod tests {
 
         match mapped {
             | Bound::Included(bytes) => {
-                let deserialized = KeyBytes::deserialize_from_memory(bytes);
+                let deserialized = KeyBytes::deserialize(bytes);
                 assert_eq!(deserialized, key);
             },
             | _ => panic!("expected Included bound"),
@@ -660,14 +583,14 @@ mod tests {
     fn test_timestamp_boundary_values() {
         // test with u128::MAX timestamp
         let key_max = KeyBytes::new(0, Bytes::from("key"), u128::MAX);
-        let serialized = key_max.serialize_for_memory();
-        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        let serialized = key_max.serialize();
+        let deserialized = KeyBytes::deserialize(serialized);
         assert_eq!(deserialized.ts(), u128::MAX);
 
         // test with 0 timestamp
         let key_zero = KeyBytes::new(0, Bytes::from("key"), 0);
-        let serialized = key_zero.serialize_for_memory();
-        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        let serialized = key_zero.serialize();
+        let deserialized = KeyBytes::deserialize(serialized);
         assert_eq!(deserialized.ts(), 0);
     }
 
@@ -675,13 +598,13 @@ mod tests {
     fn test_namespace_boundary_values() {
         // test with u64::MAX namespace
         let key = KeyBytes::new(u64::MAX, Bytes::from("key"), 100);
-        let serialized = key.serialize_for_memory();
-        let deserialized = KeyBytes::deserialize_from_memory(serialized);
+        let serialized = key.serialize();
+        let deserialized = KeyBytes::deserialize(serialized);
         assert_eq!(deserialized.ns(), u64::MAX);
 
         let val = ValueBytes::new(u64::MAX, Bytes::from("value"));
-        let serialized = val.serialize_for_memory();
-        let deserialized = ValueBytes::deserialize_from_memory(serialized);
+        let serialized = val.serialize();
+        let deserialized = ValueBytes::deserialize(serialized);
         assert_eq!(deserialized.ns(), u64::MAX);
     }
 
@@ -698,14 +621,14 @@ mod tests {
         let tombstone = ValueBytes::new_tombstone(5);
 
         // Test memory serialization
-        let serialized = tombstone.serialize_for_memory();
-        let deserialized = ValueBytes::deserialize_from_memory(serialized);
+        let serialized = tombstone.serialize();
+        let deserialized = ValueBytes::deserialize(serialized);
         assert!(deserialized.is_tombstone());
         assert_eq!(deserialized.ns(), 5);
 
         // Test storage serialization
-        let serialized = tombstone.serialize_for_storage();
-        let deserialized = ValueBytes::deserialize_from_disk(serialized);
+        let serialized = tombstone.serialize();
+        let deserialized = ValueBytes::deserialize(serialized);
         assert!(deserialized.is_tombstone());
         assert_eq!(deserialized.ns(), 5);
     }

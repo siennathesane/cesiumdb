@@ -132,7 +132,7 @@ impl Memtable {
             | Some(_key) => self
                 .map
                 .get(&_key.value().clone())
-                .map(|val| ValueBytes::deserialize_from_memory(val.value().clone())),
+                .map(|val| ValueBytes::deserialize(val.value().clone())),
         }
     }
 
@@ -161,9 +161,9 @@ impl Memtable {
         }
 
         for (key, val) in data.iter() {
-            let _key = key.clone().serialize_for_memory();
+            let _key = key.clone().serialize();
             let _key_ptr = key.clone().serialize_for_latest();
-            let _val = val.serialize_for_memory();
+            let _val = val.serialize();
             // the key * value both have two u32 bits associated with them
             // on physical storage, so we account for that. we also have to
             // account for the key, the key pointer, and the key pointer's value (re: the
@@ -251,12 +251,19 @@ impl Iterator for MemtableIterator {
     #[instrument(level = "trace")]
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|entry: Entry<'_, Bytes, Bytes>| {
-            (
-                KeyBytes::deserialize_from_memory(entry.key().clone()),
-                ValueBytes::deserialize_from_memory(entry.value().clone()),
-            )
-        })
+        loop {
+            let entry = self.inner.next()?;
+            let key = KeyBytes::deserialize(entry.key().clone());
+
+            // Skip "latest" pointer entries (these have ts=0 after inversion)
+            // These are internal bookkeeping entries that point to the actual key
+            if key.is_pointer_key() {
+                continue;
+            }
+
+            let value = ValueBytes::deserialize(entry.value().clone());
+            return Some((key, value));
+        }
     }
 
     #[inline]

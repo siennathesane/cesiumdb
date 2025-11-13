@@ -17,10 +17,6 @@ struct SegmentMetadata {
 }
 
 impl Serializer for SegmentMetadata {
-    fn serialize_for_memory(&self) -> Bytes {
-        self.serialize()
-    }
-
     fn serialize(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(100);
         buf.put_u64(self.fname.len() as u64);
@@ -33,10 +29,6 @@ impl Serializer for SegmentMetadata {
 }
 
 impl Deserializer for SegmentMetadata {
-    fn deserialize_from_memory(payload: Bytes) -> Self {
-        Self::deserialize(payload)
-    }
-
     fn deserialize(payload: Bytes) -> Self {
         let mut bytes = payload;
         let fname_len = bytes.get_u64() as usize;
@@ -79,15 +71,15 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_metadata_serialize_for_memory() {
+    fn test_segment_metadata_serialize() {
         let metadata = SegmentMetadata {
             fname: "test.sst".to_string(),
             starting_key: Bytes::from("key"),
             seed: 999,
         };
 
-        let serialized = metadata.serialize_for_memory();
-        let deserialized = SegmentMetadata::deserialize_from_memory(serialized);
+        let serialized = metadata.serialize();
+        let deserialized = SegmentMetadata::deserialize(serialized);
 
         assert_eq!(deserialized.fname, metadata.fname);
         assert_eq!(deserialized.starting_key, metadata.starting_key);

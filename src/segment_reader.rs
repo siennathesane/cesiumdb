@@ -101,9 +101,26 @@ impl SegmentReader {
             return Err(InvalidSize);
         }
 
+        // Use the actual number of blocks that were written, not the file size
+        // The file might be larger than the actual data due to pre-allocation
+        let index_blocks = key_index.lock().num_blocks() as usize;
         let num_blocks = segment_size / BLOCK_SIZE;
 
-        let visible_key_blocks = num_blocks;
+        // Determine visible blocks:
+        // - If index has num_blocks set (from metadata), use it (handles empty segments correctly)
+        // - Otherwise (test segments or old files), fall back to file size
+        // We can't perfectly distinguish "empty segment" from "uninitialized test segment",
+        // but we can check if the file is pre-allocated to max size (64MB) with no data
+        let visible_key_blocks = if index_blocks > 0 {
+            // Metadata says there are blocks - trust it
+            index_blocks
+        } else if segment_size >= 64 * 1024 * 1024 {
+            // Large pre-allocated file with 0 blocks in metadata - this is an empty segment
+            0
+        } else {
+            // Small file or test segment - use file size
+            num_blocks
+        };
         let visible_val_blocks = val_handle.len() / BLOCK_SIZE;
 
         Ok(Self {

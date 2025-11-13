@@ -316,13 +316,13 @@ fn bench_segment_scan(c: &mut Criterion, dir: &TempDir) {
                                 let y = format!("v{:05}", i).as_bytes().to_vec();
                                 let mut value = ValueBytes::new(DEFAULT_NS, Bytes::from(y));
 
-                                let key_bytes = key.serialize_for_memory();
+                                let key_bytes = key.serialize();
 
                                 // store the raw key for later range bounds
                                 keys.push(key_bytes.clone().into());
 
                                 segment_ref
-                                    .write(&key_bytes, &value.serialize_for_memory())
+                                    .write(&key_bytes, &value.serialize())
                                     .unwrap();
                             }
 

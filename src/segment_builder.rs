@@ -121,38 +121,62 @@ impl SegmentBuilder {
         // Validate index location
         let index_start = key_metadata.index_start();
         let index_size = key_metadata.index_size();
+        let block_count = key_metadata.block_count();
 
-        if index_start == 0 || index_size == 0 {
+        // Allow empty segments (block_count=0, index_start=0)
+        // but reject malformed metadata (index_start=0 with blocks, or index_size=0)
+        if block_count > 0 && index_start == 0 {
             return Err(SegmentError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "Invalid index location in metadata: start={}, size={}",
-                    index_start, index_size
+                    "Invalid index location: segment has {} blocks but index_start=0",
+                    block_count
                 ),
             )));
         }
 
-        if index_start >= key_file_size || index_start + index_size > key_file_size {
+        if index_size == 0 {
             return Err(SegmentError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "Index location out of bounds: start={}, size={}, file_size={}",
-                    index_start, index_size, key_file_size
-                ),
+                "Invalid index: index_size=0".to_string(),
             )));
         }
 
-        let key_index_payload =
-            key_mmap[index_start as usize..(index_start + index_size) as usize].as_ref();
-
-        if key_index_payload.len() < 56 {
-            return Err(SegmentError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Index data too small: {}", key_index_payload.len()),
-            )));
+        // For non-empty segments, validate index bounds
+        if block_count > 0 {
+            if index_start >= key_file_size || index_start + index_size > key_file_size {
+                return Err(SegmentError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Index location out of bounds: start={}, size={}, file_size={}",
+                        index_start, index_size, key_file_size
+                    ),
+                )));
+            }
         }
 
-        let key_index = Index::from(Bytes::copy_from_slice(key_index_payload));
+        // Read and deserialize the index
+        let mut key_index = if block_count == 0 {
+            // Empty segment - create a new empty index instead of reading from file
+            // (index_start=0 for empty segments, so we can't read from there)
+            Index::new(key_metadata.id(), 0)
+        } else {
+            let key_index_payload =
+                key_mmap[index_start as usize..(index_start + index_size) as usize].as_ref();
+
+            if key_index_payload.len() < 56 {
+                return Err(SegmentError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Index data too small: {}", key_index_payload.len()),
+                )));
+            }
+
+            Index::from(Bytes::copy_from_slice(key_index_payload))
+        };
+
+        // Update the index's num_blocks from the metadata (the index is deserialized with whatever
+        // was saved, but the authoritative block count is in the metadata)
+        key_index.set_num_blocks(key_metadata.block_count() as u64);
 
         // Repeat similar process for value segment
         let val_path = self.root.join(val_segment_id.to_string());
@@ -316,7 +340,7 @@ mod tests {
         // Store serialized forms
         let serialized_pairs: Vec<(Bytes, Bytes)> = test_data
             .iter()
-            .map(|(k, v)| (k.serialize_for_memory(), v.serialize_for_memory()))
+            .map(|(k, v)| (k.serialize(), v.serialize()))
             .collect();
 
         // Write data

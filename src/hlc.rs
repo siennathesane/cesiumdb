@@ -75,9 +75,9 @@ impl HybridLogicalClock {
 impl HLC for HybridLogicalClock {
     #[inline]
     fn time(&self) -> u128 {
-        self.last_tick
-            .store(self.last_tick.load(Relaxed) + 1, Relaxed);
-        self.last_tick.load(Relaxed)
+        // Atomically increment and return the new value
+        // fetch_add returns the OLD value, so we add 1 to get the new value
+        self.last_tick.fetch_add(1, Relaxed) + 1
     }
 }
 

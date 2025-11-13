@@ -98,6 +98,16 @@ impl Index {
         }
     }
 
+    /// Returns the number of blocks indexed
+    pub fn num_blocks(&self) -> u64 {
+        self.num_blocks
+    }
+
+    /// Sets the number of blocks (used when loading from metadata)
+    pub(crate) fn set_num_blocks(&mut self, count: u64) {
+        self.num_blocks = count;
+    }
+
     /// Insert an item into the index.
     #[instrument(level = "trace")]
     pub fn insert_item(&mut self, key: &[u8]) {

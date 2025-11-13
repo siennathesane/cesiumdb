@@ -239,7 +239,7 @@ impl Block {
 }
 
 impl Deserializer for Block {
-    fn deserialize_from_memory(payload: Bytes) -> Self {
+    fn deserialize(payload: Bytes) -> Self {
         let mut block = Block::new();
 
         // First two bytes are num_entries
@@ -264,11 +264,6 @@ impl Deserializer for Block {
         }
 
         block
-    }
-
-    fn deserialize(payload: Bytes) -> Self {
-        // Storage format is identical to memory format for blocks
-        Self::deserialize_from_memory(payload)
     }
 }
 
