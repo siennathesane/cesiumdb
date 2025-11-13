@@ -441,6 +441,44 @@ impl Segment {
         }
     }
 
+    /// Helper to write a chunk to a fresh block with the given flag.
+    /// This is used during multi-block entry splitting.
+    fn write_chunk_to_new_block(
+        &self,
+        chunk: &[u8],
+        flag: EntryFlag,
+        block_type: &BlockType,
+    ) -> Result<(), SegmentError> {
+        let mut block = Block::new();
+        block.add_entry(chunk, flag)
+            .map_err(|e| {
+                eprintln!(
+                    "Error adding {:?} chunk to {} block: {:?}, chunk size: {}",
+                    flag, block_type, e, chunk.len()
+                );
+                SegmentError::InsufficientSpace
+            })?;
+
+        match block_type {
+            Key => {
+                let mut writer_guard = self.key_writer.lock();
+                let writer = writer_guard.as_mut().ok_or(ReadOnly)?;
+                writer.write_block(block)?;
+                drop(writer_guard);
+                self.key_index.lock().inc_block_count(1);
+            },
+            Value => {
+                let mut writer_guard = self.val_writer.lock();
+                let writer = writer_guard.as_mut().ok_or(ReadOnly)?;
+                writer.write_block(block)?;
+                drop(writer_guard);
+                self.val_block_count.fetch_add(1, Relaxed);
+            },
+        }
+
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), SegmentError> {
         if self.key_writer.lock().is_none() {
             return Err(ReadOnly);
@@ -476,234 +514,54 @@ impl Segment {
     /// Split a payload across multiple blocks.
     /// Returns (block_num, entry_index) where the START entry was placed.
     fn split_across_blocks(&self, data: &[u8], r#type: &BlockType) -> Result<(u64, u16), SegmentError> {
-        let mut remaining = data;
-
-        // First, determine the maximum chunk size that can fit in a block
-        // Account for the entry flag byte and other overhead
-        let max_chunk_size = MAX_ENTRY_SIZE - 1;
-
-        // Track where the START entry is placed
-        let start_block_num: u64;
-        let start_entry_index: u16 = 0; // Always at index 0 in fresh block
-
-        // Process the first chunk (START flag)
-        if !remaining.is_empty() {
-            let chunk_size = std::cmp::min(max_chunk_size, remaining.len());
-            let chunk = &remaining[..chunk_size];
-
-            match r#type {
-                | Key => {
-                    // Always start with a new block
-                    {
-                        let key_block = self.current_key_block.lock();
-                        if !key_block.is_empty() {
-                            drop(key_block);
-                            match self.write_block(&Key) {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
-                        }
-                    }
-
-                    // Capture block number before adding START entry
-                    start_block_num = self.key_index.lock().block_count();
-
-                    {
-                        let mut key_block = self.current_key_block.lock();
-                        match key_block.add_entry(chunk, Start) {
-                            | Ok(_) => {
-                                drop(key_block);
-                                self.key_index.lock().insert_item(data);
-                                match self.write_block(&Key) {
-                                    | Ok(_) => {},
-                                    | Err(e) => return Err(e),
-                                };
-                            },
-                            | Err(e) => {
-                                eprintln!(
-                                    "Error adding START chunk to key block: {:?}, chunk size: {}",
-                                    e,
-                                    chunk.len()
-                                );
-                                return Err(SegmentError::InsufficientSpace);
-                            },
-                        }
-                    }
-                },
-                | Value => {
-                    // Always start with a new block
-                    {
-                        let val_block = self.current_val_block.lock();
-                        if !val_block.is_empty() {
-                            drop(val_block);
-                            match self.write_block(&Value) {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
-                        }
-                    }
-
-                    // Capture block number before adding START entry
-                    start_block_num = self.val_block_count.load(Relaxed);
-
-                    {
-                        let mut val_block = self.current_val_block.lock();
-                        match val_block.add_entry(chunk, Start) {
-                            | Ok(_) => {
-                                drop(val_block);
-                                match self.write_block(&Value) {
-                                    | Ok(_) => {},
-                                    | Err(e) => return Err(e),
-                                };
-                            },
-                            | Err(e) => {
-                                eprintln!(
-                                    "Error adding START chunk to value block: {:?}, chunk size: {}",
-                                    e,
-                                    chunk.len()
-                                );
-                                return Err(SegmentError::InsufficientSpace);
-                            },
-                        }
-                    }
-                },
-            }
-
-            remaining = &remaining[chunk_size..];
-        } else {
+        if data.is_empty() {
             return Err(SegmentError::InsufficientSpace);
         }
+
+        let mut remaining = data;
+        let max_chunk_size = MAX_ENTRY_SIZE - 1;
+        let start_entry_index: u16 = 0; // Always at index 0 in fresh block
+
+        // Ensure current block is flushed before starting
+        {
+            let block = match r#type {
+                Key => self.current_key_block.lock(),
+                Value => self.current_val_block.lock(),
+            };
+            if !block.is_empty() {
+                drop(block);
+                self.write_block(r#type)?;
+            }
+        }
+
+        // Capture the block number where START will be placed
+        let start_block_num = match r#type {
+            Key => self.key_index.lock().block_count(),
+            Value => self.val_block_count.load(Relaxed),
+        };
+
+        // Write START chunk
+        let chunk_size = std::cmp::min(max_chunk_size, remaining.len());
+        let chunk = &remaining[..chunk_size];
+
+        // For keys, also insert into index
+        if matches!(r#type, Key) {
+            self.key_index.lock().insert_item(data);
+        }
+
+        self.write_chunk_to_new_block(chunk, Start, r#type)?;
+        remaining = &remaining[chunk_size..];
 
         // Process middle chunks (MIDDLE flag)
         while remaining.len() > max_chunk_size {
             let chunk = &remaining[..max_chunk_size];
-
-            match r#type {
-                | Key => {
-                    let mut block = Block::new();
-                    match block.add_entry(chunk, Middle) {
-                        | Ok(_) => {
-                            let mut writer_guard = self.key_writer.lock();
-                            match writer_guard.as_mut() {
-                                | Some(writer) => {
-                                    match writer.write_block(block) {
-                                        | Ok(_) => {
-                                            drop(writer_guard);
-                                            // Sync index block count
-                                            self.key_index.lock().inc_block_count(1);
-                                        },
-                                        | Err(e) => return Err(e),
-                                    }
-                                },
-                                | None => return Err(ReadOnly),
-                            }
-                        },
-                        | Err(e) => {
-                            eprintln!(
-                                "Error adding MIDDLE chunk to key block: {:?}, chunk size: {}",
-                                e,
-                                chunk.len()
-                            );
-                            return Err(SegmentError::InsufficientSpace);
-                        },
-                    }
-                },
-                | Value => {
-                    let mut block = Block::new();
-                    match block.add_entry(chunk, Middle) {
-                        | Ok(_) => {
-                            let mut writer_guard = self.val_writer.lock();
-                            match writer_guard.as_mut() {
-                                | Some(writer) => {
-                                    match writer.write_block(block) {
-                                        | Ok(_) => {
-                                            drop(writer_guard);
-                                            // Increment block count
-                                            self.val_block_count.fetch_add(1, Relaxed);
-                                        },
-                                        | Err(e) => return Err(e),
-                                    }
-                                },
-                                | None => return Err(ReadOnly),
-                            }
-                        },
-                        | Err(e) => {
-                            eprintln!(
-                                "Error adding MIDDLE chunk to value block: {:?}, chunk size: {}",
-                                e,
-                                chunk.len()
-                            );
-                            return Err(SegmentError::InsufficientSpace);
-                        },
-                    }
-                },
-            }
-
+            self.write_chunk_to_new_block(chunk, Middle, r#type)?;
             remaining = &remaining[max_chunk_size..];
         }
 
         // Process the last chunk (END flag) if there's anything left
         if !remaining.is_empty() {
-            match r#type {
-                | Key => {
-                    let mut block = Block::new();
-                    match block.add_entry(remaining, End) {
-                        | Ok(_) => {
-                            let mut writer_guard = self.key_writer.lock();
-                            match writer_guard.as_mut() {
-                                | Some(writer) => {
-                                    match writer.write_block(block) {
-                                        | Ok(_) => {
-                                            drop(writer_guard);
-                                            // Sync index block count
-                                            self.key_index.lock().inc_block_count(1);
-                                        },
-                                        | Err(e) => return Err(e),
-                                    }
-                                },
-                                | None => return Err(ReadOnly),
-                            }
-                        },
-                        | Err(e) => {
-                            eprintln!(
-                                "Error adding END chunk to key block: {:?}, chunk size: {}",
-                                e,
-                                remaining.len()
-                            );
-                            return Err(SegmentError::InsufficientSpace);
-                        },
-                    }
-                },
-                | Value => {
-                    let mut block = Block::new();
-                    match block.add_entry(remaining, End) {
-                        | Ok(_) => {
-                            let mut writer_guard = self.val_writer.lock();
-                            match writer_guard.as_mut() {
-                                | Some(writer) => {
-                                    match writer.write_block(block) {
-                                        | Ok(_) => {
-                                            drop(writer_guard);
-                                            // Increment block count
-                                            self.val_block_count.fetch_add(1, Relaxed);
-                                        },
-                                        | Err(e) => return Err(e),
-                                    }
-                                },
-                                | None => return Err(ReadOnly),
-                            }
-                        },
-                        | Err(e) => {
-                            eprintln!(
-                                "Error adding END chunk to value block: {:?}, chunk size: {}",
-                                e,
-                                remaining.len()
-                            );
-                            return Err(SegmentError::InsufficientSpace);
-                        },
-                    }
-                },
-            }
+            self.write_chunk_to_new_block(remaining, End, r#type)?;
         }
 
         Ok((start_block_num, start_entry_index))
