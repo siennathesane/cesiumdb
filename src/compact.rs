@@ -19,7 +19,10 @@ use crate::{
     },
     memtable::Memtable,
     merge::MergeIterator,
-    segment::Segment,
+    segment::{
+        Segment,
+        DEFAULT_SEGMENT_SIZE,
+    },
     segment_builder::SegmentBuilder,
     utils::Serializer,
 };
@@ -72,7 +75,7 @@ where
     let merge_iter = MergeIterator::new(iterators);
     let builder = SegmentBuilder::new(output_path)?;
     let seed = random();
-    let segment = builder.new_segment(segment_id, seed, 64 * 1024 * 1024)?;
+    let segment = builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE)?;
 
     let mut entry_count = 0u64;
 
@@ -169,7 +172,7 @@ pub fn flush_memtable(
 
     let builder = SegmentBuilder::new(output_path)?;
     let seed = random();
-    let segment = builder.new_segment(segment_id, seed, 64 * 1024 * 1024)?;
+    let segment = builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE)?;
 
     let mut entry_count = 0u64;
 

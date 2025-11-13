@@ -40,6 +40,7 @@ use crate::{
             Key,
             Value,
         },
+        DEFAULT_SEGMENT_SIZE,
     },
     segment_iterator::{
         SeekingBlockIterator,
@@ -114,7 +115,7 @@ impl SegmentReader {
         let visible_key_blocks = if index_blocks > 0 {
             // Metadata says there are blocks - trust it
             index_blocks
-        } else if segment_size >= 64 * 1024 * 1024 {
+        } else if segment_size >= DEFAULT_SEGMENT_SIZE as usize {
             // Large pre-allocated file with 0 blocks in metadata - this is an empty segment
             0
         } else {
@@ -226,54 +227,53 @@ impl SegmentReader {
     }
 
     #[instrument(level = "trace")]
-    fn read_key(&self, key_block_index: usize, entry_index: usize) -> Result<Bytes, SegmentError> {
-        let block = match self.read_key_block(key_block_index) {
-            | Ok(v) => v,
-            | Err(e) => return Err(e),
-        };
-
-        let (flag, data) = match block.get(entry_index) {
-            | Some(v) => v,
-            | None => return Err(MissingKey),
-        };
+    /// Helper method to read a potentially multi-block entry.
+    ///
+    /// # Arguments
+    /// * `flag` - Entry flag from the initial block
+    /// * `initial_data` - Data from the initial block entry
+    /// * `starting_block` - Block index where the entry starts (for multi-block entries, where to continue reading)
+    ///
+    /// # Returns
+    /// The complete entry data, reassembled if it was split across blocks
+    pub(crate) fn read_multiblock_entry(
+        &self,
+        flag: EntryFlag,
+        initial_data: &[u8],
+        starting_block: usize,
+    ) -> Result<Bytes, SegmentError> {
+        use EntryFlag::*;
 
         match flag {
-            | complete => Ok(Bytes::copy_from_slice(data)),
-            | start => {
-                let mut buffer = BytesMut::with_capacity(data.len() * 2);
-                buffer.extend_from_slice(data);
+            Complete => Ok(Bytes::copy_from_slice(initial_data)),
+            Start => {
+                let mut buffer = BytesMut::with_capacity(initial_data.len() * 2);
+                buffer.extend_from_slice(initial_data);
 
-                let mut current_block_index = key_block_index + 1;
+                let mut current_block_index = starting_block;
                 let mut found_end = false;
 
                 while current_block_index < self.visible_key_blocks && !found_end {
-                    let next_block = match self.read_key_block(current_block_index) {
-                        | Ok(v) => v,
-                        | Err(e) => return Err(e),
-                    };
+                    let next_block = self.read_key_block(current_block_index)?;
 
                     if next_block.num_entries() == 0 {
                         current_block_index += 1;
                         continue;
                     }
 
-                    let (next_flag, next_data) = match next_block.get(0) {
-                        | Some(v) => v,
-                        | None => return Err(CorruptedBlock),
-                    };
+                    let (next_flag, next_data) = next_block.get(0)
+                        .ok_or(CorruptedBlock)?;
 
                     match next_flag {
-                        | middle => {
+                        Middle => {
                             buffer.extend_from_slice(next_data);
                             current_block_index += 1;
                         },
-                        | end => {
+                        End => {
                             buffer.extend_from_slice(next_data);
                             found_end = true;
                         },
-                        | _ => {
-                            return Err(CorruptedBlock);
-                        },
+                        _ => return Err(CorruptedBlock),
                     }
                 }
 
@@ -283,8 +283,16 @@ impl SegmentReader {
 
                 Ok(buffer.freeze())
             },
-            | EntryFlag::Middle | EntryFlag::End => Err(CorruptedBlock),
+            Middle | End => Err(CorruptedBlock),
         }
+    }
+
+    fn read_key(&self, key_block_index: usize, entry_index: usize) -> Result<Bytes, SegmentError> {
+        let block = self.read_key_block(key_block_index)?;
+        let (flag, data) = block.get(entry_index).ok_or(MissingKey)?;
+
+        // Use helper to handle multi-block entries
+        self.read_multiblock_entry(flag, data, key_block_index + 1)
     }
 
     #[instrument(level = "trace")]
@@ -385,60 +393,10 @@ impl SegmentReader {
 
     fn find_key(&self, key_hash: u64, key_block_offset: u64) -> Result<Bytes, SegmentError> {
         let block_index = key_block_offset as usize;
-        let block = match self.read_key_block(block_index) {
-            | Ok(v) => v,
-            | Err(e) => return Err(e),
-        };
+        let block = self.read_key_block(block_index)?;
 
         if let Some((flag, data)) = block.get(0) {
-            return match flag {
-                | complete => Ok(Bytes::copy_from_slice(data)),
-                | start => {
-                    let mut buffer = BytesMut::with_capacity(data.len() * 2);
-                    buffer.extend_from_slice(data);
-
-                    let mut current_block_index = block_index + 1;
-                    let mut found_end = false;
-
-                    while current_block_index < self.visible_key_blocks && !found_end {
-                        let next_block = match self.read_key_block(current_block_index) {
-                            | Ok(v) => v,
-                            | Err(e) => return Err(e),
-                        };
-
-                        if next_block.num_entries() == 0 {
-                            current_block_index += 1;
-                            continue;
-                        }
-
-                        let (next_flag, next_data) = match next_block.get(0) {
-                            | Some(v) => v,
-                            | None => return Err(CorruptedBlock),
-                        };
-
-                        match next_flag {
-                            | middle => {
-                                buffer.extend_from_slice(next_data);
-                                current_block_index += 1;
-                            },
-                            | end => {
-                                buffer.extend_from_slice(next_data);
-                                found_end = true;
-                            },
-                            | _ => {
-                                return Err(CorruptedBlock);
-                            },
-                        }
-                    }
-
-                    if !found_end {
-                        return Err(CorruptedBlock);
-                    }
-
-                    Ok(buffer.freeze())
-                },
-                | _ => Err(CorruptedBlock),
-            };
+            return self.read_multiblock_entry(flag, data, block_index + 1);
         }
 
         Err(ReadOutOfBounds)

@@ -37,6 +37,17 @@ use crate::{
     },
 };
 
+// Index header constants
+/// Number of u64 fields in the index header
+const INDEX_HEADER_FIELDS: usize = 6;
+/// Size of the index header: 6 * u64 = 48 bytes
+/// Fields: id, bloom_filter_seed, bloom_filter_size, ns_offset_size, block_offset_size, num_blocks
+const INDEX_HEADER_SIZE: usize = INDEX_HEADER_FIELDS * size_of::<u64>();
+/// Size of each offset entry (namespace or block): 2 * u64 = 16 bytes
+const OFFSET_ENTRY_SIZE: usize = 2 * size_of::<u64>();
+/// Minimum valid index size (header + some data)
+pub(crate) const MIN_INDEX_SIZE: usize = 56;
+
 /// The value at which the bloom filter has a 50% probability of false positives
 /// for 3-byte key storage
 const BLOOM_OVERRIDE: usize = 10300768;
@@ -194,16 +205,16 @@ impl Index {
         //   ns_offset_size
         //   block_offset_size
         //   num_blocks
-        let header_size = (8 + 8 + 8 + 8 + 8 + 8) as usize;
+        let header_size = INDEX_HEADER_SIZE;
 
         // the size of the bloom filter data
         let bloom_size = self.bloom_filter.bitmap().clone().freeze().len();
 
-        // the size of the block offsets. 16 bytes per offset
-        let block_offset_size = self.block_offset_entries.len() * 16;
+        // the size of the block offsets
+        let block_offset_size = self.block_offset_entries.len() * OFFSET_ENTRY_SIZE;
 
-        // the size of the namespace offsets. 16 bytes per offset
-        let ns_offset_size = self.ns_offset_entries.len() * 16;
+        // the size of the namespace offsets
+        let ns_offset_size = self.ns_offset_entries.len() * OFFSET_ENTRY_SIZE;
 
         header_size + bloom_size + block_offset_size + ns_offset_size
     }

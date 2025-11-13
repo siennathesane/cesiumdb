@@ -53,6 +53,26 @@ use crate::{
     segment_writer::SegmentWriter,
 };
 
+// Constants for value location metadata embedded in keys
+/// Size of value location metadata: u64 (block_num) + u16 (entry_index) = 10 bytes
+pub(crate) const VALUE_LOCATION_SIZE: usize = size_of::<u64>() + size_of::<u16>();
+/// Offset where value block number is stored in key metadata
+const VALUE_BLOCK_OFFSET: usize = 0;
+/// Offset where value entry index is stored in key metadata
+const VALUE_ENTRY_OFFSET: usize = size_of::<u64>();
+/// Offset where actual key data starts (after metadata)
+pub(crate) const KEY_DATA_OFFSET: usize = VALUE_LOCATION_SIZE;
+
+// Segment file size constants
+/// Default segment size: 64 MiB
+pub(crate) const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+/// Threshold for detecting pre-allocated empty segments
+const PREALLOCATED_FILE_THRESHOLD: u64 = DEFAULT_SEGMENT_SIZE;
+
+// Metadata size constant
+/// Size of segment metadata: 4 * u64 = 32 bytes
+const METADATA_SIZE: usize = 4 * size_of::<u64>();
+
 #[derive(Debug)]
 pub enum BlockType {
     Key,
@@ -302,118 +322,18 @@ impl Segment {
         }
 
         // Write value to value block FIRST so we know where it lands
-        let (value_block_num, value_entry_index) = {
-            let mut val_block = self.current_val_block.lock();
-
-            match val_block.add_entry(val, Complete) {
-                | Ok(()) => {
-                    // Value added successfully to current block
-                    let block_num = self.val_block_count.load(Relaxed);
-                    let entry_idx = (val_block.num_entries() - 1) as u16;
-                    drop(val_block);
-                    (block_num, entry_idx)
-                },
-                | Err(be) => {
-                    drop(val_block);
-
-                    match be {
-                        | BlockError::TooLargeForBlock => {
-                            // Split returns where the START entry was placed
-                            match self.split_across_blocks(val, &Value) {
-                                | Ok((block_num, entry_idx)) => (block_num, entry_idx),
-                                | Err(e) => return Err(e),
-                            }
-                        },
-                        | BlockError::CorruptedBlock => {
-                            unreachable!("unexpected corrupted block error during write")
-                        },
-                        | BlockError::BlockFull => {
-                            match self.write_block(&Value) {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
-
-                            let mut val_block = self.current_val_block.lock();
-                            match val_block.add_entry(val, Complete) {
-                                | Ok(_) => {
-                                    // Value added successfully to new block
-                                    let block_num = self.val_block_count.load(Relaxed);
-                                    let entry_idx = (val_block.num_entries() - 1) as u16;
-                                    (block_num, entry_idx)
-                                },
-                                | Err(rbe) => match rbe {
-                                    | BlockError::TooLargeForBlock => {
-                                        drop(val_block);
-                                        // Split returns where the START entry was placed
-                                        match self.split_across_blocks(val, &Value) {
-                                            | Ok((block_num, entry_idx)) => (block_num, entry_idx),
-                                            | Err(e) => return Err(e),
-                                        }
-                                    },
-                                    | BlockError::CorruptedBlock | BlockError::BlockFull => {
-                                        unreachable!("unexpected val block error, no idea how we got here")
-                                    },
-                                },
-                            }
-                        },
-                    }
-                },
-            }
-        };
+        let (value_block_num, value_entry_index) = self.add_entry_with_retry(val, &Value)?;
 
         // Now write key with embedded value location metadata
         // Format: [value_block_num:u64][value_entry_index:u16][key_data]
-        let mut key_with_metadata = BytesMut::with_capacity(10 + key.len());
+        let mut key_with_metadata = BytesMut::with_capacity(VALUE_LOCATION_SIZE + key.len());
         key_with_metadata.put_u64_le(value_block_num);
         key_with_metadata.put_u16_le(value_entry_index);
         key_with_metadata.put_slice(key);
 
-        {
-            let mut key_block = self.current_key_block.lock();
-            match key_block.add_entry(&key_with_metadata, Complete) {
-                | Ok(()) => {},
-                | Err(be) => {
-                    drop(key_block);
-
-                    match be {
-                        | BlockError::TooLargeForBlock => {
-                            // Key split - we already have value location in metadata, so ignore return value
-                            match self.split_across_blocks(&key_with_metadata, &Key) {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            }
-                        },
-                        | BlockError::CorruptedBlock => {
-                            unreachable!("unexpected corrupted block error during key write")
-                        },
-                        | BlockError::BlockFull => {
-                            match self.write_block(&Key) {
-                                | Ok(_) => {},
-                                | Err(e) => return Err(e),
-                            };
-
-                            let mut key_block = self.current_key_block.lock();
-                            match key_block.add_entry(&key_with_metadata, Complete) {
-                                | Ok(_) => {},
-                                | Err(rbe) => match rbe {
-                                    | BlockError::TooLargeForBlock => {
-                                        drop(key_block);
-                                        // Key split - we already have value location in metadata, so ignore return value
-                                        match self.split_across_blocks(&key_with_metadata, &Key) {
-                                            | Ok(_) => {},
-                                            | Err(e) => return Err(e),
-                                        }
-                                    },
-                                    | BlockError::CorruptedBlock | BlockError::BlockFull => {
-                                        unreachable!("unexpected key block error, no idea how we got here")
-                                    },
-                                },
-                            }
-                        },
-                    }
-                },
-            }
-        }
+        // Write key with embedded value location metadata
+        // Note: We ignore the return value since we already have the value location
+        self.add_entry_with_retry(&key_with_metadata, &Key)?;
 
         self.key_index.lock().insert_item(key);
 
@@ -447,6 +367,80 @@ impl Segment {
     }
 
     /// Flush any pending blocks
+    /// Helper method to add an entry to a block with retry logic.
+    /// Returns (block_num, entry_index) for where the entry was placed.
+    ///
+    /// This handles the common pattern of:
+    /// 1. Try adding to current block
+    /// 2. If too large -> split across blocks
+    /// 3. If block full -> flush block and retry
+    fn add_entry_with_retry(
+        &self,
+        data: &[u8],
+        block_type: &BlockType,
+    ) -> Result<(u64, u16), SegmentError> {
+        use crate::errs::BlockError;
+
+        let (block_mutex, block_counter) = match block_type {
+            Key => (&self.current_key_block, None),
+            Value => (&self.current_val_block, Some(&self.val_block_count)),
+        };
+
+        let mut block = block_mutex.lock();
+
+        match block.add_entry(data, Complete) {
+            Ok(()) => {
+                // Entry added successfully to current block
+                let block_num = match block_counter {
+                    Some(counter) => counter.load(Relaxed),
+                    None => 0, // For key blocks, we don't use block_num in the same way
+                };
+                let entry_idx = (block.num_entries() - 1) as u16;
+                drop(block);
+                Ok((block_num, entry_idx))
+            },
+            Err(be) => {
+                drop(block);
+
+                match be {
+                    BlockError::TooLargeForBlock => {
+                        // Entry is too large for a single block, split it
+                        self.split_across_blocks(data, block_type)
+                    },
+                    BlockError::CorruptedBlock => {
+                        unreachable!("unexpected corrupted block error during write")
+                    },
+                    BlockError::BlockFull => {
+                        // Flush current block and retry
+                        self.write_block(block_type)?;
+
+                        let mut block = block_mutex.lock();
+                        match block.add_entry(data, Complete) {
+                            Ok(_) => {
+                                // Entry added successfully to new block
+                                let block_num = match block_counter {
+                                    Some(counter) => counter.load(Relaxed),
+                                    None => 0,
+                                };
+                                let entry_idx = (block.num_entries() - 1) as u16;
+                                Ok((block_num, entry_idx))
+                            },
+                            Err(rbe) => match rbe {
+                                BlockError::TooLargeForBlock => {
+                                    drop(block);
+                                    self.split_across_blocks(data, block_type)
+                                },
+                                BlockError::CorruptedBlock | BlockError::BlockFull => {
+                                    unreachable!("unexpected block error after flush")
+                                },
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    }
+
     pub fn flush(&self) -> Result<(), SegmentError> {
         if self.key_writer.lock().is_none() {
             return Err(ReadOnly);

@@ -257,57 +257,11 @@ impl<'a> SegmentScanIterator<'a> {
         }
     }
 
-    /// Reads a multi-block key.
-    /// This is a simplified implementation and should be expanded for real use.
+    /// Reads a multi-block key using the shared reader helper.
     fn read_full_key(&self, flag: EntryFlag, initial_data: &[u8]) -> Result<Bytes, SegmentError> {
-        // For complete entries, just copy the data
-        if flag == EntryFlag::Complete {
-            return Ok(Bytes::copy_from_slice(initial_data));
-        }
-
-        // For multi-block keys (Start flag), we need to read subsequent blocks
-        let mut buffer = BytesMut::with_capacity(initial_data.len() * 2);
-        buffer.extend_from_slice(initial_data);
-
-        let mut current_block_index = self.current_block_index - 1; // We're already past this block
-        let mut found_end = false;
-
-        while current_block_index < self.reader.visible_key_blocks && !found_end {
-            let next_block = match self.reader.read_key_block(current_block_index) {
-                | Ok(v) => v,
-                | Err(e) => return Err(e),
-            };
-
-            if next_block.num_entries() == 0 {
-                current_block_index += 1;
-                continue;
-            }
-
-            let (next_flag, next_data) = match next_block.get(0) {
-                | Some(v) => v,
-                | None => return Err(SegmentError::CorruptedBlock),
-            };
-
-            match next_flag {
-                | EntryFlag::Middle => {
-                    buffer.extend_from_slice(next_data);
-                    current_block_index += 1;
-                },
-                | EntryFlag::End => {
-                    buffer.extend_from_slice(next_data);
-                    found_end = true;
-                },
-                | _ => {
-                    return Err(SegmentError::CorruptedBlock);
-                },
-            }
-        }
-
-        if !found_end {
-            return Err(SegmentError::CorruptedBlock);
-        }
-
-        Ok(buffer.freeze())
+        // Delegate to the reader's shared multi-block entry handler
+        // Note: We use current_block_index - 1 because we've already advanced past the initial block
+        self.reader.read_multiblock_entry(flag, initial_data, self.current_block_index - 1)
     }
 
     /// Checks if a key is within the scan range.

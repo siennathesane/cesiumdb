@@ -13,7 +13,10 @@ use crate::{
             InvalidSize,
         },
     },
-    index::Index,
+    index::{
+        Index,
+        MIN_INDEX_SIZE,
+    },
     map::Map,
     segment::{
         BlockType::Value,
@@ -164,7 +167,7 @@ impl SegmentBuilder {
             let key_index_payload =
                 key_mmap[index_start as usize..(index_start + index_size) as usize].as_ref();
 
-            if key_index_payload.len() < 56 {
+            if key_index_payload.len() < MIN_INDEX_SIZE {
                 return Err(SegmentError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Index data too small: {}", key_index_payload.len()),
