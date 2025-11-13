@@ -67,6 +67,7 @@ pub mod errs;
 mod hash;
 pub mod hlc;
 mod index;
+pub mod io;
 pub mod keypair;
 pub mod levels;
 mod manifest;

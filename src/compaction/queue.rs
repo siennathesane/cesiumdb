@@ -374,27 +374,26 @@ mod tests {
             }));
         }
 
-        // Spawn consumer threads
+        // Wait for producers to finish first
+        for p in producers {
+            p.join().unwrap();
+        }
+
+        // Now spawn consumer threads
         let mut consumers = vec![];
         for _ in 0..4 {
             let q = queue.clone();
             consumers.push(thread::spawn(move || {
                 let mut count = 0;
-                for _ in 0..100 {
-                    if let Some(_job) = q.dequeue() {
-                        q.mark_completed();
-                        count += 1;
-                    }
+                while let Some(_job) = q.dequeue() {
+                    q.mark_completed();
+                    count += 1;
                 }
                 count
             }));
         }
 
-        // Wait for all threads
-        for p in producers {
-            p.join().unwrap();
-        }
-
+        // Wait for consumers
         let mut total_consumed = 0;
         for c in consumers {
             total_consumed += c.join().unwrap();

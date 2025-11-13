@@ -406,6 +406,16 @@ impl SegmentReader {
         (self.visible_key_blocks, self.visible_val_blocks)
     }
 
+    /// Returns a reference to the key map handle
+    pub(crate) fn key_handle(&self) -> &Arc<Map> {
+        &self.key_handle
+    }
+
+    /// Returns a reference to the value map handle
+    pub(crate) fn val_handle(&self) -> &Arc<Map> {
+        &self.val_handle
+    }
+
     #[instrument(level = "trace")]
     pub(crate) fn iter<'a>(&'a mut self) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator::new(self)
