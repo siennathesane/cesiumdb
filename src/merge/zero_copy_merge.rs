@@ -4,6 +4,7 @@
 //! multiple sorted iterators without copying data unnecessarily.
 
 use crate::keypair::{KeyBytes, ValueBytes};
+use crate::simd::simd_compare_keys;
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -43,7 +44,8 @@ impl PartialOrd for HeapEntry {
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap behavior
-        other.entry.key.cmp(&self.entry.key)
+        // Use SIMD-optimized comparison for better performance
+        other.entry.key.simd_cmp(&self.entry.key)
             .then_with(|| {
                 // For equal keys, prefer newer (higher source index = newer level)
                 other.entry.source_index.cmp(&self.entry.source_index)
@@ -407,8 +409,8 @@ mod tests {
 
         for i in 0..10 {
             let source = vec![
-                Ok((make_key(0, format!("key{}", i * 2).as_bytes(), 100), make_value(0, b"value"))),
-                Ok((make_key(0, format!("key{}", i * 2 + 1).as_bytes(), 100), make_value(0, b"value"))),
+                Ok((make_key(0, format!("key{:02}", i * 2).as_bytes(), 100), make_value(0, b"value"))),
+                Ok((make_key(0, format!("key{:02}", i * 2 + 1).as_bytes(), 100), make_value(0, b"value"))),
             ];
             sources.push(source.into_iter());
         }

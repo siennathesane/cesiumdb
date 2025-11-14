@@ -80,6 +80,7 @@ mod segment_builder;
 mod segment_iterator;
 pub mod segment_reader;
 pub mod segment_writer;
+pub mod simd;
 pub(crate) mod state;
 mod stats;
 pub mod utils;

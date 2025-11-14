@@ -184,6 +184,61 @@ impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
     }
 }
 
+impl Key<Bytes> {
+    /// SIMD-optimized comparison for merge operations
+    ///
+    /// Uses SIMD instructions to accelerate key comparison when available.
+    /// Falls back to standard comparison for small keys.
+    #[inline]
+    pub fn simd_cmp(&self, other: &Self) -> Ordering {
+        // Must match the standard Ord implementation exactly
+        // Standard: (self.ns, self.key.as_ref(), Reverse(self.ts))
+        self.ns.cmp(&other.ns)
+            .then_with(|| {
+                // Use SIMD for key bytes comparison
+                crate::simd::simd_compare_keys(self.key.as_ref(), other.key.as_ref())
+            })
+            .then_with(|| {
+                // Reverse comparison for timestamp (like Reverse(self.ts))
+                other.ts.cmp(&self.ts)
+            })
+    }
+}
+
+#[cfg(test)]
+mod simd_tests {
+    use super::*;
+
+    #[test]
+    fn test_simd_cmp_matches_ord() {
+        use rand::Rng;
+        let mut rng = rand::rng();
+
+        for _ in 0..100 {
+            let ns1 = rng.random();
+            let ns2 = rng.random();
+            let ts1 = rng.random();
+            let ts2 = rng.random();
+
+            let len = rng.random_range(1..64);
+            let mut key1_bytes = vec![0u8; len];
+            let mut key2_bytes = vec![0u8; len];
+            rng.fill(&mut key1_bytes[..]);
+            rng.fill(&mut key2_bytes[..]);
+
+            let key1 = KeyBytes::new(ns1, Bytes::from(key1_bytes), ts1);
+            let key2 = KeyBytes::new(ns2, Bytes::from(key2_bytes), ts2);
+
+            let simd_result = key1.simd_cmp(&key2);
+            let ord_result = key1.cmp(&key2);
+
+            assert_eq!(simd_result, ord_result,
+                "SIMD and Ord mismatch for ns1={}, ns2={}, ts1={}, ts2={}",
+                ns1, ns2, ts1, ts2);
+        }
+    }
+}
+
 impl From<Bytes> for Key<Bytes> {
     fn from(val: Bytes) -> Self {
         let mut ns_arr = [0u8; 8];
