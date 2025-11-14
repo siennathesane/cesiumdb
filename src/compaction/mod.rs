@@ -7,6 +7,7 @@
 //! - Background thread coordination
 //! - Lock-free job queue
 //! - Adaptive resource management
+//! - Workload-aware strategy selection
 
 pub mod job;
 pub mod scheduler;
@@ -14,6 +15,8 @@ pub mod executor;
 pub mod queue;
 pub mod registry;
 pub mod adaptive;
+pub mod workload;
+pub mod adaptor;
 
 pub use job::{CompactionJob, CompactionJobType};
 pub use scheduler::CompactionScheduler;
@@ -21,3 +24,5 @@ pub use executor::CompactionExecutor;
 pub use queue::{CompactionQueue, JobPriority, QueueStats};
 pub use registry::{SegmentRegistry, RegistryStats};
 pub use adaptive::{AdaptiveExecutor, ResourceLimits, ResourceUsage};
+pub use workload::{WorkloadStats, WorkloadPattern, WorkloadAnalysis};
+pub use adaptor::{WorkloadAdaptor, AdaptationPolicy, StrategyRecommendation};
