@@ -519,12 +519,12 @@ mod tests {
     }
 
     #[test]
-    fn test_bytes_mut_as_mut() {
+    fn test_bytes_mut_buf_mut() {
         let pool = BufferPool::new();
         let mut buffer = pool.get();
 
-        // Test mutable access via as_mut()
-        buffer.as_mut().extend_from_slice(b"data");
+        // Test mutable access via buf_mut()
+        buffer.buf_mut().extend_from_slice(b"data");
         assert_eq!(buffer.len(), 4);
     }
 }
