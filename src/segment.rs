@@ -1171,4 +1171,481 @@ mod tests {
             final_key_blocks
         );
     }
+
+    #[test]
+    fn test_segment_is_read_only_new_segment() {
+        let (segment, _dir) = create_test_segment();
+
+        // A newly created segment should NOT be read-only
+        assert!(
+            !segment.is_read_only(),
+            "New segment should not be read-only"
+        );
+    }
+
+    #[test]
+    fn test_segment_close_makes_read_only() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write some data
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0, b'1', b'2', b'3'];
+        segment.write(&key, &val).expect("failed to write");
+
+        // Close the segment
+        segment.close().expect("failed to close segment");
+
+        // Now segment should be read-only
+        assert!(
+            segment.is_read_only(),
+            "Segment should be read-only after close"
+        );
+    }
+
+    #[test]
+    fn test_segment_write_to_read_only_fails() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write and close
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0, b'1', b'2', b'3'];
+        segment.write(&key, &val).expect("failed to write");
+        segment.close().expect("failed to close");
+
+        // Attempt to write should fail
+        let result = segment.write(&key, &val);
+        assert!(result.is_err(), "Writing to read-only segment should fail");
+        assert!(
+            matches!(result.err().unwrap(), ReadOnly),
+            "Expected ReadOnly error"
+        );
+    }
+
+    #[test]
+    fn test_segment_flush_read_only_fails() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write, close
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0, b'1', b'2', b'3'];
+        segment.write(&key, &val).expect("failed to write");
+        segment.close().expect("failed to close");
+
+        // Flush on read-only should fail
+        let result = segment.flush();
+        assert!(result.is_err(), "Flush on read-only segment should fail");
+        assert!(
+            matches!(result.err().unwrap(), ReadOnly),
+            "Expected ReadOnly error"
+        );
+    }
+
+    #[test]
+    fn test_segment_close_twice() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write some data
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0, b'1', b'2', b'3'];
+        segment.write(&key, &val).expect("failed to write");
+
+        // Close first time
+        segment.close().expect("failed to close");
+
+        // Close second time should fail
+        let result = segment.close();
+        assert!(result.is_err(), "Second close should fail");
+        assert!(
+            matches!(result.err().unwrap(), ReadOnly),
+            "Expected ReadOnly error"
+        );
+    }
+
+    #[test]
+    fn test_segment_id() {
+        let (segment, _dir) = create_test_segment();
+
+        // The test helper creates segment with key_id=1
+        assert_eq!(segment.id(), 1, "Segment ID should be 1");
+    }
+
+    #[test]
+    fn test_segment_new_reader_before_close() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment_ref = Arc::get_mut(&mut segment).unwrap();
+
+        // Write some data
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b't', b'e', b's', b't'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0, b'v', b'a', b'l'];
+        segment_ref.write(&key, &val).expect("failed to write");
+        segment_ref.flush().expect("failed to flush");
+
+        // Get reader before closing
+        let reader = segment_ref.new_reader();
+        assert!(reader.is_ok(), "Should be able to create reader before close");
+    }
+
+    #[test]
+    fn test_metadata_serialization() {
+        let metadata = Metadata::new(12345, 100, 4096, 8192);
+
+        // Convert to bytes
+        let bytes: Bytes = metadata.into();
+        assert_eq!(bytes.len(), 32, "Metadata should be 32 bytes");
+
+        // Convert back
+        let restored = Metadata::from(bytes);
+        assert_eq!(restored.id(), 12345);
+        assert_eq!(restored.block_count(), 100);
+        assert_eq!(restored.index_size(), 4096);
+        assert_eq!(restored.index_start(), 8192);
+    }
+
+    #[test]
+    fn test_metadata_serialized_size() {
+        let metadata = Metadata::new(1, 2, 3, 4);
+        assert_eq!(
+            metadata.serialized_size(),
+            32,
+            "Metadata should always serialize to 32 bytes"
+        );
+    }
+
+    #[test]
+    fn test_metadata_finalize_unsafe() {
+        let metadata = Metadata::new(0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x87654321);
+
+        // Allocate aligned buffer
+        let mut buffer = vec![0u8; 32];
+
+        // SAFETY: buffer is properly sized and aligned for this test
+        unsafe {
+            metadata.finalize(buffer.as_mut_ptr());
+        }
+
+        // Verify the data was written correctly
+        let id = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+        let block_count = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
+        let index_size = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
+        let index_start = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+
+        assert_eq!(id, 0xDEADBEEF);
+        assert_eq!(block_count, 0xCAFEBABE);
+        assert_eq!(index_size, 0x12345678);
+        assert_eq!(index_start, 0x87654321);
+    }
+
+    #[test]
+    fn test_block_type_display() {
+        assert_eq!(format!("{}", Key), "key");
+        assert_eq!(format!("{}", Value), "value");
+    }
+
+    #[test]
+    fn test_segment_empty_write() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write entry with empty value (but still need namespace)
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b'k', b'e', b'y'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0]; // just namespace, no actual value
+
+        let result = segment.write(&key, &val);
+        assert!(result.is_ok(), "Should be able to write entry with empty value");
+    }
+
+    #[test]
+    fn test_segment_flush_empty() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Flush without writing anything should succeed
+        let result = segment.flush();
+        assert!(result.is_ok(), "Flushing empty segment should succeed");
+    }
+
+    #[test]
+    fn test_segment_multiple_flushes() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write and flush multiple times
+        for i in 0..5 {
+            let mut key = vec![0u8; 8];
+            key.extend_from_slice(&(i as u32).to_le_bytes());
+
+            let mut val = vec![0u8; 8];
+            val.extend_from_slice(b"value");
+
+            segment.write(&key, &val).expect("failed to write");
+            segment.flush().expect("failed to flush");
+        }
+
+        // Should have written blocks
+        assert!(
+            segment.key_index.lock().block_count() >= 5,
+            "Should have created multiple key blocks"
+        );
+    }
+
+    #[test]
+    fn test_segment_boundary_entry_size() {
+        use crate::block::MAX_ENTRY_SIZE;
+
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Create entry just at the boundary of max size
+        let key = vec![0u8; 8 + 10]; // namespace + small key
+
+        // Create value that's close to but not exceeding MAX_ENTRY_SIZE
+        let val_size = MAX_ENTRY_SIZE - 20; // Leave some room for overhead
+        let mut val = vec![0u8; 8]; // namespace
+        val.extend(vec![b'x'; val_size]);
+
+        let result = segment.write(&key, &val);
+        assert!(result.is_ok(), "Should be able to write entry near max size");
+    }
+
+    #[test]
+    fn test_segment_very_large_entry_multiblock() {
+        use crate::block::MAX_ENTRY_SIZE;
+
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Create entry that must span multiple blocks
+        let key = vec![0u8; 8 + 10];
+
+        // Create value much larger than MAX_ENTRY_SIZE
+        let mut val = vec![0u8; 8];
+        val.extend(vec![b'y'; MAX_ENTRY_SIZE * 3]);
+
+        let result = segment.write(&key, &val);
+        assert!(result.is_ok(), "Should be able to write multi-block entry");
+
+        segment.flush().expect("failed to flush");
+
+        // Value should span multiple blocks
+        let val_block_count = segment.val_block_count.load(Relaxed);
+        assert!(val_block_count >= 3, "Value should span at least 3 blocks");
+    }
+
+    #[test]
+    fn test_segment_concurrent_readers() {
+        let (segment, _dir) = create_test_segment();
+
+        // Create multiple readers
+        let reader1 = segment.new_reader();
+        let reader2 = segment.new_reader();
+        let reader3 = segment.new_reader();
+
+        assert!(reader1.is_ok(), "First reader should be created");
+        assert!(reader2.is_ok(), "Second reader should be created");
+        assert!(reader3.is_ok(), "Third reader should be created");
+    }
+
+    #[test]
+    fn test_segment_write_read_verify() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write multiple entries
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..10)
+            .map(|i| {
+                let mut key = vec![0u8; 8];
+                key.extend(format!("key_{:03}", i).as_bytes());
+                let mut val = vec![0u8; 8];
+                val.extend(format!("value_{:03}", i).as_bytes());
+                (key, val)
+            })
+            .collect();
+
+        for (key, val) in &entries {
+            segment.write(key, val).expect("failed to write");
+        }
+        segment.flush().expect("failed to flush");
+
+        // Get reader and verify entries
+        let reader = segment.new_reader().expect("failed to create reader");
+
+        for (key, expected_val) in &entries {
+            // Strip the value location metadata when looking up
+            let result = reader.get(key);
+            assert!(result.is_ok(), "Get should not error");
+            let found = result.unwrap();
+            assert!(found.is_some(), "Key should be found: {:?}", key);
+            assert_eq!(found.unwrap().as_ref(), expected_val.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_segment_namespace_changes() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        // Write entries with different namespaces
+        let namespaces: Vec<u64> = vec![0, 1, 2, 0, 3, 1, 4, 2];
+
+        for (i, &ns) in namespaces.iter().enumerate() {
+            let mut key = ns.to_le_bytes().to_vec();
+            key.extend(format!("key_{}", i).as_bytes());
+
+            let mut val = ns.to_le_bytes().to_vec();
+            val.extend(format!("val_{}", i).as_bytes());
+
+            segment.write(&key, &val).expect("failed to write");
+        }
+
+        // Check that namespace changes were tracked
+        let ns_count = segment.key_index.lock().ns_offset_count();
+        // Should track unique namespaces: 0, 1, 2, 3, 4 = 5 unique
+        // Plus initial default namespace insertion = at least 5
+        assert!(ns_count >= 5, "Should track at least 5 namespace offsets, got {}", ns_count);
+    }
+
+    #[test]
+    fn test_segment_val_block_count_tracking() {
+        let (mut segment, _dir) = create_test_segment();
+        let segment = Arc::get_mut(&mut segment).unwrap();
+
+        let initial_count = segment.val_block_count.load(Relaxed);
+        assert_eq!(initial_count, 0, "Initial val_block_count should be 0");
+
+        // Write enough data to create value blocks
+        for i in 0..100 {
+            let mut key = vec![0u8; 8];
+            key.extend(&(i as u32).to_le_bytes());
+
+            let mut val = vec![0u8; 8];
+            val.extend(vec![b'v'; 100]); // 100 bytes of value data
+
+            segment.write(&key, &val).expect("failed to write");
+        }
+
+        segment.flush().expect("failed to flush");
+
+        let final_count = segment.val_block_count.load(Relaxed);
+        assert!(final_count > 0, "val_block_count should have increased");
+    }
+
+    #[test]
+    fn test_segment_open_creates_read_only_segment() {
+        use crate::index::Index;
+
+        let dir = tempdir().expect("failed to create temp dir");
+
+        // Create key and value maps
+        let key_path = dir.path().join("test-key-segment");
+        let key_map = Arc::new(Map::new(key_path, 4096 * 10).expect("failed to create key map"));
+
+        let val_path = dir.path().join("test-val-segment");
+        let val_map = Arc::new(Map::new(val_path, 4096 * 10).expect("failed to create val map"));
+
+        let seed = 42i64;
+        let key_index = Index::new(1, seed);
+
+        // Open segment (creates read-only segment)
+        let segment = Segment::open(key_map, key_index, 1, val_map, 2);
+        assert!(segment.is_ok(), "Should be able to open segment");
+
+        let segment = segment.unwrap();
+        assert!(segment.is_read_only(), "Opened segment should be read-only");
+    }
+
+    #[test]
+    fn test_segment_open_write_fails() {
+        use crate::index::Index;
+
+        let dir = tempdir().expect("failed to create temp dir");
+
+        let key_path = dir.path().join("test-key-segment");
+        let key_map = Arc::new(Map::new(key_path, 4096 * 10).expect("failed to create key map"));
+
+        let val_path = dir.path().join("test-val-segment");
+        let val_map = Arc::new(Map::new(val_path, 4096 * 10).expect("failed to create val map"));
+
+        let seed = 42i64;
+        let key_index = Index::new(1, seed);
+
+        let segment = Segment::open(key_map, key_index, 1, val_map, 2).unwrap();
+
+        // Try to write to opened (read-only) segment
+        let key = [0u8, 0, 0, 0, 0, 0, 0, 0, b'k', b'e', b'y'];
+        let val = [0u8, 0, 0, 0, 0, 0, 0, 0, b'v', b'a', b'l'];
+
+        // We need Arc::get_mut but segment is already Arc, so we need to unwrap
+        // Since Segment::open returns Arc<Segment>, we can use the reference directly
+        // But write takes &self, so this should work
+        let result = segment.write(&key, &val);
+        assert!(result.is_err(), "Writing to opened segment should fail");
+        assert!(matches!(result.err().unwrap(), ReadOnly));
+    }
+
+    #[test]
+    fn test_segment_size_in_bytes_new_segment() {
+        let (segment, _dir) = create_test_segment();
+
+        // New segment with writers won't have handles set, so size is 0
+        let size = segment.size_in_bytes();
+        assert_eq!(size, 0, "New segment should report 0 size (no handles yet)");
+    }
+
+    #[test]
+    fn test_segment_size_in_bytes_opened_segment() {
+        use crate::index::Index;
+
+        let dir = tempdir().expect("failed to create temp dir");
+
+        let key_path = dir.path().join("test-key-segment");
+        let key_map = Arc::new(Map::new(key_path, 4096 * 5).expect("failed to create key map"));
+
+        let val_path = dir.path().join("test-val-segment");
+        let val_map = Arc::new(Map::new(val_path, 4096 * 3).expect("failed to create val map"));
+
+        let seed = 42i64;
+        let key_index = Index::new(1, seed);
+
+        let segment = Segment::open(key_map, key_index, 1, val_map, 2).unwrap();
+
+        // Opened segment should report size from handles
+        let size = segment.size_in_bytes();
+        assert_eq!(size, 4096 * 5 + 4096 * 3, "Opened segment should report map sizes");
+    }
+
+    #[test]
+    fn test_segment_reader_method_on_opened_segment() {
+        use crate::index::Index;
+        use crate::block::Block;
+
+        let dir = tempdir().expect("failed to create temp dir");
+
+        let key_path = dir.path().join("test-key-segment");
+        let key_map = Arc::new(Map::new(key_path, 4096 * 5).expect("failed to create key map"));
+
+        let val_path = dir.path().join("test-val-segment");
+        let val_map = Arc::new(Map::new(val_path, 4096 * 5).expect("failed to create val map"));
+
+        let seed = 42i64;
+        let key_index = Index::new(1, seed);
+
+        let segment = Segment::open(key_map, key_index, 1, val_map, 2).unwrap();
+
+        // reader() method should work on read-only segment
+        let reader = segment.reader();
+        assert!(reader.is_ok(), "reader() should succeed on read-only segment");
+    }
+
+    #[test]
+    fn test_segment_reader_method_on_new_segment_fails() {
+        let (segment, _dir) = create_test_segment();
+
+        // reader() method should fail on writable segment
+        let reader = segment.reader();
+        assert!(reader.is_err(), "reader() should fail on writable segment");
+    }
 }

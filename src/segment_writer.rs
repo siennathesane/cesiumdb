@@ -776,4 +776,265 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_block_count_tracking() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Initial block count should be 0
+        assert_eq!(writer.block_count(), 0, "Initial block count should be 0");
+
+        // Write blocks and verify count increases
+        for expected_count in 1..=5 {
+            let mut block = Block::new();
+            block
+                .add_complete_entry(b"test data")
+                .expect("failed to add entry");
+            writer.write_block(block).expect("failed to write block");
+
+            assert_eq!(
+                writer.block_count(),
+                expected_count,
+                "Block count should be {}",
+                expected_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_begin_close_prevents_writes() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Write one block first
+        let mut block = Block::new();
+        block
+            .add_complete_entry(b"first block")
+            .expect("failed to add entry");
+        writer.write_block(block).expect("failed to write block");
+
+        // Begin close
+        writer.begin_close();
+
+        // Attempt to write another block should fail
+        let mut block2 = Block::new();
+        block2
+            .add_complete_entry(b"second block")
+            .expect("failed to add entry");
+        let result = writer.write_block(block2);
+
+        assert!(result.is_err(), "Writing after begin_close should fail");
+        assert!(
+            matches!(result.err().unwrap(), Closing),
+            "Expected Closing error"
+        );
+    }
+
+    #[test]
+    fn test_write_blocks_after_begin_close_fails() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Begin close
+        writer.begin_close();
+
+        // Attempt to write blocks should fail
+        let mut block = Block::new();
+        block
+            .add_complete_entry(b"test")
+            .expect("failed to add entry");
+        let result = writer.write_blocks(&[block]);
+
+        assert!(result.is_err(), "Writing blocks after begin_close should fail");
+        assert!(
+            matches!(result.err().unwrap(), Closing),
+            "Expected Closing error"
+        );
+    }
+
+    #[test]
+    fn test_write_metadata_requires_closing() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        use crate::segment::Metadata;
+
+        // Attempt to write metadata without calling begin_close
+        let metadata = Metadata::new(1, 0, 0, 0);
+        let result = writer.write_metadata(metadata);
+
+        assert!(
+            result.is_err(),
+            "write_metadata without begin_close should fail"
+        );
+        assert!(
+            matches!(result.err().unwrap(), NotClosing),
+            "Expected NotClosing error"
+        );
+    }
+
+    #[test]
+    fn test_write_metadata_after_begin_close() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        use crate::segment::Metadata;
+
+        // Begin close first
+        writer.begin_close();
+
+        // Now write metadata should succeed
+        let metadata = Metadata::new(12345, 10, 4096, 8192);
+        let result = writer.write_metadata(metadata);
+
+        assert!(result.is_ok(), "write_metadata after begin_close should succeed");
+    }
+
+    #[test]
+    fn test_write_index_calls_begin_close() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        use crate::index::Index;
+
+        // Write a block first
+        let mut block = Block::new();
+        block
+            .add_complete_entry(b"test data")
+            .expect("failed to add entry");
+        writer.write_block(block).expect("failed to write block");
+
+        // Create an index with some data
+        let mut index = Index::new(1, 42);
+        index.insert_item(b"test_key_1");
+        index.insert_item(b"test_key_2");
+        index.inc_block_count(1);
+
+        // Write index (this should call begin_close internally)
+        let result = writer.write_index(&index);
+        assert!(result.is_ok(), "write_index should succeed");
+
+        // Subsequent writes should fail because begin_close was called
+        let mut block2 = Block::new();
+        block2
+            .add_complete_entry(b"another block")
+            .expect("failed to add entry");
+        let write_result = writer.write_block(block2);
+        assert!(write_result.is_err(), "Write after write_index should fail");
+    }
+
+    #[test]
+    fn test_close_idempotent() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Close multiple times should be ok
+        assert!(writer.close().is_ok(), "First close should succeed");
+        assert!(writer.close().is_ok(), "Second close should also succeed");
+        assert!(writer.close().is_ok(), "Third close should also succeed");
+    }
+
+    #[test]
+    fn test_current_offset_tracking() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Initial offset should be 0
+        assert_eq!(writer.current_offset(), 0, "Initial offset should be 0");
+
+        // Write blocks and verify offset increases
+        for i in 1..=3 {
+            let mut block = Block::new();
+            block
+                .add_complete_entry(b"test data")
+                .expect("failed to add entry");
+            writer.write_block(block).expect("failed to write block");
+
+            assert_eq!(
+                writer.current_offset(),
+                BLOCK_SIZE * i,
+                "Offset should be {} after {} blocks",
+                BLOCK_SIZE * i,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_segment_writer_debug() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Debug formatting should work
+        let debug_str = format!("{:?}", writer);
+        assert!(
+            debug_str.contains("SegmentWriter"),
+            "Debug output should contain SegmentWriter"
+        );
+        assert!(
+            debug_str.contains("current_offset"),
+            "Debug output should contain current_offset"
+        );
+        assert!(
+            debug_str.contains("block_count"),
+            "Debug output should contain block_count"
+        );
+    }
+
+    #[test]
+    fn test_write_index_returns_correct_offset() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        use crate::index::Index;
+
+        // Write 3 blocks first
+        for _ in 0..3 {
+            let mut block = Block::new();
+            block
+                .add_complete_entry(b"test data")
+                .expect("failed to add entry");
+            writer.write_block(block).expect("failed to write block");
+        }
+
+        let offset_before_index = writer.current_offset();
+        assert_eq!(
+            offset_before_index,
+            BLOCK_SIZE * 3,
+            "Offset should be 3 blocks"
+        );
+
+        // Create and write index
+        let mut index = Index::new(1, 42);
+        index.insert_item(b"key1");
+        index.insert_item(b"key2");
+        index.inc_block_count(3);
+
+        let index_start = writer.write_index(&index).expect("failed to write index");
+
+        // The index should start right after the blocks
+        assert_eq!(
+            index_start as usize, offset_before_index,
+            "Index should start at the offset after blocks"
+        );
+    }
+
+    #[test]
+    fn test_calculate_new_size_minimum() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let file_path = dir.path().join("small-map");
+        // Create a very small map
+        let map = Arc::new(Map::new(file_path, 1024).expect("failed to create map"));
+        let writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Calculate new size for a requirement larger than current
+        let new_size = writer.calculate_new_size(BLOCK_SIZE * 2);
+
+        // Should be at least the required size
+        assert!(
+            new_size >= BLOCK_SIZE as u64 * 2,
+            "New size should be at least the required size"
+        );
+    }
 }
