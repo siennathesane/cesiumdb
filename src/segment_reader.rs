@@ -1238,4 +1238,352 @@ mod tests {
         assert!(result3.is_some());
         assert_eq!(result3.unwrap().as_ref(), val3);
     }
+
+    #[test]
+    fn test_read_value_block_direct() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        // Create value blocks with test data
+        let mut val_block0 = Block::new();
+        val_block0
+            .add_entry(b"value_data_0", EntryFlag::Complete)
+            .unwrap();
+
+        let mut val_block1 = Block::new();
+        val_block1
+            .add_entry(b"value_data_1", EntryFlag::Complete)
+            .unwrap();
+
+        // Write value blocks to map
+        write_block_to_mapfor_get(&val_map, 0, &val_block0);
+        write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block1);
+
+        // Create reader
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Read value from block 0, entry 0
+        let result0 = reader.read_value(0, 0);
+        assert!(result0.is_ok(), "Should read value from block 0");
+        assert_eq!(result0.unwrap().as_ref(), b"value_data_0");
+
+        // Read value from block 1, entry 0
+        let result1 = reader.read_value(1, 0);
+        assert!(result1.is_ok(), "Should read value from block 1");
+        assert_eq!(result1.unwrap().as_ref(), b"value_data_1");
+    }
+
+    #[test]
+    fn test_read_value_out_of_bounds() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Try to read value beyond visible blocks
+        let result = reader.read_value(100, 0);
+        assert!(result.is_err(), "Should fail reading beyond visible blocks");
+        assert!(matches!(result.err().unwrap(), ReadOutOfBounds));
+    }
+
+    #[test]
+    fn test_read_value_entry_out_of_bounds() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        // Create value block with only one entry
+        let mut val_block = Block::new();
+        val_block
+            .add_entry(b"single_value", EntryFlag::Complete)
+            .unwrap();
+        write_block_to_mapfor_get(&val_map, 0, &val_block);
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Try to read entry index beyond block entries
+        let result = reader.read_value(0, 5);
+        assert!(result.is_err(), "Should fail reading entry beyond block entries");
+    }
+
+    #[test]
+    fn test_visible_blocks() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        let (visible_key, visible_val) = reader.visible_blocks();
+        // Based on the test setup, both should have blocks
+        assert!(visible_key > 0 || visible_val > 0 || reader.num_blocks() > 0,
+            "Reader should have some visibility info");
+    }
+
+    #[test]
+    fn test_num_blocks() {
+        let (dir, key_map) = prepare_blocks_map(5);
+        let (_, val_map) = prepare_blocks_map(5);
+
+        let key_index = Index::new(1, 1234);
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        assert_eq!(reader.num_blocks(), 5, "Should have 5 blocks");
+    }
+
+    #[test]
+    fn test_key_handle_and_val_handle() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Verify handles are accessible
+        assert_eq!(reader.key_handle().len(), key_map.len());
+        assert_eq!(reader.val_handle().len(), val_map.len());
+    }
+
+    #[test]
+    fn test_read_config_default() {
+        let config = ReadConfig::default();
+        assert_eq!(config.read_ahead, 4, "Default read_ahead should be 4");
+    }
+
+    #[test]
+    fn test_segment_reader_with_config() {
+        let size = BLOCK_SIZE * 4;
+        let (_dir, key_map) = create_test_map(size);
+        let (_dir2, val_map) = create_test_map(size);
+
+        let key_index = Index::new(1, 1234);
+
+        let config = ReadConfig { read_ahead: 8 };
+
+        let reader = SegmentReader::with_config(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+            config,
+        );
+
+        assert!(reader.is_ok(), "Should create reader with custom config");
+    }
+
+    #[test]
+    fn test_read_multiblock_entry_complete() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Test with a Complete flag
+        let data = b"test_complete_entry";
+        let result = reader.read_multiblock_entry(EntryFlag::Complete, data, 0);
+
+        assert!(result.is_ok(), "Should handle Complete flag");
+        assert_eq!(result.unwrap().as_ref(), data);
+    }
+
+    #[test]
+    fn test_read_multiblock_entry_invalid_middle() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Test with invalid Middle flag (should error)
+        let data = b"middle_data";
+        let result = reader.read_multiblock_entry(EntryFlag::Middle, data, 0);
+
+        assert!(result.is_err(), "Should error on Middle flag at start");
+        assert!(matches!(result.err().unwrap(), CorruptedBlock));
+    }
+
+    #[test]
+    fn test_read_multiblock_entry_invalid_end() {
+        let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Test with invalid End flag (should error)
+        let data = b"end_data";
+        let result = reader.read_multiblock_entry(EntryFlag::End, data, 0);
+
+        assert!(result.is_err(), "Should error on End flag at start");
+        assert!(matches!(result.err().unwrap(), CorruptedBlock));
+    }
+
+    #[test]
+    fn test_read_value_with_multiblock_entry() {
+        let dir = tempdir().unwrap();
+
+        // Create value map large enough for 3 blocks
+        let val_path = dir.path().join("val_segment");
+        let val_map = Arc::new(Map::new(val_path, BLOCK_SIZE as u64 * 3).unwrap());
+
+        // Create key map (minimal)
+        let key_path = dir.path().join("key_segment");
+        let key_map = Arc::new(Map::new(key_path, BLOCK_SIZE as u64 * 3).unwrap());
+
+        // Create multiblock value: Start -> End
+        let mut val_block0 = Block::new();
+        val_block0.add_entry(b"start_part_", EntryFlag::Start).unwrap();
+
+        let mut val_block1 = Block::new();
+        val_block1.add_entry(b"end_part", EntryFlag::End).unwrap();
+
+        // Write blocks
+        let range0 = 0..BLOCK_SIZE;
+        val_map.write_to_range(range0, |slice| unsafe {
+            val_block0.finalize(slice.as_mut_ptr());
+        }).unwrap();
+
+        let range1 = BLOCK_SIZE..(2 * BLOCK_SIZE);
+        val_map.write_to_range(range1, |slice| unsafe {
+            val_block1.finalize(slice.as_mut_ptr());
+        }).unwrap();
+
+        let key_index = Index::new(1, 1234);
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Read multiblock value
+        let result = reader.read_value(0, 0);
+        assert!(result.is_ok(), "Should read multiblock value");
+        assert_eq!(result.unwrap().as_ref(), b"start_part_end_part");
+    }
+
+    #[test]
+    fn test_read_value_with_start_middle_end() {
+        let dir = tempdir().unwrap();
+
+        // Create value map for 3 blocks
+        let val_path = dir.path().join("val_segment");
+        let val_map = Arc::new(Map::new(val_path, BLOCK_SIZE as u64 * 3).unwrap());
+
+        let key_path = dir.path().join("key_segment");
+        let key_map = Arc::new(Map::new(key_path, BLOCK_SIZE as u64 * 3).unwrap());
+
+        // Create Start -> Middle -> End
+        let mut val_block0 = Block::new();
+        val_block0.add_entry(b"start_", EntryFlag::Start).unwrap();
+
+        let mut val_block1 = Block::new();
+        val_block1.add_entry(b"middle_", EntryFlag::Middle).unwrap();
+
+        let mut val_block2 = Block::new();
+        val_block2.add_entry(b"end", EntryFlag::End).unwrap();
+
+        // Write blocks
+        val_map.write_to_range(0..BLOCK_SIZE, |slice| unsafe {
+            val_block0.finalize(slice.as_mut_ptr());
+        }).unwrap();
+
+        val_map.write_to_range(BLOCK_SIZE..(2 * BLOCK_SIZE), |slice| unsafe {
+            val_block1.finalize(slice.as_mut_ptr());
+        }).unwrap();
+
+        val_map.write_to_range((2 * BLOCK_SIZE)..(3 * BLOCK_SIZE), |slice| unsafe {
+            val_block2.finalize(slice.as_mut_ptr());
+        }).unwrap();
+
+        let key_index = Index::new(1, 1234);
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Read multiblock value with middle part
+        let result = reader.read_value(0, 0);
+        assert!(result.is_ok(), "Should read Start->Middle->End value");
+        assert_eq!(result.unwrap().as_ref(), b"start_middle_end");
+    }
+
+    #[test]
+    fn test_segment_reader_debug_format() {
+        let (dir, key_map) = prepare_blocks_map(2);
+        let (_, val_map) = prepare_blocks_map(2);
+
+        let key_index = Index::new(1, 1234);
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Test Debug formatting
+        let debug_str = format!("{:?}", reader);
+        assert!(debug_str.contains("SegmentReader"), "Debug should contain SegmentReader");
+    }
+
+    #[test]
+    fn test_scan_with_bounds() {
+        let (dir, key_map, val_map, mut key_index, val_index) = prepare_test_segment_for_get();
+
+        // Set up the index with some items
+        key_index.insert_item(b"key_a");
+        key_index.insert_item(b"key_b");
+        key_index.insert_item(b"key_c");
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::Mutex::new(key_index)),
+        )
+        .unwrap();
+
+        // Test creating scan iterator with bounds
+        let lower = Bound::Included(b"key_a".as_slice());
+        let upper = Bound::Excluded(b"key_z".as_slice());
+
+        // This should compile and not panic
+        let _iter = reader.scan(lower, upper);
+    }
 }
