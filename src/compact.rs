@@ -20,8 +20,8 @@ use crate::{
     memtable::Memtable,
     merge::MergeIterator,
     segment::{
-        Segment,
         DEFAULT_SEGMENT_SIZE,
+        Segment,
     },
     segment_builder::SegmentBuilder,
     utils::Serializer,
@@ -64,29 +64,47 @@ pub fn compact<I>(
     segment_id: u64,
 ) -> Result<Arc<Segment>, SegmentError>
 where
-    I: Iterator<Item = (KeyBytes, ValueBytes)>,
-{
+    I: Iterator<Item = (KeyBytes, ValueBytes)>, {
     // Ensure the output directory exists
     if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| SegmentError::IoError(e))?;
+        match fs::create_dir_all(parent).map_err(SegmentError::IoError) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        }
     }
-    fs::create_dir_all(&output_path).map_err(|e| SegmentError::IoError(e))?;
+    match fs::create_dir_all(&output_path).map_err(SegmentError::IoError) {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
 
     let merge_iter = MergeIterator::new(iterators);
-    let builder = SegmentBuilder::new(output_path)?;
+    let builder = match SegmentBuilder::new(output_path) {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
     let seed = random();
-    let segment = builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE)?;
+    let segment = match builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE) {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
 
     let mut entry_count = 0u64;
 
     // Unwrap the Arc to get mutable access
-    let segment_mut = Arc::try_unwrap(segment).map_err(|_| {
-        SegmentError::CantCreateWriter(crate::segment::BlockType::Key, segment_id)
-    })?;
+    let segment_mut = match Arc::try_unwrap(segment) {
+        | Ok(v) => v,
+        | Err(_) => {
+            return Err(SegmentError::CantCreateWriter(
+                crate::segment::BlockType::Key,
+                segment_id,
+            ));
+        },
+    };
 
     let seg = segment_mut;
 
-    // Track the last key (namespace + key bytes, without timestamp) to handle duplicates
+    // Track the last key (namespace + key bytes, without timestamp) to handle
+    // duplicates
     let mut last_key: Option<(u64, Bytes)> = None;
     let mut skip_until_new_key = false;
 
@@ -95,8 +113,8 @@ where
 
         // Check if this is a new logical key
         let is_new_key = match &last_key {
-            None => true,
-            Some(prev) => prev != &current_key,
+            | None => true,
+            | Some(prev) => prev != &current_key,
         };
 
         if is_new_key {
@@ -121,12 +139,18 @@ where
         // Serialize and write
         let key_bytes = key.serialize();
         let val_bytes = value.serialize();
-        seg.write(key_bytes.as_ref(), val_bytes.as_ref())?;
+        match seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
         entry_count += 1;
     }
 
     // Close the segment (writes index and metadata)
-    seg.close()?;
+    match seg.close() {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
 
     tracing::info!(
         segment_id = segment_id,
@@ -141,7 +165,8 @@ where
 ///
 /// Unlike `compact()`, this function preserves tombstones because:
 /// - Tombstones in the memtable may be deleting keys from older L0 segments
-/// - They should only be discarded during major compaction when all versions are merged
+/// - They should only be discarded during major compaction when all versions
+///   are merged
 ///
 /// # Arguments
 /// * `memtable` - The memtable to flush
@@ -166,20 +191,38 @@ pub fn flush_memtable(
 ) -> Result<Arc<Segment>, SegmentError> {
     // Ensure the output directory exists
     if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| SegmentError::IoError(e))?;
+        match fs::create_dir_all(parent).map_err(SegmentError::IoError) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        }
     }
-    fs::create_dir_all(&output_path).map_err(|e| SegmentError::IoError(e))?;
+    match fs::create_dir_all(&output_path).map_err(SegmentError::IoError) {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
 
-    let builder = SegmentBuilder::new(output_path)?;
+    let builder = match SegmentBuilder::new(output_path) {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
     let seed = random();
-    let segment = builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE)?;
+    let segment = match builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE) {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
 
     let mut entry_count = 0u64;
 
     // Unwrap the Arc to get mutable access
-    let segment_mut = Arc::try_unwrap(segment).map_err(|_| {
-        SegmentError::CantCreateWriter(crate::segment::BlockType::Key, segment_id)
-    })?;
+    let segment_mut = match Arc::try_unwrap(segment) {
+        | Ok(v) => v,
+        | Err(_) => {
+            return Err(SegmentError::CantCreateWriter(
+                crate::segment::BlockType::Key,
+                segment_id,
+            ));
+        },
+    };
 
     let seg = segment_mut;
 
@@ -188,19 +231,29 @@ pub fn flush_memtable(
     let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
 
     for (key, value) in iter {
-        eprintln!("flush: writing entry {}, tombstone={}", entry_count, value.is_tombstone());
+        eprintln!(
+            "flush: writing entry {}, tombstone={}",
+            entry_count,
+            value.is_tombstone()
+        );
         // NOTE: We do NOT filter tombstones here - they're needed to mask
         // older versions that may exist in L0 segments
         let key_bytes = key.serialize();
         let val_bytes = value.serialize();
 
         // Write to segment
-        seg.write(key_bytes.as_ref(), val_bytes.as_ref())?;
+        match seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
         entry_count += 1;
     }
 
     // Close the segment (writes index and metadata)
-    seg.close()?;
+    match seg.close() {
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
+    };
 
     tracing::info!(
         memtable_id = memtable.id(),
@@ -394,8 +447,9 @@ mod tests {
         let segment = flush_memtable(memtable.clone(), output_path, 1).unwrap();
 
         assert!(segment.is_read_only());
-        // The segment should contain the tombstone (we can't easily verify this here,
-        // but the compaction tests verify tombstone filtering works correctly)
+        // The segment should contain the tombstone (we can't easily verify this
+        // here, but the compaction tests verify tombstone filtering
+        // works correctly)
     }
 
     #[test]
@@ -582,12 +636,18 @@ mod tests {
         for result in reader.scan(Bound::Unbounded, Bound::Unbounded) {
             let (_key, value) = result.unwrap();
             // None of the values should be tombstones
-            assert!(!value.is_tombstone(), "Tombstones should be filtered during compaction");
+            assert!(
+                !value.is_tombstone(),
+                "Tombstones should be filtered during compaction"
+            );
             count += 1;
         }
 
         // We should only have key2 (key1's tombstone should have removed all versions)
-        assert_eq!(count, 1, "Should only have one non-tombstone entry after compaction");
+        assert_eq!(
+            count, 1,
+            "Should only have one non-tombstone entry after compaction"
+        );
     }
 
     #[test]
@@ -620,13 +680,20 @@ mod tests {
         let mut count = 0;
         for result in flush_reader.scan(Bound::Unbounded, Bound::Unbounded) {
             let (_key, value) = result.unwrap();
-            eprintln!("Scanned entry {}: tombstone={}", count, value.is_tombstone());
+            eprintln!(
+                "Scanned entry {}: tombstone={}",
+                count,
+                value.is_tombstone()
+            );
             if value.is_tombstone() {
                 found_tombstone = true;
             }
             count += 1;
         }
-        eprintln!("Total scanned: {}, found_tombstone={}", count, found_tombstone);
+        eprintln!(
+            "Total scanned: {}, found_tombstone={}",
+            count, found_tombstone
+        );
         assert!(found_tombstone, "Flush should preserve tombstones for L0");
 
         // Compact should filter tombstones
@@ -648,6 +715,9 @@ mod tests {
                 found_tombstone_in_compact = true;
             }
         }
-        assert!(!found_tombstone_in_compact, "Compact should filter tombstones");
+        assert!(
+            !found_tombstone_in_compact,
+            "Compact should filter tombstones"
+        );
     }
 }

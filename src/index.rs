@@ -41,7 +41,8 @@ use crate::{
 /// Number of u64 fields in the index header
 const INDEX_HEADER_FIELDS: usize = 6;
 /// Size of the index header: 6 * u64 = 48 bytes
-/// Fields: id, bloom_filter_seed, bloom_filter_size, ns_offset_size, block_offset_size, num_blocks
+/// Fields: id, bloom_filter_seed, bloom_filter_size, ns_offset_size,
+/// block_offset_size, num_blocks
 const INDEX_HEADER_SIZE: usize = INDEX_HEADER_FIELDS * size_of::<u64>();
 /// Size of each offset entry (namespace or block): 2 * u64 = 16 bytes
 const OFFSET_ENTRY_SIZE: usize = 2 * size_of::<u64>();
@@ -235,12 +236,9 @@ impl Index {
     #[instrument(level = "trace", skip(dst))]
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
         // SAFETY: Verify alignment invariants in debug builds
+        debug_assert!(!dst.is_null(), "Destination pointer must not be null");
         debug_assert!(
-            !dst.is_null(),
-            "Destination pointer must not be null"
-        );
-        debug_assert!(
-            dst as usize % std::mem::align_of::<u64>() == 0,
+            (dst as usize).is_multiple_of(std::mem::align_of::<u64>()),
             "Destination pointer must be 8-byte aligned for u64 writes"
         );
 
@@ -268,8 +266,9 @@ impl Index {
         let bloom_data = self.bloom_filter.bitmap().clone().freeze();
         let bloom_filter_size = bloom_data.len() as u64;
 
-        // SAFETY: All writes stay within the allocated buffer size (verified by caller).
-        // Each write advances the offset to ensure non-overlapping writes.
+        // SAFETY: All writes stay within the allocated buffer size (verified by
+        // caller). Each write advances the offset to ensure non-overlapping
+        // writes.
         unsafe {
             // write id
             ptr::copy_nonoverlapping(
@@ -511,7 +510,7 @@ mod tests {
         )
         .as_bytes()
     }
-    
+
     #[test]
     fn test_debug() {
         let index = Index::new(42, 123);
@@ -812,8 +811,8 @@ mod tests {
     }
 
     // Regression tests for get_namespace_block() bug fix
-    // Bug: The function was searching by block offset (*b) instead of namespace (*n)
-    // and returning from block_offset_entries instead of ns_offset_entries
+    // Bug: The function was searching by block offset (*b) instead of namespace
+    // (*n) and returning from block_offset_entries instead of ns_offset_entries
 
     #[test]
     fn test_get_namespace_block_basic() {
@@ -893,8 +892,8 @@ mod tests {
         let seed = 100;
         let mut index = Index::new(1, seed);
 
-        // Create a scenario where namespace values and block offsets differ significantly
-        // This ensures the binary search is using the right field
+        // Create a scenario where namespace values and block offsets differ
+        // significantly This ensures the binary search is using the right field
 
         // Namespace 50 maps to block 0
         index.insert_ns_offset(50);
@@ -925,7 +924,8 @@ mod tests {
             "Should find namespace 300 at block 2"
         );
 
-        // These should not be found (proving we're searching by namespace, not block offset)
+        // These should not be found (proving we're searching by namespace, not block
+        // offset)
         assert_eq!(
             index.get_namespace_block(1),
             None,
@@ -974,7 +974,8 @@ mod tests {
         index.insert_ns_offset(ns2);
         index.inc_block_count(1);
 
-        // Also add many more block offset entries (for keys) to create a clear difference
+        // Also add many more block offset entries (for keys) to create a clear
+        // difference
         for i in 0..50 {
             let key = create_test_key(i);
             index.insert_item(&key);

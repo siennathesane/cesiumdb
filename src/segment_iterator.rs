@@ -260,8 +260,10 @@ impl<'a> SegmentScanIterator<'a> {
     /// Reads a multi-block key using the shared reader helper.
     fn read_full_key(&self, flag: EntryFlag, initial_data: &[u8]) -> Result<Bytes, SegmentError> {
         // Delegate to the reader's shared multi-block entry handler
-        // Note: We use current_block_index - 1 because we've already advanced past the initial block
-        self.reader.read_multiblock_entry(flag, initial_data, self.current_block_index - 1)
+        // Note: We use current_block_index - 1 because we've already advanced past the
+        // initial block
+        self.reader
+            .read_multiblock_entry(flag, initial_data, self.current_block_index - 1)
     }
 
     /// Checks if a key is within the scan range.
@@ -293,7 +295,8 @@ impl<'a> SegmentScanIterator<'a> {
     }
 
     /// Reads the value for a key.
-    /// The key format is: [value_block_num:u64][value_entry_index:u16][actual_key_data]
+    /// The key format is:
+    /// [value_block_num:u64][value_entry_index:u16][actual_key_data]
     fn read_value_for_key(&self, key: &Bytes) -> Result<Option<Bytes>, SegmentError> {
         // Extract value location metadata from the first 10 bytes of the key
         if key.len() < 10 {
@@ -305,7 +308,10 @@ impl<'a> SegmentScanIterator<'a> {
         let value_entry_index = u16::from_le_bytes(key[8..10].try_into().unwrap());
 
         // Read the value from the value segment at the specified location
-        match self.reader.read_value(value_block_num as usize, value_entry_index as usize) {
+        match self
+            .reader
+            .read_value(value_block_num as usize, value_entry_index as usize)
+        {
             | Ok(value) => Ok(Some(value)),
             | Err(e) => Err(e),
         }
@@ -628,7 +634,7 @@ mod tests {
             // Update indexes
             key_index.inc_block_count(1);
             key_index.insert_item(&full_key);
-            
+
             val_index.inc_block_count(1);
             val_index.insert_item(&full_key);
         }
@@ -1232,7 +1238,11 @@ mod tests {
 
         // Try to find the block that would contain this key
         assert!(
-            reader.key_index.lock().get_block(non_existent_key).is_none(),
+            reader
+                .key_index
+                .lock()
+                .get_block(non_existent_key)
+                .is_none(),
             "Should not find block for non-existent key"
         );
     }
@@ -1247,8 +1257,12 @@ mod tests {
         let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Just verify basic properties of our test setup (key index is owned by reader)
-        assert!(reader.key_index.lock().block_count() > 0, "Expected blocks in key index");
-        // Note: We no longer have a val_index since value locations are stored in key metadata
+        assert!(
+            reader.key_index.lock().block_count() > 0,
+            "Expected blocks in key index"
+        );
+        // Note: We no longer have a val_index since value locations are stored
+        // in key metadata
     }
 
     #[test]

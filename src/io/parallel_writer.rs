@@ -3,13 +3,31 @@
 //! This module provides parallel writing capabilities for segments,
 //! allowing multiple blocks to be written concurrently during compaction.
 
-use crate::block::{Block, BLOCK_SIZE};
-use crate::io::buffer_pool::BufferPool;
-use crate::map::Map;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::{
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+    },
+    thread,
+};
+
+use crossbeam_channel::{
+    Receiver,
+    Sender,
+    bounded,
+};
+
+use crate::{
+    block::{
+        BLOCK_SIZE,
+        Block,
+    },
+    io::buffer_pool::BufferPool,
+    map::Map,
+};
 
 /// A write task to be processed
 pub struct WriteTask {
@@ -160,11 +178,11 @@ impl ParallelWriter {
             let block_range = offset..(offset + BLOCK_SIZE);
 
             // Write the block to the map
+            // SAFETY: We know the block is exactly BLOCK_SIZE bytes
+            // and the space is available. The closure is passed a valid mutable slice.
             let success = task
                 .map
                 .write_to_range(block_range, |slice| unsafe {
-                    // SAFETY: We know the block is exactly BLOCK_SIZE bytes
-                    // and the space is available
                     task.block.finalize(slice.as_mut_ptr());
                 })
                 .is_ok();
@@ -194,7 +212,12 @@ impl ParallelWriter {
     /// Submits a write task
     ///
     /// Returns the task ID if successful, or None if the queue is full.
-    pub fn write_block(&self, map: Arc<Map>, block_index: usize, block: Block) -> Option<u64> {
+    pub(crate) fn write_block(
+        &self,
+        map: Arc<Map>,
+        block_index: usize,
+        block: Block,
+    ) -> Option<u64> {
         let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
 
         let task = WriteTask {
@@ -276,10 +299,13 @@ impl Drop for ParallelWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::block::Block;
-    use crate::map::Map;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        block::Block,
+        map::Map,
+    };
 
     fn create_test_map() -> Arc<Map> {
         let temp_dir = TempDir::new().unwrap();

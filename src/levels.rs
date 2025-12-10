@@ -6,9 +6,12 @@
 //! - Level metadata and statistics
 //! - Key range tracking for efficient lookups
 
+use std::{
+    cmp::Ordering,
+    sync::Arc,
+};
+
 use crate::segment::Segment;
-use std::cmp::Ordering;
-use std::sync::Arc;
 
 /// Compaction strategy for a level
 ///
@@ -113,8 +116,8 @@ impl KeyRange {
 
     /// Checks if this range overlaps with another range
     pub fn overlaps(&self, other: &KeyRange) -> bool {
-        self.start.as_slice() <= other.end.as_slice()
-            && other.start.as_slice() <= self.end.as_slice()
+        self.start.as_slice() <= other.end.as_slice() &&
+            other.start.as_slice() <= self.end.as_slice()
     }
 
     /// Checks if this range is strictly before another range
@@ -166,24 +169,24 @@ impl LevelStats {
     /// Score > 1.0 means the level should be compacted
     pub fn score(&self, max_size: u64, strategy: &CompactionStrategy) -> f64 {
         match strategy {
-            CompactionStrategy::Tiered { size_ratio, .. } => {
+            | CompactionStrategy::Tiered { size_ratio, .. } => {
                 // Score based on number of files and size ratio
                 let size_score = self.total_size as f64 / max_size as f64;
                 let file_score = self.num_segments as f64 / 10.0;
                 size_score.max(file_score)
-            }
-            CompactionStrategy::Leveled { fanout, .. } => {
+            },
+            | CompactionStrategy::Leveled { fanout, .. } => {
                 // Simple size-based scoring
                 self.total_size as f64 / max_size as f64
-            }
-            CompactionStrategy::Universal {
+            },
+            | CompactionStrategy::Universal {
                 max_size_amplification,
                 ..
             } => {
                 // Score based on space amplification
                 let space_amp = self.total_size as f64 / max_size as f64;
                 space_amp / max_size_amplification
-            }
+            },
         }
     }
 }
@@ -263,11 +266,7 @@ impl Level {
     ///
     /// Returns the removed segment if found.
     pub fn remove_segment(&mut self, segment_id: u64) -> Option<Arc<Segment>> {
-        if let Some(idx) = self
-            .segments
-            .iter()
-            .position(|s| s.id() == segment_id)
-        {
+        if let Some(idx) = self.segments.iter().position(|s| s.id() == segment_id) {
             let segment = self.segments.remove(idx);
             self.key_ranges.remove(idx);
 
@@ -469,7 +468,12 @@ mod tests {
 
     #[test]
     fn test_level_add_remove() {
-        let level = Level::new(1, CompactionStrategy::default_leveled(), 1024 * 1024, 64 * 1024);
+        let level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
 
         // Note: We can't easily test with real segments without full setup,
         // so this is a simplified test of the structure
@@ -489,7 +493,10 @@ mod tests {
         // Check that strategies are set correctly
         assert_eq!(version.levels[0].strategy, CompactionStrategy::default_l0()); // L1
         assert_eq!(version.levels[1].strategy, CompactionStrategy::default_l0()); // L2
-        assert_eq!(version.levels[2].strategy, CompactionStrategy::default_leveled()); // L3
+        assert_eq!(
+            version.levels[2].strategy,
+            CompactionStrategy::default_leveled()
+        ); // L3
     }
 
     #[test]

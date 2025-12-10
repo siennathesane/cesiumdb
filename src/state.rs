@@ -8,11 +8,13 @@ use parking_lot::{
     RwLock,
 };
 
-use crate::memtable::{
-    DEFAULT_MEMTABLE_SIZE_IN_BYTES,
-    Memtable,
+use crate::{
+    memtable::{
+        DEFAULT_MEMTABLE_SIZE_IN_BYTES,
+        Memtable,
+    },
+    version::VersionManager,
 };
-use crate::version::VersionManager;
 
 pub const DEFAULT_BLOCK_SIZE: u64 = 4096;
 pub const DEFAULT_TARGET_SST_SIZE: u64 = 4096;
@@ -205,7 +207,10 @@ mod tests {
         assert_eq!(frozen.len(), 1);
 
         let retrieved = frozen[0].get(key);
-        assert!(retrieved.is_some(), "data should be preserved in frozen memtable");
+        assert!(
+            retrieved.is_some(),
+            "data should be preserved in frozen memtable"
+        );
         assert_eq!(retrieved.unwrap().as_bytes(), val.as_bytes());
     }
 
@@ -229,7 +234,10 @@ mod tests {
     #[test]
     fn test_storage_builder_chain() {
         let mut builder = DbStorageBuilder::new();
-        builder.block_size(4096).target_sst_size(8192).num_memtable_limit(6);
+        builder
+            .block_size(4096)
+            .target_sst_size(8192)
+            .num_memtable_limit(6);
 
         let state = builder.build();
         assert_eq!(state.lock().current_memtable().id(), 0);
@@ -243,7 +251,10 @@ mod tests {
         for _ in 0..10 {
             state.lock().new_memtable();
             let current_id = state.lock().current_memtable().id();
-            assert!(current_id > prev_id, "memtable ids should monotonically increase");
+            assert!(
+                current_id > prev_id,
+                "memtable ids should monotonically increase"
+            );
             prev_id = current_id;
         }
     }

@@ -203,6 +203,7 @@ impl Memtable {
         // 2. rust's drop order guarantees inner (Range) drops before _map (Arc)
         // 3. therefore, the SkipMap is guaranteed alive during Range's lifetime
         // 4. the Range only borrows; returned values are owned (cloned Bytes)
+        #[allow(clippy::missing_transmute_annotations)]
         let range = unsafe { transmute(ranger) };
 
         MemtableIterator::new(map_clone, range)
@@ -252,7 +253,10 @@ impl Iterator for MemtableIterator {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let entry = self.inner.next()?;
+            let entry = match self.inner.next() {
+                | Some(v) => v,
+                | None => return None,
+            };
             let key = KeyBytes::deserialize(entry.key().clone());
 
             // Skip "latest" pointer entries (these have ts=0 after inversion)
@@ -275,18 +279,24 @@ impl Iterator for MemtableIterator {
 #[cfg(test)]
 mod tests {
     #[cfg(not(loom))]
-    use std::{sync::Arc, thread};
-
-    #[cfg(loom)]
-    use loom::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicU64, Ordering},
-        },
+    use std::{
+        sync::Arc,
         thread,
     };
 
     use bytes::Bytes;
+    #[cfg(loom)]
+    use loom::{
+        sync::{
+            Arc,
+            atomic::{
+                AtomicBool,
+                AtomicU64,
+                Ordering,
+            },
+        },
+        thread,
+    };
     use rand::{
         Rng,
         RngCore,
@@ -409,7 +419,10 @@ mod tests {
         let key = KeyBytes::new(DEFAULT_NS, Bytes::from("nonexistent"), 0);
 
         let result = memtable.get(key);
-        assert!(result.is_none(), "get on nonexistent key should return None");
+        assert!(
+            result.is_none(),
+            "get on nonexistent key should return None"
+        );
     }
 
     #[test]
@@ -427,7 +440,10 @@ mod tests {
 
         let new_size = memtable.size();
         assert!(new_size > 0, "size should increase after put");
-        assert!(new_size > initial_size, "size should be greater than initial");
+        assert!(
+            new_size > initial_size,
+            "size should be greater than initial"
+        );
     }
 
     #[test]
@@ -438,7 +454,10 @@ mod tests {
         let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), 0);
 
         let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
-        assert!(iter.next().is_none(), "scan on empty memtable should return no items");
+        assert!(
+            iter.next().is_none(),
+            "scan on empty memtable should return no items"
+        );
     }
 
     #[test]
@@ -468,7 +487,11 @@ mod tests {
 
         // insert multiple keys
         for i in 0..10 {
-            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{:02}", i)), clock.time());
+            let key = KeyBytes::new(
+                DEFAULT_NS,
+                Bytes::from(format!("key-{:02}", i)),
+                clock.time(),
+            );
             let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
             assert!(memtable.put(key, val).is_ok());
         }
@@ -480,7 +503,10 @@ mod tests {
         let items: Vec<_> = iter.collect();
 
         // should return items in the range
-        assert!(items.len() >= 1, "scan with bounds should return items in range");
+        assert!(
+            items.len() >= 1,
+            "scan with bounds should return items in range"
+        );
     }
 
     #[test]
@@ -566,7 +592,11 @@ mod tests {
         for ns in 0..5 {
             let key = KeyBytes::new(ns, key_name.clone(), 0);
             let result = memtable.get(key);
-            assert!(result.is_some(), "key in namespace {} should be retrievable", ns);
+            assert!(
+                result.is_some(),
+                "key in namespace {} should be retrievable",
+                ns
+            );
         }
     }
 
@@ -620,7 +650,10 @@ mod tests {
 
         // get should still work efficiently
         let result = memtable.get(KeyBytes::new(DEFAULT_NS, key_name, 0));
-        assert!(result.is_some(), "should retrieve latest version efficiently");
+        assert!(
+            result.is_some(),
+            "should retrieve latest version efficiently"
+        );
     }
 
     #[test]
@@ -654,7 +687,8 @@ mod tests {
 
             // Insert some data
             for i in 0..5 {
-                let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
+                let key =
+                    KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
                 let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
                 assert!(memtable.put(key, val).is_ok());
             }
@@ -667,11 +701,15 @@ mod tests {
         // Iterator should still work even though memtable is gone
         // This proves the Arc keeps the SkipMap alive
         let items: Vec<_> = iter.collect();
-        assert!(items.len() >= 1, "iterator should work after memtable is dropped");
+        assert!(
+            items.len() >= 1,
+            "iterator should work after memtable is dropped"
+        );
     }
 
     // Loom tests for atomic operation patterns
-    // These test the concurrency patterns used in memtable without the crossbeam dependencies
+    // These test the concurrency patterns used in memtable without the crossbeam
+    // dependencies
 
     #[test]
     #[cfg(loom)]
@@ -715,8 +753,8 @@ mod tests {
             // If frozen, we might have 0 or 1 writes depending on interleaving
             // This demonstrates the TOCTOU race condition
             if is_frozen && total_writes > 0 {
-                // This can happen: check passed, then freeze happened, then write completed
-                // This is the race condition!
+                // This can happen: check passed, then freeze happened, then
+                // write completed This is the race condition!
             }
         });
     }
@@ -765,7 +803,11 @@ mod tests {
             // Both operations might succeed due to TOCTOU, resulting in > max_size
             if wrote1 && wrote2 {
                 // This demonstrates the race: both checked, both passed, total exceeds max
-                assert!(final_size == 110, "Both writes succeeded, total = {}", final_size);
+                assert!(
+                    final_size == 110,
+                    "Both writes succeeded, total = {}",
+                    final_size
+                );
             }
         });
     }
@@ -840,9 +882,7 @@ mod tests {
                 f1.store(true, Relaxed);
             });
 
-            let t2 = thread::spawn(move || {
-                f2.load(Relaxed)
-            });
+            let t2 = thread::spawn(move || f2.load(Relaxed));
 
             t1.join().unwrap();
             let saw_frozen = t2.join().unwrap();

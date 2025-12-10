@@ -321,9 +321,7 @@ fn bench_segment_scan(c: &mut Criterion, dir: &TempDir) {
                                 // store the raw key for later range bounds
                                 keys.push(key_bytes.clone().into());
 
-                                segment_ref
-                                    .write(&key_bytes, &value.serialize())
-                                    .unwrap();
+                                segment_ref.write(&key_bytes, &value.serialize()).unwrap();
                             }
 
                             segment_ref.flush().unwrap();

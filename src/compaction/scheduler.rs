@@ -7,11 +7,27 @@
 //! - Write amplification
 //! - Available resources
 
-use crate::compaction::job::{CompactionInput, CompactionJob, CompactionJobType, CompactionOutput};
-use crate::levels::{CompactionStrategy, VersionSet};
-use crate::segment::Segment;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{
+        AtomicU64,
+        Ordering,
+    },
+};
+
+use crate::{
+    compaction::job::{
+        CompactionInput,
+        CompactionJob,
+        CompactionJobType,
+        CompactionOutput,
+    },
+    levels::{
+        CompactionStrategy,
+        VersionSet,
+    },
+    segment::Segment,
+};
 
 /// Configuration for the compaction scheduler
 #[derive(Clone)]
@@ -86,10 +102,10 @@ impl CompactionScheduler {
         }
 
         // Check L0 compaction
-        if version.l0.len() >= self.config.l0_compaction_trigger {
-            if let Some(job) = self.create_l0_compaction(version) {
-                return Some(job);
-            }
+        if version.l0.len() >= self.config.l0_compaction_trigger &&
+            let Some(job) = self.create_l0_compaction(version)
+        {
+            return Some(job);
         }
 
         // Check level compactions
@@ -125,16 +141,17 @@ impl CompactionScheduler {
                     .expect("segment should have key range");
 
                 // Check if this segment overlaps with any segment in next level
-                let has_overlap = next_level.key_ranges.iter().any(|r| r.overlaps(segment_range));
+                let has_overlap = next_level
+                    .key_ranges
+                    .iter()
+                    .any(|r| r.overlaps(segment_range));
 
                 if !has_overlap {
                     // Found a trivial move!
                     let input = CompactionInput::new(level.level_num, vec![segment.clone()]);
 
-                    let output = CompactionOutput::new(
-                        next_level_num,
-                        self.config.target_segment_size,
-                    );
+                    let output =
+                        CompactionOutput::new(next_level_num, self.config.target_segment_size);
 
                     let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
@@ -234,7 +251,11 @@ impl CompactionScheduler {
     }
 
     /// Creates a level compaction job
-    fn create_level_compaction(&self, version: &VersionSet, level_num: u8) -> Option<CompactionJob> {
+    fn create_level_compaction(
+        &self,
+        version: &VersionSet,
+        level_num: u8,
+    ) -> Option<CompactionJob> {
         let level_idx = level_num as usize - 1;
         if level_idx >= version.levels.len() {
             return None;
@@ -249,10 +270,14 @@ impl CompactionScheduler {
         }
 
         let segment = level.segments[0].clone();
-        let segment_range = level
+        let segment_range = match level
             .key_ranges
             .iter()
-            .find(|r| r.segment_id == segment.id())?;
+            .find(|r| r.segment_id == segment.id())
+        {
+            | Some(v) => v,
+            | None => return None,
+        };
 
         let input = CompactionInput::new(level_num, vec![segment]);
 
@@ -267,7 +292,11 @@ impl CompactionScheduler {
                 .segments
                 .iter()
                 .filter(|seg| {
-                    if let Some(range) = next_level.key_ranges.iter().find(|r| r.segment_id == seg.id()) {
+                    if let Some(range) = next_level
+                        .key_ranges
+                        .iter()
+                        .find(|r| r.segment_id == seg.id())
+                    {
                         segment_range.overlaps(range)
                     } else {
                         false

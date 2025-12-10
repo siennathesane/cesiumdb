@@ -193,7 +193,8 @@ impl Key<Bytes> {
     pub fn simd_cmp(&self, other: &Self) -> Ordering {
         // Must match the standard Ord implementation exactly
         // Standard: (self.ns, self.key.as_ref(), Reverse(self.ts))
-        self.ns.cmp(&other.ns)
+        self.ns
+            .cmp(&other.ns)
             .then_with(|| {
                 // Use SIMD for key bytes comparison
                 crate::simd::simd_compare_keys(self.key.as_ref(), other.key.as_ref())
@@ -232,9 +233,11 @@ mod simd_tests {
             let simd_result = key1.simd_cmp(&key2);
             let ord_result = key1.cmp(&key2);
 
-            assert_eq!(simd_result, ord_result,
+            assert_eq!(
+                simd_result, ord_result,
                 "SIMD and Ord mismatch for ns1={}, ns2={}, ts1={}, ts2={}",
-                ns1, ns2, ts1, ts2);
+                ns1, ns2, ts1, ts2
+            );
         }
     }
 }
@@ -314,7 +317,6 @@ impl ValueBytes {
             value: Bytes::copy_from_slice(&bytes[9..]),
         }
     }
-
 
     #[instrument(level = "trace")]
     #[inline]
@@ -444,7 +446,10 @@ mod tests {
         let key1 = KeyBytes::new(0, Bytes::from("aaa"), 100);
         let key2 = KeyBytes::new(0, Bytes::from("bbb"), 100);
 
-        assert!(key1 < key2, "keys in same namespace should be ordered by key bytes");
+        assert!(
+            key1 < key2,
+            "keys in same namespace should be ordered by key bytes"
+        );
     }
 
     #[test]
@@ -452,8 +457,12 @@ mod tests {
         let key1 = KeyBytes::new(0, Bytes::from("key"), 200);
         let key2 = KeyBytes::new(0, Bytes::from("key"), 100);
 
-        // with same ns and key, newer timestamp (200) should come first (Reverse ordering)
-        assert!(key1 < key2, "keys with same ns and key should be ordered by timestamp in reverse");
+        // with same ns and key, newer timestamp (200) should come first (Reverse
+        // ordering)
+        assert!(
+            key1 < key2,
+            "keys with same ns and key should be ordered by timestamp in reverse"
+        );
     }
 
     #[test]
@@ -596,7 +605,10 @@ mod tests {
         let val2 = ValueBytes::new(0, Bytes::from("bbb"));
         let val3 = ValueBytes::new(1, Bytes::from("aaa"));
 
-        assert!(val1 < val2, "values should be ordered by value bytes in same namespace");
+        assert!(
+            val1 < val2,
+            "values should be ordered by value bytes in same namespace"
+        );
         assert!(val1 < val3, "values should be ordered by namespace first");
         assert!(val2 < val3, "namespace ordering should take precedence");
     }

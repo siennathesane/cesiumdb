@@ -6,14 +6,31 @@
 //! - Applies backpressure when resources are constrained
 //! - Adapts to changing system conditions
 
-use crate::compaction::executor::CompactionExecutor;
-use crate::compaction::job::CompactionJob;
-use crate::compaction::queue::CompactionQueue;
-use crate::version::VersionManager;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            AtomicUsize,
+            Ordering,
+        },
+    },
+    thread,
+    time::{
+        Duration,
+        Instant,
+    },
+};
+
+use crate::{
+    compaction::{
+        executor::CompactionExecutor,
+        job::CompactionJob,
+        queue::CompactionQueue,
+    },
+    version::VersionManager,
+};
 
 /// Resource limits for compaction
 #[derive(Debug, Clone, Copy)]
@@ -275,17 +292,30 @@ impl Drop for AdaptiveExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::compaction::job::{CompactionInput, CompactionJobType, CompactionOutput};
-    use crate::levels::{CompactionStrategy, KeyRange, Level, VersionSet};
     use std::path::PathBuf;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        compaction::job::{
+            CompactionInput,
+            CompactionJobType,
+            CompactionOutput,
+        },
+        levels::{
+            CompactionStrategy,
+            KeyRange,
+            Level,
+            VersionSet,
+        },
+    };
 
     fn create_test_executor() -> (AdaptiveExecutor, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
 
-        let version_manager = Arc::new(VersionManager::new(7));  // 7 levels
+        let version_manager = Arc::new(VersionManager::new(7)); // 7 levels
         let executor = Arc::new(CompactionExecutor::new(Arc::clone(&version_manager), path));
         let queue = Arc::new(CompactionQueue::new());
 
@@ -295,12 +325,7 @@ mod tests {
             ..Default::default()
         };
 
-        let adaptive = AdaptiveExecutor::new(
-            executor,
-            queue,
-            version_manager,
-            limits,
-        );
+        let adaptive = AdaptiveExecutor::new(executor, queue, version_manager, limits);
 
         (adaptive, temp_dir)
     }

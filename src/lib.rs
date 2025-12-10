@@ -414,7 +414,10 @@ mod tests {
         // test get on empty db
         let result = db.get(b"nonexistent");
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "get on empty db should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "get on empty db should return None"
+        );
 
         // insert and retrieve
         let key = b"test-key";
@@ -424,13 +427,19 @@ mod tests {
         let result = db.get(key);
         assert!(result.is_ok());
         let retrieved = result.unwrap();
-        assert!(retrieved.is_some(), "get should return Some for existing key");
+        assert!(
+            retrieved.is_some(),
+            "get should return Some for existing key"
+        );
         assert_eq!(&retrieved.unwrap()[..], val, "retrieved value should match");
 
         // test get on different key
         let result = db.get(b"different-key");
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "get on non-existent key should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "get on non-existent key should return None"
+        );
     }
 
     #[test]
@@ -452,7 +461,11 @@ mod tests {
         assert!(result.is_ok());
         let retrieved = result.unwrap();
         assert!(retrieved.is_some());
-        assert_eq!(&retrieved.unwrap()[..], val3, "get should return the latest value");
+        assert_eq!(
+            &retrieved.unwrap()[..],
+            val3,
+            "get should return the latest value"
+        );
     }
 
     #[test]
@@ -533,7 +546,10 @@ mod tests {
         // verify key doesn't exist in default namespace
         let result = db.get(key);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "key should not exist in default namespace");
+        assert!(
+            result.unwrap().is_none(),
+            "key should not exist in default namespace"
+        );
     }
 
     #[test]
@@ -558,7 +574,10 @@ mod tests {
         // verify the key no longer exists (tombstone filters it out)
         let result = db.get_ns(ns, key);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "deleted key in namespace should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "deleted key in namespace should return None"
+        );
     }
 
     #[test]
@@ -581,12 +600,19 @@ mod tests {
         let time2 = db.time();
 
         // time should be monotonically increasing
-        assert!(time2 >= time1, "clock should return monotonically increasing values");
+        assert!(
+            time2 >= time1,
+            "clock should return monotonically increasing values"
+        );
     }
 
     #[test]
     fn test_db_batch_mixed_operations() {
-        use crate::Batch::{Delete, DeleteNs, PutNs};
+        use crate::Batch::{
+            Delete,
+            DeleteNs,
+            PutNs,
+        };
 
         let db = db_builder();
 

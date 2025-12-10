@@ -57,6 +57,7 @@ impl Map {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path.clone())
         {
             | Ok(v) => v,
@@ -66,7 +67,7 @@ impl Map {
         match file.set_len(initial_size) {
             | Ok(_) => {},
             | Err(e) => return Err(IoError(e)),
-        };
+        }
 
         let size_metadata = match file.metadata() {
             | Ok(v) => v.len(),
@@ -126,7 +127,7 @@ impl Map {
             match file.set_len(new_size) {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
-            };
+            }
 
             let size_metadata = match file.metadata() {
                 | Ok(v) => v.len(),
@@ -166,7 +167,7 @@ impl Map {
             match file.set_len(new_size) {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
-            };
+            }
 
             let size_metadata = match file.metadata() {
                 | Ok(v) => v.len(),
@@ -248,10 +249,10 @@ impl Map {
         unsafe {
             let mmap = &*ptr;
             let inner = &mut *mmap.get();
-            match inner.flush().map_err(|e| IoError(e)) {
+            match inner.flush().map_err(IoError) {
                 | Ok(_) => {},
                 | Err(e) => return Err(e),
-            };
+            }
         }
 
         Ok(())
@@ -318,8 +319,8 @@ impl Deref for Map {
         // SAFETY: none, we are dereferencing a pointer
         unsafe {
             let mmap = &*ptr;
-            let inner = &*mmap.get();
-            inner
+
+            (&*mmap.get()) as _
         }
     }
 }
@@ -330,8 +331,8 @@ impl DerefMut for Map {
         // SAFETY: none, we are mutably dereferencing a pointer
         unsafe {
             let mmap = &mut *ptr;
-            let inner = &mut *mmap.get();
-            inner
+
+            (&mut *mmap.get()) as _
         }
     }
 }

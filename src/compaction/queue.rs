@@ -3,20 +3,29 @@
 //! This module provides a thread-safe, lock-free queue for coordinating
 //! compaction jobs across multiple worker threads.
 
-use crate::compaction::job::CompactionJob;
+use std::sync::{
+    Arc,
+    atomic::{
+        AtomicBool,
+        AtomicU64,
+        AtomicUsize,
+        Ordering,
+    },
+};
+
 use crossbeam_queue::SegQueue;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+
+use crate::compaction::job::CompactionJob;
 
 /// Priority for a compaction job
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobPriority {
     /// Low priority (background cleanup)
-    Low = 0,
+    Low      = 0,
     /// Normal priority (regular compactions)
-    Normal = 1,
+    Normal   = 1,
     /// High priority (L0 compaction)
-    High = 2,
+    High     = 2,
     /// Critical priority (flush, blocks writes)
     Critical = 3,
 }
@@ -100,10 +109,10 @@ impl CompactionQueue {
         let job = Arc::new(job);
 
         match priority {
-            JobPriority::Critical => self.critical.push(job),
-            JobPriority::High => self.high.push(job),
-            JobPriority::Normal => self.normal.push(job),
-            JobPriority::Low => self.low.push(job),
+            | JobPriority::Critical => self.critical.push(job),
+            | JobPriority::High => self.high.push(job),
+            | JobPriority::Normal => self.normal.push(job),
+            | JobPriority::Low => self.low.push(job),
         }
 
         self.total_queued.fetch_add(1, Ordering::Release);
@@ -118,12 +127,16 @@ impl CompactionQueue {
         }
 
         // Try queues in priority order
-        let job = self
+        let job = match self
             .critical
             .pop()
             .or_else(|| self.high.pop())
             .or_else(|| self.normal.pop())
-            .or_else(|| self.low.pop())?;
+            .or_else(|| self.low.pop())
+        {
+            | Some(v) => v,
+            | None => return None,
+        };
 
         self.total_queued.fetch_sub(1, Ordering::Release);
         self.in_progress.fetch_add(1, Ordering::Release);
@@ -241,8 +254,14 @@ impl std::fmt::Display for QueueStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compaction::job::{CompactionInput, CompactionJobType, CompactionOutput};
-    use crate::levels::KeyRange;
+    use crate::{
+        compaction::job::{
+            CompactionInput,
+            CompactionJobType,
+            CompactionOutput,
+        },
+        levels::KeyRange,
+    };
 
     fn create_test_job(score: f64) -> CompactionJob {
         let input = CompactionInput {

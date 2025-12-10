@@ -3,9 +3,11 @@
 //! Efficiently handles deletion of large contiguous key ranges by using
 //! range tombstones instead of individual per-key tombstones.
 
-use crate::levels::KeyRange;
-use bytes::Bytes;
 use std::cmp::Ordering;
+
+use bytes::Bytes;
+
+use crate::levels::KeyRange;
 
 /// A range tombstone marking deletion of all keys in a range
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +44,7 @@ impl RangeTombstone {
 
     /// Checks if this tombstone overlaps with a key range
     pub fn overlaps(&self, range: &KeyRange) -> bool {
-        self.start.as_ref() <= range.end.as_slice()
-            && range.start.as_slice() <= self.end.as_ref()
+        self.start.as_ref() <= range.end.as_slice() && range.start.as_slice() <= self.end.as_ref()
     }
 
     /// Merges this tombstone with another if they overlap or are adjacent
@@ -81,23 +82,21 @@ impl RangeTombstone {
     /// Checks if this tombstone overlaps or is adjacent to another
     fn overlaps_or_adjacent(&self, other: &RangeTombstone) -> bool {
         // Overlapping
-        if self.start.as_ref() <= other.end.as_ref()
-            && other.start.as_ref() <= self.end.as_ref()
-        {
+        if self.start.as_ref() <= other.end.as_ref() && other.start.as_ref() <= self.end.as_ref() {
             return true;
         }
 
         // Adjacent (this.end + 1 == other.start or other.end + 1 == this.start)
-        if let Some(next) = self.next_key() {
-            if next.as_ref() == other.start.as_ref() {
-                return true;
-            }
+        if let Some(next) = self.next_key() &&
+            next.as_ref() == other.start.as_ref()
+        {
+            return true;
         }
 
-        if let Some(next) = other.next_key() {
-            if next.as_ref() == self.start.as_ref() {
-                return true;
-            }
+        if let Some(next) = other.next_key() &&
+            next.as_ref() == self.start.as_ref()
+        {
+            return true;
         }
 
         false
@@ -122,7 +121,8 @@ impl RangeTombstone {
 
     /// Splits this tombstone at the given key
     ///
-    /// Returns (left, right) where left covers [start, key) and right covers [key, end].
+    /// Returns (left, right) where left covers [start, key) and right covers
+    /// [key, end].
     pub fn split_at(&self, key: &[u8]) -> (Option<RangeTombstone>, Option<RangeTombstone>) {
         if key <= self.start.as_ref() {
             // Key is before range - no left part
@@ -192,21 +192,19 @@ impl RangeTombstoneManager {
     /// Checks if a key is covered by any range tombstone
     pub fn is_deleted(&self, key: &[u8]) -> bool {
         // Binary search for potential covering tombstone
-        let idx = self
-            .tombstones
-            .binary_search_by(|t| {
-                if key < t.start.as_ref() {
-                    Ordering::Greater
-                } else if key > t.end.as_ref() {
-                    Ordering::Less
-                } else {
-                    Ordering::Equal
-                }
-            });
+        let idx = self.tombstones.binary_search_by(|t| {
+            if key < t.start.as_ref() {
+                Ordering::Greater
+            } else if key > t.end.as_ref() {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        });
 
         match idx {
-            Ok(_) => true, // Found exact match
-            Err(i) => {
+            | Ok(_) => true, // Found exact match
+            | Err(i) => {
                 // Check tombstone before and after insertion point
                 if i > 0 && self.tombstones[i - 1].covers(key) {
                     return true;
@@ -215,7 +213,7 @@ impl RangeTombstoneManager {
                     return true;
                 }
                 false
-            }
+            },
         }
     }
 
@@ -313,12 +311,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_creation() {
-        let tombstone = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"z"),
-            100,
-            0,
-        );
+        let tombstone =
+            RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"z"), 100, 0);
 
         assert_eq!(tombstone.start.as_ref(), b"a");
         assert_eq!(tombstone.end.as_ref(), b"z");
@@ -328,12 +322,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_covers() {
-        let tombstone = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"z"),
-            100,
-            0,
-        );
+        let tombstone =
+            RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"z"), 100, 0);
 
         assert!(tombstone.covers(b"a"));
         assert!(tombstone.covers(b"m"));
@@ -344,12 +334,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_overlaps() {
-        let tombstone = RangeTombstone::new(
-            Bytes::from_static(b"d"),
-            Bytes::from_static(b"m"),
-            100,
-            0,
-        );
+        let tombstone =
+            RangeTombstone::new(Bytes::from_static(b"d"), Bytes::from_static(b"m"), 100, 0);
         let range1 = KeyRange::new(b"a".to_vec(), b"f".to_vec(), 1);
         let range2 = KeyRange::new(b"p".to_vec(), b"z".to_vec(), 2);
 
@@ -359,18 +345,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_merge() {
-        let t1 = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"m"),
-            100,
-            0,
-        );
-        let t2 = RangeTombstone::new(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"z"),
-            101,
-            0,
-        );
+        let t1 = RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"m"), 100, 0);
+        let t2 = RangeTombstone::new(Bytes::from_static(b"k"), Bytes::from_static(b"z"), 101, 0);
 
         let merged = t1.try_merge(&t2);
         assert!(merged.is_some());
@@ -383,18 +359,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_no_merge_different_level() {
-        let t1 = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"m"),
-            100,
-            0,
-        );
-        let t2 = RangeTombstone::new(
-            Bytes::from_static(b"k"),
-            Bytes::from_static(b"z"),
-            101,
-            1,
-        );
+        let t1 = RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"m"), 100, 0);
+        let t2 = RangeTombstone::new(Bytes::from_static(b"k"), Bytes::from_static(b"z"), 101, 1);
 
         let merged = t1.try_merge(&t2);
         assert!(merged.is_none());
@@ -402,12 +368,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_split() {
-        let tombstone = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"z"),
-            100,
-            0,
-        );
+        let tombstone =
+            RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"z"), 100, 0);
 
         let (left, right) = tombstone.split_at(b"m");
 
@@ -434,12 +396,7 @@ mod tests {
     fn test_manager_add() {
         let mut manager = RangeTombstoneManager::new();
 
-        let t1 = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"m"),
-            100,
-            0,
-        );
+        let t1 = RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"m"), 100, 0);
         manager.add(t1);
 
         assert_eq!(manager.len(), 1);
@@ -449,12 +406,7 @@ mod tests {
     fn test_manager_is_deleted() {
         let mut manager = RangeTombstoneManager::new();
 
-        let t1 = RangeTombstone::new(
-            Bytes::from_static(b"d"),
-            Bytes::from_static(b"m"),
-            100,
-            0,
-        );
+        let t1 = RangeTombstone::new(Bytes::from_static(b"d"), Bytes::from_static(b"m"), 100, 0);
         manager.add(t1);
 
         assert!(manager.is_deleted(b"d"));
@@ -468,18 +420,8 @@ mod tests {
     fn test_manager_overlapping() {
         let mut manager = RangeTombstoneManager::new();
 
-        let t1 = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"f"),
-            100,
-            0,
-        );
-        let t2 = RangeTombstone::new(
-            Bytes::from_static(b"p"),
-            Bytes::from_static(b"z"),
-            101,
-            0,
-        );
+        let t1 = RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"f"), 100, 0);
+        let t2 = RangeTombstone::new(Bytes::from_static(b"p"), Bytes::from_static(b"z"), 101, 0);
         manager.add(t1);
         manager.add(t2);
 
@@ -551,18 +493,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_ordering() {
-        let t1 = RangeTombstone::new(
-            Bytes::from_static(b"a"),
-            Bytes::from_static(b"f"),
-            100,
-            0,
-        );
-        let t2 = RangeTombstone::new(
-            Bytes::from_static(b"p"),
-            Bytes::from_static(b"z"),
-            101,
-            0,
-        );
+        let t1 = RangeTombstone::new(Bytes::from_static(b"a"), Bytes::from_static(b"f"), 100, 0);
+        let t2 = RangeTombstone::new(Bytes::from_static(b"p"), Bytes::from_static(b"z"), 101, 0);
 
         assert!(t1 < t2);
     }
