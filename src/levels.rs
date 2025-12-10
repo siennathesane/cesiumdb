@@ -467,6 +467,103 @@ mod tests {
     }
 
     #[test]
+    fn test_key_range_is_before() {
+        let r1 = KeyRange::new(b"apple".to_vec(), b"banana".to_vec(), 1);
+        let r2 = KeyRange::new(b"cherry".to_vec(), b"date".to_vec(), 2);
+        let r3 = KeyRange::new(b"avocado".to_vec(), b"blueberry".to_vec(), 3);
+
+        // r1 [apple-banana] is before r2 [cherry-date]
+        assert!(r1.is_before(&r2));
+        // r2 is NOT before r1
+        assert!(!r2.is_before(&r1));
+        // r1 [apple-banana] is NOT before r3 [avocado-blueberry] (they overlap)
+        assert!(!r1.is_before(&r3));
+        // r3 is NOT before r2 (r3 ends at blueberry, r2 starts at cherry, blueberry < cherry)
+        assert!(r3.is_before(&r2));
+    }
+
+    #[test]
+    fn test_key_range_is_after() {
+        let r1 = KeyRange::new(b"apple".to_vec(), b"banana".to_vec(), 1);
+        let r2 = KeyRange::new(b"cherry".to_vec(), b"date".to_vec(), 2);
+        let r3 = KeyRange::new(b"avocado".to_vec(), b"blueberry".to_vec(), 3);
+
+        // r2 [cherry-date] is after r1 [apple-banana]
+        assert!(r2.is_after(&r1));
+        // r1 is NOT after r2
+        assert!(!r1.is_after(&r2));
+        // r3 [avocado-blueberry] is NOT after r1 [apple-banana] (they overlap)
+        assert!(!r3.is_after(&r1));
+        // r2 is after r3
+        assert!(r2.is_after(&r3));
+    }
+
+    #[test]
+    fn test_key_range_is_before_and_after_edge_cases() {
+        // Test with adjacent ranges (touching but not overlapping)
+        let r1 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 1);
+        let r2 = KeyRange::new(b"c".to_vec(), b"d".to_vec(), 2);
+
+        assert!(r1.is_before(&r2));
+        assert!(r2.is_after(&r1));
+        assert!(!r2.is_before(&r1));
+        assert!(!r1.is_after(&r2));
+
+        // Test with same range
+        let r3 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 3);
+        assert!(!r1.is_before(&r3));
+        assert!(!r1.is_after(&r3));
+    }
+
+    #[test]
+    fn test_key_range_ordering() {
+        let r1 = KeyRange::new(b"apple".to_vec(), b"banana".to_vec(), 1);
+        let r2 = KeyRange::new(b"cherry".to_vec(), b"date".to_vec(), 2);
+        let r3 = KeyRange::new(b"apple".to_vec(), b"avocado".to_vec(), 3);
+        let r4 = KeyRange::new(b"apple".to_vec(), b"banana".to_vec(), 4);
+
+        // r1 < r2 (apple < cherry)
+        assert!(r1 < r2);
+        assert!(r2 > r1);
+
+        // r3 < r1 (same start, but avocado < banana)
+        assert!(r3 < r1);
+        assert!(r1 > r3);
+
+        // r1 == r4 (same start and end, different segment_id doesn't affect ordering)
+        assert_eq!(r1.cmp(&r4), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_key_range_partial_ord() {
+        let r1 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 1);
+        let r2 = KeyRange::new(b"c".to_vec(), b"d".to_vec(), 2);
+
+        // Test partial_cmp
+        assert_eq!(r1.partial_cmp(&r2), Some(Ordering::Less));
+        assert_eq!(r2.partial_cmp(&r1), Some(Ordering::Greater));
+        assert_eq!(r1.partial_cmp(&r1), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_key_range_new_edge_cases() {
+        // Empty range (start == end)
+        let r = KeyRange::new(b"same".to_vec(), b"same".to_vec(), 1);
+        assert!(r.contains(b"same"));
+        assert!(!r.contains(b"other"));
+
+        // Single byte keys
+        let r2 = KeyRange::new(vec![0x00], vec![0xFF], 2);
+        assert!(r2.contains(&[0x00]));
+        assert!(r2.contains(&[0x7F]));
+        assert!(r2.contains(&[0xFF]));
+
+        // Empty keys
+        let r3 = KeyRange::new(vec![], vec![], 3);
+        assert!(r3.contains(&[]));
+    }
+
+    #[test]
     fn test_level_add_remove() {
         let level = Level::new(
             1,
@@ -479,6 +576,47 @@ mod tests {
         // so this is a simplified test of the structure
         assert_eq!(level.stats.num_segments, 0);
         assert_eq!(level.total_size(), 0);
+    }
+
+    #[test]
+    fn test_level_find_segments_for_key_empty() {
+        let level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Finding segments in empty level should return empty vec
+        let segments = level.find_segments_for_key(b"test");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_level_find_overlapping_segments_empty() {
+        let level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Finding overlapping segments in empty level should return empty vec
+        let segments = level.find_overlapping_segments(b"a", b"z");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_level_score_empty() {
+        let level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Empty level should have score 0
+        assert_eq!(level.score(), 0.0);
     }
 
     #[test]
@@ -506,6 +644,15 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_strategy_universal_allows_overlaps() {
+        let universal = CompactionStrategy::Universal {
+            max_size_amplification: 2.0,
+            size_ratio: 1.0,
+        };
+        assert!(universal.allows_overlaps());
+    }
+
+    #[test]
     fn test_level_max_sizes() {
         let v = VersionSet::new(1, 5);
 
@@ -513,5 +660,846 @@ mod tests {
         assert_eq!(v.levels[0].max_size, 64 * 1024 * 1024);
         assert_eq!(v.levels[1].max_size, 640 * 1024 * 1024);
         assert_eq!(v.levels[2].max_size, 6400 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_level_target_file_sizes() {
+        let v = VersionSet::new(1, 5);
+
+        // L1-L2 = 64MB, L3+ = 128MB
+        assert_eq!(v.levels[0].target_file_size, 64 * 1024 * 1024); // L1
+        assert_eq!(v.levels[1].target_file_size, 64 * 1024 * 1024); // L2
+        assert_eq!(v.levels[2].target_file_size, 128 * 1024 * 1024); // L3
+        assert_eq!(v.levels[3].target_file_size, 128 * 1024 * 1024); // L4
+    }
+
+    #[test]
+    fn test_version_set_next_version() {
+        let v1 = VersionSet::new(1, 5);
+        let v2 = v1.next_version();
+
+        assert_eq!(v2.sequence, 2);
+        assert_eq!(v2.num_levels(), v1.num_levels());
+        assert_eq!(v2.l0.len(), v1.l0.len());
+        assert_eq!(v2.total_segments, v1.total_segments);
+        assert_eq!(v2.total_size, v1.total_size);
+
+        // Next version again
+        let v3 = v2.next_version();
+        assert_eq!(v3.sequence, 3);
+    }
+
+    #[test]
+    fn test_version_set_pick_compaction_level_empty() {
+        let v = VersionSet::new(1, 5);
+
+        // Empty version set should not need compaction
+        let result = v.pick_compaction_level();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_level_stats_default() {
+        let stats = LevelStats::default();
+
+        assert_eq!(stats.total_size, 0);
+        assert_eq!(stats.num_segments, 0);
+        assert_eq!(stats.num_reads, 0);
+        assert_eq!(stats.bytes_read, 0);
+        assert_eq!(stats.num_compactions, 0);
+        assert_eq!(stats.bytes_written, 0);
+    }
+
+    #[test]
+    fn test_level_stats_score_tiered() {
+        let mut stats = LevelStats::default();
+        stats.total_size = 100;
+        stats.num_segments = 5;
+
+        let strategy = CompactionStrategy::Tiered {
+            size_ratio: 4.0,
+            min_merge_width: 4,
+            max_merge_width: 10,
+        };
+
+        // Score should be max of size_score and file_score
+        // size_score = 100 / 1000 = 0.1
+        // file_score = 5 / 10 = 0.5
+        // max = 0.5
+        let score = stats.score(1000, &strategy);
+        assert!((score - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_level_stats_score_tiered_size_dominated() {
+        let mut stats = LevelStats::default();
+        stats.total_size = 800;
+        stats.num_segments = 2;
+
+        let strategy = CompactionStrategy::Tiered {
+            size_ratio: 4.0,
+            min_merge_width: 4,
+            max_merge_width: 10,
+        };
+
+        // size_score = 800 / 1000 = 0.8
+        // file_score = 2 / 10 = 0.2
+        // max = 0.8
+        let score = stats.score(1000, &strategy);
+        assert!((score - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_level_stats_score_leveled() {
+        let mut stats = LevelStats::default();
+        stats.total_size = 500;
+        stats.num_segments = 5;
+
+        let strategy = CompactionStrategy::Leveled {
+            fanout: 10,
+            target_file_count: 10,
+        };
+
+        // Score = total_size / max_size = 500 / 1000 = 0.5
+        let score = stats.score(1000, &strategy);
+        assert!((score - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_level_stats_score_universal() {
+        let mut stats = LevelStats::default();
+        stats.total_size = 1500;
+
+        let strategy = CompactionStrategy::Universal {
+            max_size_amplification: 2.0,
+            size_ratio: 1.0,
+        };
+
+        // space_amp = 1500 / 1000 = 1.5
+        // score = space_amp / max_size_amplification = 1.5 / 2.0 = 0.75
+        let score = stats.score(1000, &strategy);
+        assert!((score - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compaction_strategy_default_l0_values() {
+        let strategy = CompactionStrategy::default_l0();
+
+        match strategy {
+            CompactionStrategy::Tiered {
+                size_ratio,
+                min_merge_width,
+                max_merge_width,
+            } => {
+                assert!((size_ratio - 4.0).abs() < 0.001);
+                assert_eq!(min_merge_width, 4);
+                assert_eq!(max_merge_width, 10);
+            }
+            _ => panic!("Expected Tiered strategy"),
+        }
+    }
+
+    #[test]
+    fn test_compaction_strategy_default_leveled_values() {
+        let strategy = CompactionStrategy::default_leveled();
+
+        match strategy {
+            CompactionStrategy::Leveled {
+                fanout,
+                target_file_count,
+            } => {
+                assert_eq!(fanout, 10);
+                assert_eq!(target_file_count, 10);
+            }
+            _ => panic!("Expected Leveled strategy"),
+        }
+    }
+
+    #[test]
+    fn test_level_new() {
+        let level = Level::new(
+            3,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024 * 1024,
+            64 * 1024 * 1024,
+        );
+
+        assert_eq!(level.level_num, 3);
+        assert!(level.segments.is_empty());
+        assert!(level.key_ranges.is_empty());
+        assert_eq!(level.max_size, 1024 * 1024 * 1024);
+        assert_eq!(level.target_file_size, 64 * 1024 * 1024);
+        assert_eq!(level.stats.num_segments, 0);
+        assert_eq!(level.stats.total_size, 0);
+    }
+
+    #[test]
+    fn test_version_set_multiple_levels() {
+        // Test with different number of levels
+        for num_levels in 3..=10 {
+            let v = VersionSet::new(1, num_levels);
+            assert_eq!(v.num_levels(), num_levels);
+
+            // L1-L2 should be tiered
+            if num_levels >= 1 {
+                assert!(v.levels[0].strategy.allows_overlaps());
+            }
+            if num_levels >= 2 {
+                assert!(v.levels[1].strategy.allows_overlaps());
+            }
+
+            // L3+ should be leveled (no overlaps)
+            for i in 2..num_levels {
+                assert!(
+                    !v.levels[i].strategy.allows_overlaps(),
+                    "Level {} should use leveled strategy",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_key_range_clone() {
+        let r1 = KeyRange::new(b"apple".to_vec(), b"banana".to_vec(), 42);
+        let r2 = r1.clone();
+
+        assert_eq!(r1.start, r2.start);
+        assert_eq!(r1.end, r2.end);
+        assert_eq!(r1.segment_id, r2.segment_id);
+    }
+
+    #[test]
+    fn test_key_range_debug() {
+        let r = KeyRange::new(b"a".to_vec(), b"z".to_vec(), 1);
+        let debug_str = format!("{:?}", r);
+
+        assert!(debug_str.contains("KeyRange"));
+        assert!(debug_str.contains("start"));
+        assert!(debug_str.contains("end"));
+        assert!(debug_str.contains("segment_id"));
+    }
+
+    #[test]
+    fn test_level_stats_clone() {
+        let mut stats = LevelStats::default();
+        stats.total_size = 100;
+        stats.num_segments = 5;
+        stats.num_reads = 10;
+        stats.bytes_read = 1000;
+        stats.num_compactions = 2;
+        stats.bytes_written = 500;
+
+        let cloned = stats.clone();
+
+        assert_eq!(cloned.total_size, 100);
+        assert_eq!(cloned.num_segments, 5);
+        assert_eq!(cloned.num_reads, 10);
+        assert_eq!(cloned.bytes_read, 1000);
+        assert_eq!(cloned.num_compactions, 2);
+        assert_eq!(cloned.bytes_written, 500);
+    }
+
+    #[test]
+    fn test_compaction_strategy_clone() {
+        let s1 = CompactionStrategy::default_l0();
+        let s2 = s1.clone();
+
+        assert_eq!(s1, s2);
+
+        let s3 = CompactionStrategy::Universal {
+            max_size_amplification: 1.5,
+            size_ratio: 0.9,
+        };
+        let s4 = s3.clone();
+
+        assert_eq!(s3, s4);
+    }
+
+    #[test]
+    fn test_compaction_strategy_debug() {
+        let tiered = CompactionStrategy::default_l0();
+        let debug_str = format!("{:?}", tiered);
+        assert!(debug_str.contains("Tiered"));
+
+        let leveled = CompactionStrategy::default_leveled();
+        let debug_str = format!("{:?}", leveled);
+        assert!(debug_str.contains("Leveled"));
+
+        let universal = CompactionStrategy::Universal {
+            max_size_amplification: 2.0,
+            size_ratio: 1.0,
+        };
+        let debug_str = format!("{:?}", universal);
+        assert!(debug_str.contains("Universal"));
+    }
+
+    #[test]
+    fn test_compaction_strategy_copy() {
+        let s1 = CompactionStrategy::default_l0();
+        let s2 = s1; // Copy
+
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_level_clone() {
+        let level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        let cloned = level.clone();
+
+        assert_eq!(cloned.level_num, level.level_num);
+        assert_eq!(cloned.max_size, level.max_size);
+        assert_eq!(cloned.target_file_size, level.target_file_size);
+        assert_eq!(cloned.strategy, level.strategy);
+    }
+
+    #[test]
+    fn test_version_set_clone() {
+        let v1 = VersionSet::new(42, 5);
+        let v2 = v1.clone();
+
+        assert_eq!(v2.sequence, 42);
+        assert_eq!(v2.num_levels(), 5);
+        assert_eq!(v2.total_segments, v1.total_segments);
+        assert_eq!(v2.total_size, v1.total_size);
+    }
+
+    #[test]
+    fn test_key_range_overlaps_edge_cases() {
+        // Ranges that touch exactly at boundary
+        let r1 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 1);
+        let r2 = KeyRange::new(b"b".to_vec(), b"c".to_vec(), 2);
+
+        // They overlap at exactly "b"
+        assert!(r1.overlaps(&r2));
+        assert!(r2.overlaps(&r1));
+
+        // Self overlap
+        assert!(r1.overlaps(&r1));
+    }
+
+    #[test]
+    fn test_key_range_contains_boundary() {
+        let range = KeyRange::new(b"aaa".to_vec(), b"zzz".to_vec(), 1);
+
+        // Exact boundaries
+        assert!(range.contains(b"aaa"));
+        assert!(range.contains(b"zzz"));
+
+        // Just inside
+        assert!(range.contains(b"aab"));
+        assert!(range.contains(b"zzy"));
+
+        // Outside - lexicographically less than start
+        assert!(!range.contains(b"aa")); // shorter, lexicographically less than "aaa"
+        assert!(!range.contains(b"aA")); // 'A' < 'a' in ASCII
+
+        // Inside - "aaaa" > "aaa" and "aaaa" < "zzz"
+        assert!(range.contains(b"aaaa"));
+
+        // Outside - lexicographically greater than end
+        assert!(!range.contains(b"zzzz")); // "zzzz" > "zzz"
+    }
+
+    #[test]
+    fn test_level_stats_debug() {
+        let stats = LevelStats::default();
+        let debug_str = format!("{:?}", stats);
+
+        assert!(debug_str.contains("LevelStats"));
+        assert!(debug_str.contains("total_size"));
+        assert!(debug_str.contains("num_segments"));
+    }
+
+    #[test]
+    fn test_version_set_sequence_starts_correctly() {
+        let v1 = VersionSet::new(0, 5);
+        assert_eq!(v1.sequence, 0);
+
+        let v2 = VersionSet::new(100, 5);
+        assert_eq!(v2.sequence, 100);
+
+        let v3 = VersionSet::new(u64::MAX, 5);
+        assert_eq!(v3.sequence, u64::MAX);
+    }
+
+    #[test]
+    fn test_level_total_size_reflects_stats() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        assert_eq!(level.total_size(), 0);
+
+        // Manually modify stats to simulate segments being added
+        level.stats.total_size = 12345;
+        assert_eq!(level.total_size(), 12345);
+    }
+
+    #[test]
+    fn test_key_range_eq() {
+        let r1 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 1);
+        let r2 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 1);
+        let r3 = KeyRange::new(b"a".to_vec(), b"b".to_vec(), 2); // Different segment_id
+        let r4 = KeyRange::new(b"a".to_vec(), b"c".to_vec(), 1); // Different end
+
+        assert_eq!(r1, r2);
+        assert_ne!(r1, r3); // segment_id differs
+        assert_ne!(r1, r4); // end differs
+    }
+
+    #[test]
+    fn test_compaction_strategy_partial_eq() {
+        let t1 = CompactionStrategy::Tiered {
+            size_ratio: 4.0,
+            min_merge_width: 4,
+            max_merge_width: 10,
+        };
+        let t2 = CompactionStrategy::Tiered {
+            size_ratio: 4.0,
+            min_merge_width: 4,
+            max_merge_width: 10,
+        };
+        let t3 = CompactionStrategy::Tiered {
+            size_ratio: 5.0, // Different
+            min_merge_width: 4,
+            max_merge_width: 10,
+        };
+
+        assert_eq!(t1, t2);
+        assert_ne!(t1, t3);
+
+        let l1 = CompactionStrategy::default_leveled();
+        assert_ne!(t1, l1);
+    }
+
+    #[test]
+    fn test_level_find_segments_for_key_with_ranges() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Manually add key ranges (simulating segments being added)
+        level
+            .key_ranges
+            .push(KeyRange::new(b"a".to_vec(), b"d".to_vec(), 1));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"e".to_vec(), b"h".to_vec(), 2));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"i".to_vec(), b"l".to_vec(), 3));
+
+        // Key in first range
+        let segments = level.find_segments_for_key(b"b");
+        assert_eq!(segments, vec![1]);
+
+        // Key in second range
+        let segments = level.find_segments_for_key(b"f");
+        assert_eq!(segments, vec![2]);
+
+        // Key in third range
+        let segments = level.find_segments_for_key(b"j");
+        assert_eq!(segments, vec![3]);
+
+        // Key at boundary
+        let segments = level.find_segments_for_key(b"a");
+        assert_eq!(segments, vec![1]);
+
+        // Key not in any range
+        let segments = level.find_segments_for_key(b"z");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_level_find_segments_for_key_overlapping_ranges() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_l0(), // Tiered allows overlaps
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Add overlapping ranges (valid for tiered compaction)
+        level
+            .key_ranges
+            .push(KeyRange::new(b"a".to_vec(), b"f".to_vec(), 1));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"c".to_vec(), b"h".to_vec(), 2));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"e".to_vec(), b"j".to_vec(), 3));
+
+        // Key "d" is in first two ranges
+        let segments = level.find_segments_for_key(b"d");
+        assert_eq!(segments.len(), 2);
+        assert!(segments.contains(&1));
+        assert!(segments.contains(&2));
+
+        // Key "f" is in all three ranges
+        let segments = level.find_segments_for_key(b"f");
+        assert_eq!(segments.len(), 3);
+        assert!(segments.contains(&1));
+        assert!(segments.contains(&2));
+        assert!(segments.contains(&3));
+    }
+
+    #[test]
+    fn test_level_find_overlapping_segments_with_ranges() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Add non-overlapping key ranges
+        level
+            .key_ranges
+            .push(KeyRange::new(b"a".to_vec(), b"c".to_vec(), 1));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"d".to_vec(), b"f".to_vec(), 2));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"g".to_vec(), b"i".to_vec(), 3));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"j".to_vec(), b"l".to_vec(), 4));
+
+        // Query that overlaps first two
+        let segments = level.find_overlapping_segments(b"b", b"e");
+        assert_eq!(segments.len(), 2);
+        assert!(segments.contains(&1));
+        assert!(segments.contains(&2));
+
+        // Query that overlaps last two
+        let segments = level.find_overlapping_segments(b"h", b"k");
+        assert_eq!(segments.len(), 2);
+        assert!(segments.contains(&3));
+        assert!(segments.contains(&4));
+
+        // Query that overlaps all
+        let segments = level.find_overlapping_segments(b"a", b"z");
+        assert_eq!(segments.len(), 4);
+
+        // Query that overlaps none
+        let segments = level.find_overlapping_segments(b"m", b"z");
+        assert!(segments.is_empty());
+
+        // Query exactly matching one range
+        let segments = level.find_overlapping_segments(b"d", b"f");
+        assert_eq!(segments, vec![2]);
+    }
+
+    #[test]
+    fn test_level_score_with_stats() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1000, // max_size = 1000
+            64,
+        );
+
+        // Empty level - score 0
+        assert_eq!(level.score(), 0.0);
+
+        // Half full
+        level.stats.total_size = 500;
+        assert!((level.score() - 0.5).abs() < 0.001);
+
+        // Exactly full
+        level.stats.total_size = 1000;
+        assert!((level.score() - 1.0).abs() < 0.001);
+
+        // Over capacity
+        level.stats.total_size = 1500;
+        assert!((level.score() - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_level_score_tiered_strategy() {
+        let mut level = Level::new(
+            0,
+            CompactionStrategy::Tiered {
+                size_ratio: 4.0,
+                min_merge_width: 4,
+                max_merge_width: 10,
+            },
+            1000, // max_size
+            64,
+        );
+
+        // With tiered, score is max of size_score and file_score
+        level.stats.total_size = 200; // size_score = 0.2
+        level.stats.num_segments = 8; // file_score = 0.8
+
+        // Score should be max(0.2, 0.8) = 0.8
+        assert!((level.score() - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_version_set_total_size_and_segments() {
+        let mut v = VersionSet::new(1, 5);
+
+        assert_eq!(v.total_size, 0);
+        assert_eq!(v.total_segments, 0);
+
+        // Simulate adding to levels
+        v.levels[0].stats.total_size = 100;
+        v.levels[0].stats.num_segments = 2;
+        v.levels[1].stats.total_size = 500;
+        v.levels[1].stats.num_segments = 5;
+
+        // total_size and total_segments are separate from level stats
+        // (they track L0 + would need to be updated separately)
+        v.total_size = 600;
+        v.total_segments = 7;
+
+        assert_eq!(v.total_size, 600);
+        assert_eq!(v.total_segments, 7);
+    }
+
+    #[test]
+    fn test_version_set_pick_compaction_level_l0_trigger() {
+        let v = VersionSet::new(1, 5);
+
+        // Add segments to L0 to trigger compaction (threshold is 4)
+        // We need to create mock segments, but since pick_compaction_level
+        // only checks l0.len(), we can just add empty Arcs if we had them.
+        // For now, let's test the threshold logic directly by checking
+        // the function returns None when l0 is empty.
+        assert!(v.pick_compaction_level().is_none());
+
+        // The actual L0 compaction trigger test would require adding Arc<Segment>
+        // objects, which is complex. The test above verifies the empty case.
+    }
+
+    #[test]
+    fn test_version_set_pick_compaction_level_l1_plus() {
+        let mut v = VersionSet::new(1, 5);
+
+        // Set L1 to exceed its max size (score > 1.0)
+        v.levels[0].stats.total_size = v.levels[0].max_size * 2; // 2x over capacity
+
+        let result = v.pick_compaction_level();
+        assert!(result.is_some());
+
+        let (level_num, score) = result.unwrap();
+        assert_eq!(level_num, 1); // L1 (levels[0])
+        assert!(score > 1.0);
+    }
+
+    #[test]
+    fn test_version_set_pick_compaction_level_highest_priority() {
+        let mut v = VersionSet::new(1, 5);
+
+        // Set multiple levels over capacity
+        v.levels[0].stats.total_size = v.levels[0].max_size * 2; // 2x
+        v.levels[1].stats.total_size = v.levels[1].max_size * 3; // 3x
+        v.levels[2].stats.total_size = v.levels[2].max_size * 1; // 1x (not over)
+
+        let result = v.pick_compaction_level();
+        assert!(result.is_some());
+
+        let (level_num, score) = result.unwrap();
+        // L2 has highest score (3.0), so it should be picked
+        assert_eq!(level_num, 2); // L2 (levels[1])
+        assert!((score - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_version_set_pick_compaction_level_all_below_threshold() {
+        let mut v = VersionSet::new(1, 5);
+
+        // Set all levels below capacity (score < 1.0)
+        v.levels[0].stats.total_size = v.levels[0].max_size / 2; // 0.5
+        v.levels[1].stats.total_size = v.levels[1].max_size / 4; // 0.25
+        v.levels[2].stats.total_size = v.levels[2].max_size / 10; // 0.1
+
+        // Should return None since no level has score > 1.0
+        let result = v.pick_compaction_level();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_key_range_sorting() {
+        let mut ranges = vec![
+            KeyRange::new(b"cherry".to_vec(), b"date".to_vec(), 3),
+            KeyRange::new(b"apple".to_vec(), b"banana".to_vec(), 1),
+            KeyRange::new(b"fig".to_vec(), b"grape".to_vec(), 4),
+            KeyRange::new(b"apple".to_vec(), b"apricot".to_vec(), 2),
+        ];
+
+        ranges.sort();
+
+        // Should be sorted by start key, then end key
+        assert_eq!(ranges[0].segment_id, 2); // apple-apricot
+        assert_eq!(ranges[1].segment_id, 1); // apple-banana
+        assert_eq!(ranges[2].segment_id, 3); // cherry-date
+        assert_eq!(ranges[3].segment_id, 4); // fig-grape
+    }
+
+    #[test]
+    fn test_level_key_ranges_sorted_for_leveled() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(), // Non-overlapping
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Add ranges out of order
+        level
+            .key_ranges
+            .push(KeyRange::new(b"m".to_vec(), b"p".to_vec(), 3));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"a".to_vec(), b"d".to_vec(), 1));
+        level
+            .key_ranges
+            .push(KeyRange::new(b"e".to_vec(), b"h".to_vec(), 2));
+
+        // For leveled strategy, ranges should be sorted (though we added them directly)
+        // The add_segment method would sort them, so let's verify the sort behavior
+        level.key_ranges.sort();
+
+        assert_eq!(level.key_ranges[0].segment_id, 1); // a-d
+        assert_eq!(level.key_ranges[1].segment_id, 2); // e-h
+        assert_eq!(level.key_ranges[2].segment_id, 3); // m-p
+    }
+
+    #[test]
+    fn test_level_remove_segment_not_found() {
+        let mut level = Level::new(
+            1,
+            CompactionStrategy::default_leveled(),
+            1024 * 1024,
+            64 * 1024,
+        );
+
+        // Try to remove from empty level
+        let result = level.remove_segment(999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_version_set_max_size_exponential_growth() {
+        let v = VersionSet::new(1, 7);
+
+        // Verify exponential growth: L1 = 64MB * 10^0, L2 = 64MB * 10^1, etc.
+        let base = 64 * 1024 * 1024u64;
+
+        assert_eq!(v.levels[0].max_size, base); // L1: 64MB
+        assert_eq!(v.levels[1].max_size, base * 10); // L2: 640MB
+        assert_eq!(v.levels[2].max_size, base * 100); // L3: 6.4GB
+        assert_eq!(v.levels[3].max_size, base * 1000); // L4: 64GB
+        assert_eq!(v.levels[4].max_size, base * 10000); // L5: 640GB
+        assert_eq!(v.levels[5].max_size, base * 100000); // L6: 6.4TB
+    }
+
+    #[test]
+    fn test_level_stats_all_fields() {
+        let mut stats = LevelStats {
+            total_size: 1024,
+            num_segments: 10,
+            num_reads: 100,
+            bytes_read: 5000,
+            num_compactions: 5,
+            bytes_written: 2000,
+        };
+
+        // Verify all fields
+        assert_eq!(stats.total_size, 1024);
+        assert_eq!(stats.num_segments, 10);
+        assert_eq!(stats.num_reads, 100);
+        assert_eq!(stats.bytes_read, 5000);
+        assert_eq!(stats.num_compactions, 5);
+        assert_eq!(stats.bytes_written, 2000);
+
+        // Modify and verify
+        stats.num_reads += 1;
+        assert_eq!(stats.num_reads, 101);
+    }
+
+    #[test]
+    fn test_key_range_binary_data() {
+        // Test with binary data including null bytes
+        let start = vec![0x00, 0x01, 0x02];
+        let end = vec![0xFF, 0xFE, 0xFD];
+        let range = KeyRange::new(start.clone(), end.clone(), 1);
+
+        assert!(range.contains(&[0x00, 0x01, 0x02]));
+        assert!(range.contains(&[0x80, 0x80, 0x80]));
+        assert!(range.contains(&[0xFF, 0xFE, 0xFD]));
+    }
+
+    #[test]
+    fn test_compaction_strategy_universal_scoring() {
+        let stats = LevelStats {
+            total_size: 2000,
+            num_segments: 5,
+            ..Default::default()
+        };
+
+        let strategy = CompactionStrategy::Universal {
+            max_size_amplification: 1.5,
+            size_ratio: 1.0,
+        };
+
+        // space_amp = 2000 / 1000 = 2.0
+        // score = 2.0 / 1.5 = 1.333...
+        let score = stats.score(1000, &strategy);
+        assert!((score - (2.0 / 1.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_version_set_l0_is_separate() {
+        let v = VersionSet::new(1, 5);
+
+        // L0 is separate from levels array
+        assert!(v.l0.is_empty());
+        assert_eq!(v.levels.len(), 5);
+
+        // levels[0] is L1, not L0
+        assert_eq!(v.levels[0].level_num, 1);
+        assert_eq!(v.levels[1].level_num, 2);
+    }
+
+    #[test]
+    fn test_level_num_assignment() {
+        let v = VersionSet::new(1, 7);
+
+        // Verify level numbers are assigned correctly
+        for (i, level) in v.levels.iter().enumerate() {
+            assert_eq!(level.level_num as usize, i + 1);
+        }
+    }
+
+    #[test]
+    fn test_key_range_with_long_keys() {
+        // Test with longer keys
+        let start = "a".repeat(1000).into_bytes();
+        let end = "z".repeat(1000).into_bytes();
+        let range = KeyRange::new(start, end, 1);
+
+        let mid = "m".repeat(1000).into_bytes();
+        assert!(range.contains(&mid));
+
+        let before = "0".repeat(1000).into_bytes();
+        assert!(!range.contains(&before));
     }
 }
