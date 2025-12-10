@@ -33,6 +33,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
+libc = "0.2"
 rand = { version = "0.9", features = ["small_rng"] }
 tempfile = "3.14.0"
 
