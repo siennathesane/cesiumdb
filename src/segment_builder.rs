@@ -146,16 +146,16 @@ impl SegmentBuilder {
         }
 
         // For non-empty segments, validate index bounds
-        if block_count > 0 {
-            if index_start >= key_file_size || index_start + index_size > key_file_size {
-                return Err(SegmentError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Index location out of bounds: start={}, size={}, file_size={}",
-                        index_start, index_size, key_file_size
-                    ),
-                )));
-            }
+        if block_count > 0 &&
+            (index_start >= key_file_size || index_start + index_size > key_file_size)
+        {
+            return Err(SegmentError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Index location out of bounds: start={}, size={}, file_size={}",
+                    index_start, index_size, key_file_size
+                ),
+            )));
         }
 
         // Read and deserialize the index
@@ -164,8 +164,7 @@ impl SegmentBuilder {
             // (index_start=0 for empty segments, so we can't read from there)
             Index::new(key_metadata.id(), 0)
         } else {
-            let key_index_payload =
-                key_mmap[index_start as usize..(index_start + index_size) as usize].as_ref();
+            let key_index_payload = key_mmap[index_start..(index_start + index_size)].as_ref();
 
             if key_index_payload.len() < MIN_INDEX_SIZE {
                 return Err(SegmentError::IoError(std::io::Error::new(
@@ -177,8 +176,9 @@ impl SegmentBuilder {
             Index::from(Bytes::copy_from_slice(key_index_payload))
         };
 
-        // Update the index's num_blocks from the metadata (the index is deserialized with whatever
-        // was saved, but the authoritative block count is in the metadata)
+        // Update the index's num_blocks from the metadata (the index is deserialized
+        // with whatever was saved, but the authoritative block count is in the
+        // metadata)
         key_index.set_num_blocks(key_metadata.block_count() as u64);
 
         // Repeat similar process for value segment
@@ -210,8 +210,8 @@ impl SegmentBuilder {
         let val_mdata_payload = val_mmap[val_metadata_offset..val_file_size].as_ref();
         let val_metadata = Metadata::from(Bytes::copy_from_slice(val_mdata_payload));
 
-        // Value segments no longer have indices - value locations are stored in key metadata
-        // So we skip reading the value index entirely
+        // Value segments no longer have indices - value locations are stored in key
+        // metadata So we skip reading the value index entirely
 
         let key_handle = Arc::new(key_mmap);
         let val_handle = Arc::new(val_mmap);

@@ -3,10 +3,17 @@
 //! This module provides a registry to track which segments are live
 //! and coordinate safe deletion after compaction.
 
-use crate::segment::Segment;
+use std::{
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    sync::Arc,
+};
+
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+
+use crate::segment::Segment;
 
 /// Registry for tracking live segments
 ///
@@ -181,17 +188,18 @@ impl std::fmt::Display for RegistryStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::segment::Segment;
-    use crate::segment_builder::SegmentBuilder;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        segment::Segment,
+        segment_builder::SegmentBuilder,
+    };
 
     fn create_test_segment(id: u64) -> Arc<Segment> {
         let temp_dir = TempDir::new().unwrap();
         let builder = SegmentBuilder::new(temp_dir.path().to_path_buf()).unwrap();
-        builder
-            .new_segment(id, 12345, 64 * 1024 * 1024)
-            .unwrap()
+        builder.new_segment(id, 12345, 64 * 1024 * 1024).unwrap()
     }
 
     #[test]

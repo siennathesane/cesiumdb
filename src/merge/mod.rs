@@ -8,4 +8,9 @@ pub mod basic;
 pub mod zero_copy_merge;
 
 pub use basic::MergeIterator;
-pub use zero_copy_merge::{ZeroCopyMergeIterator, MergeError, MergeStats, MergeSource};
+pub use zero_copy_merge::{
+    MergeError,
+    MergeSource,
+    MergeStats,
+    ZeroCopyMergeIterator,
+};

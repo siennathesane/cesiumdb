@@ -1,11 +1,20 @@
 //! Subcompaction - range splitting for parallel execution
 //!
 //! Splits large compaction jobs into smaller range-based sub-jobs that can
-//! be executed in parallel, dramatically improving throughput for large compactions.
+//! be executed in parallel, dramatically improving throughput for large
+//! compactions.
 
-use crate::compaction::job::{CompactionInput, CompactionJob, CompactionJobType, CompactionOutput};
-use crate::levels::KeyRange;
 use std::cmp::min;
+
+use crate::{
+    compaction::job::{
+        CompactionInput,
+        CompactionJob,
+        CompactionJobType,
+        CompactionOutput,
+    },
+    levels::KeyRange,
+};
 
 /// Configuration for subcompaction
 #[derive(Debug, Clone, Copy)]
@@ -26,7 +35,7 @@ pub struct SubcompactionConfig {
 impl Default for SubcompactionConfig {
     fn default() -> Self {
         Self {
-            min_size_for_split: 64 * 1024 * 1024,  // 64MB
+            min_size_for_split: 64 * 1024 * 1024, // 64MB
             target_subcompactions: 4,
             min_subcompaction_size: 16 * 1024 * 1024, // 16MB
             max_subcompactions: 8,
@@ -85,9 +94,8 @@ impl SubcompactionPlanner {
         }
 
         // Check total size
-        let total_size = job.input.total_size
-            + job
-                .next_level_input
+        let total_size = job.input.total_size +
+            job.next_level_input
                 .as_ref()
                 .map(|i| i.total_size)
                 .unwrap_or(0);
@@ -97,16 +105,16 @@ impl SubcompactionPlanner {
 
     /// Splits a compaction job into sub-jobs based on key ranges
     ///
-    /// Returns a vector of subjobs if splitting is beneficial, otherwise returns None.
+    /// Returns a vector of subjobs if splitting is beneficial, otherwise
+    /// returns None.
     pub fn split(&self, job: &CompactionJob) -> Option<Vec<SubcompactionJob>> {
         if !self.should_split(job) {
             return None;
         }
 
         // Calculate total size
-        let total_size = job.input.total_size
-            + job
-                .next_level_input
+        let total_size = job.input.total_size +
+            job.next_level_input
                 .as_ref()
                 .map(|i| i.total_size)
                 .unwrap_or(0);
@@ -214,7 +222,11 @@ impl SubcompactionPlanner {
         let mut result = Vec::with_capacity(len);
 
         for i in 0..len {
-            let start_byte = if i < start.len() { start[i] as f64 } else { 0.0 };
+            let start_byte = if i < start.len() {
+                start[i] as f64
+            } else {
+                0.0
+            };
             let end_byte = if i < end.len() { end[i] as f64 } else { 255.0 };
 
             let interpolated = start_byte + (end_byte - start_byte) * ratio;

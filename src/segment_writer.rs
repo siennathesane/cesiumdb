@@ -26,6 +26,7 @@ use parking_lot::{
     Mutex,
 };
 use tracing::instrument;
+
 use crate::{
     block::{
         BLOCK_SIZE,
@@ -200,7 +201,7 @@ impl SegmentWriter {
         let index_start = *current_offset;
         let index_end = *current_offset + index.size();
 
-        let index_bytes = Bytes::from(index.clone());
+        let index_bytes = Bytes::from(index);
         let index_size = index_bytes.len();
 
         if index_size == 0 || index_size < 56 {

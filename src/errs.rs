@@ -133,7 +133,10 @@ mod tests {
     #[test]
     fn test_memtable_error_display() {
         let err = MemtableError::DataExceedsMaximum;
-        assert_eq!(err.to_string(), "data insertion would exceed maximum capacity");
+        assert_eq!(
+            err.to_string(),
+            "data insertion would exceed maximum capacity"
+        );
 
         let err = MemtableError::MemtableIsFrozen;
         assert_eq!(err.to_string(), "memtable is frozen");
@@ -184,7 +187,10 @@ mod tests {
         assert_eq!(err.to_string(), "corrupted block");
 
         let err = SegmentError::Closing;
-        assert_eq!(err.to_string(), "segment is closing, no more blocks can be written");
+        assert_eq!(
+            err.to_string(),
+            "segment is closing, no more blocks can be written"
+        );
 
         let err = SegmentError::NotClosing;
         assert_eq!(err.to_string(), "segment is not closing");
@@ -206,7 +212,11 @@ mod tests {
     fn test_fs_error_display() {
         let err = FsError::InvalidHeaderFormat("bad header".to_string());
         let err_str = err.to_string();
-        assert!(err_str.contains("invalid header format"), "Error string: {}", err_str);
+        assert!(
+            err_str.contains("invalid header format"),
+            "Error string: {}",
+            err_str
+        );
         // Note: The error format doesn't include the string parameter in display
 
         let err = FsError::NoContiguousSpace;
@@ -353,7 +363,10 @@ mod tests {
         let block_err = BlockError::BlockFull;
         let cesium_err = CesiumError::BlockError(block_err);
 
-        assert!(matches!(cesium_err, CesiumError::BlockError(BlockError::BlockFull)));
+        assert!(matches!(
+            cesium_err,
+            CesiumError::BlockError(BlockError::BlockFull)
+        ));
     }
 
     #[test]

@@ -109,12 +109,9 @@ impl Block {
     /// - Caller must ensure exclusive access to the dst memory region
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
         // SAFETY: Verify alignment invariants in debug builds
+        debug_assert!(!dst.is_null(), "Destination pointer must not be null");
         debug_assert!(
-            !dst.is_null(),
-            "Destination pointer must not be null"
-        );
-        debug_assert!(
-            dst as usize % std::mem::align_of::<u16>() == 0,
+            (dst as usize).is_multiple_of(std::mem::align_of::<u16>()),
             "Destination pointer must be 2-byte aligned for u16 writes"
         );
 
@@ -190,7 +187,7 @@ impl Block {
 
     /// Returns an iterator over the entries in the block.
     #[inline]
-    pub fn iter(&self) -> BlockIterator {
+    pub fn iter(&self) -> BlockIterator<'_> {
         BlockIterator {
             entries: self.entries.as_ref(),
             offsets: self.offsets.as_ref(),

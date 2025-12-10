@@ -5,18 +5,33 @@
 //! - Writing output segments
 //! - Updating the version set
 
-use crate::compaction::job::{CompactionJob, CompactionJobType};
-use crate::compact::compact;
-use crate::errs::SegmentError;
-use crate::levels::{KeyRange, VersionSet};
-use crate::memtable::Memtable;
-use crate::segment::Segment;
-use crate::segment_reader::SegmentReader;
-use crate::version::VersionManager;
-use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    ops::Bound,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::Arc,
+};
+
 use thiserror::Error;
+
+use crate::{
+    compact::compact,
+    compaction::job::{
+        CompactionJob,
+        CompactionJobType,
+    },
+    errs::SegmentError,
+    levels::{
+        KeyRange,
+        VersionSet,
+    },
+    memtable::Memtable,
+    segment::Segment,
+    segment_reader::SegmentReader,
+    version::VersionManager,
+};
 
 /// Compaction executor errors
 #[derive(Error, Debug)]
@@ -91,15 +106,24 @@ impl CompactionExecutor {
 
         // Execute based on job type
         let result = match job.job_type {
-            CompactionJobType::TrivialMove => self.execute_trivial_move(job)?,
-            CompactionJobType::Flush => {
+            | CompactionJobType::TrivialMove => match self.execute_trivial_move(job) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            },
+            | CompactionJobType::Flush => {
                 // TODO: Flush requires memtable access
                 return Err(ExecutorError::InvalidJobType(job.job_type));
-            }
-            CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction => {
-                self.execute_merge_compaction(job)?
-            }
-            CompactionJobType::Manual => self.execute_merge_compaction(job)?,
+            },
+            | CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction => {
+                match self.execute_merge_compaction(job) {
+                    | Ok(v) => v,
+                    | Err(e) => return Err(e),
+                }
+            },
+            | CompactionJobType::Manual => match self.execute_merge_compaction(job) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            },
         };
 
         // Verify version hasn't changed
@@ -108,7 +132,10 @@ impl CompactionExecutor {
         }
 
         // Update version set
-        self.install_compaction_result(job, &result)?;
+        match self.install_compaction_result(job, &result) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
 
         Ok(result)
     }
@@ -137,7 +164,10 @@ impl CompactionExecutor {
     }
 
     /// Executes a merge compaction (L0→L1 or Ln→Ln+1)
-    fn execute_merge_compaction(&self, job: &CompactionJob) -> Result<CompactionResult, ExecutorError> {
+    fn execute_merge_compaction(
+        &self,
+        job: &CompactionJob,
+    ) -> Result<CompactionResult, ExecutorError> {
         if job.input.segments.is_empty() {
             return Err(ExecutorError::NoInputSegments);
         }
@@ -150,10 +180,14 @@ impl CompactionExecutor {
 
         // Create readers and iterators for all input segments
         // We need to keep readers alive for the duration of iteration
-        let readers: Vec<_> = all_inputs
+        let readers: Vec<_> = match all_inputs
             .iter()
             .map(|seg| seg.reader())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            | Ok(v) => v,
+            | Err(e) => return Err(e.into()),
+        };
 
         let iterators: Vec<_> = readers
             .iter()
@@ -169,7 +203,10 @@ impl CompactionExecutor {
         let segment_id = job.id; // Use job ID as segment ID for now
 
         // Run the compaction
-        let output_segment = compact(iterators, output_dir, segment_id)?;
+        let output_segment = match compact(iterators, output_dir, segment_id) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e.into()),
+        };
 
         // TODO: Track statistics
         let bytes_read = job.total_input_size();
@@ -200,11 +237,13 @@ impl CompactionExecutor {
         self.version_manager.update(|version| {
             // Remove input segments
             match job.job_type {
-                CompactionJobType::L0Compaction => {
+                | CompactionJobType::L0Compaction => {
                     // Remove from L0
-                    version.l0.retain(|s| !result.inputs_to_delete.contains(&s.id()));
-                }
-                CompactionJobType::LevelCompaction | CompactionJobType::TrivialMove => {
+                    version
+                        .l0
+                        .retain(|s| !result.inputs_to_delete.contains(&s.id()));
+                },
+                | CompactionJobType::LevelCompaction | CompactionJobType::TrivialMove => {
                     // Remove from source level
                     let level_idx = job.input.level as usize - 1;
                     if level_idx < version.levels.len() {
@@ -222,8 +261,8 @@ impl CompactionExecutor {
                             }
                         }
                     }
-                }
-                _ => {}
+                },
+                | _ => {},
             }
 
             // Add output segments to target level
@@ -241,7 +280,8 @@ impl CompactionExecutor {
                         .iter()
                         .zip(result.output_ranges.iter())
                     {
-                        version.levels[output_level_idx].add_segment(segment.clone(), range.clone());
+                        version.levels[output_level_idx]
+                            .add_segment(segment.clone(), range.clone());
                     }
                 }
             }
@@ -258,10 +298,13 @@ impl CompactionExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::levels::VersionSet;
-    use crate::version::VersionManager;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        levels::VersionSet,
+        version::VersionManager,
+    };
 
     #[test]
     fn test_executor_creation() {
@@ -274,7 +317,10 @@ mod tests {
 
     #[test]
     fn test_trivial_move_no_inputs() {
-        use crate::compaction::job::{CompactionInput, CompactionOutput};
+        use crate::compaction::job::{
+            CompactionInput,
+            CompactionOutput,
+        };
 
         let temp_dir = TempDir::new().unwrap();
         let vm = Arc::new(VersionManager::new(7));

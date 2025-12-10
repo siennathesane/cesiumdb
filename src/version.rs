@@ -17,10 +17,17 @@
 //! - No blocking between readers and writers
 //! - Automatic cleanup of old versions via Arc drop
 
-use crate::levels::VersionSet;
+use std::sync::{
+    Arc,
+    atomic::{
+        AtomicU64,
+        Ordering,
+    },
+};
+
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+
+use crate::levels::VersionSet;
 
 /// Version manager providing atomic version set updates
 ///
@@ -67,7 +74,8 @@ impl VersionManager {
     /// Gets a snapshot of the current version
     ///
     /// This is lock-free for readers after the initial lock acquisition.
-    /// The returned Arc keeps the version alive even if a new version is installed.
+    /// The returned Arc keeps the version alive even if a new version is
+    /// installed.
     ///
     /// # Performance
     ///
@@ -124,8 +132,7 @@ impl VersionManager {
     /// ```
     pub fn update<F>(&self, f: F) -> Arc<VersionSet>
     where
-        F: FnOnce(&mut VersionSet),
-    {
+        F: FnOnce(&mut VersionSet), {
         // Get current version under read lock
         let current = self.current();
 
@@ -228,20 +235,13 @@ pub enum VersionEdit {
     },
 
     /// A segment was removed from a specific level
-    RemoveSegment {
-        level: u8,
-        segment_id: u64,
-    },
+    RemoveSegment { level: u8, segment_id: u64 },
 
     /// A segment was removed from L0
-    RemoveL0Segment {
-        segment_id: u64,
-    },
+    RemoveL0Segment { segment_id: u64 },
 
     /// The sequence number was updated
-    UpdateSequence {
-        sequence: u64,
-    },
+    UpdateSequence { sequence: u64 },
 }
 
 impl VersionEdit {
@@ -252,25 +252,25 @@ impl VersionEdit {
         // TODO: Implement edit application
         // This will be needed when we implement the manifest WAL
         match self {
-            VersionEdit::AddL0Segment { .. } => {
+            | VersionEdit::AddL0Segment { .. } => {
                 // version.add_to_l0(segment)
                 todo!("Implement edit application when manifest is ready")
-            }
-            VersionEdit::AddSegment { .. } => {
+            },
+            | VersionEdit::AddSegment { .. } => {
                 // version.levels[level].add_segment(segment, key_range)
                 todo!("Implement edit application when manifest is ready")
-            }
-            VersionEdit::RemoveSegment { .. } => {
+            },
+            | VersionEdit::RemoveSegment { .. } => {
                 // version.levels[level].remove_segment(segment_id)
                 todo!("Implement edit application when manifest is ready")
-            }
-            VersionEdit::RemoveL0Segment { .. } => {
+            },
+            | VersionEdit::RemoveL0Segment { .. } => {
                 // version.remove_from_l0(segment_id)
                 todo!("Implement edit application when manifest is ready")
-            }
-            VersionEdit::UpdateSequence { sequence } => {
+            },
+            | VersionEdit::UpdateSequence { sequence } => {
                 _version.sequence = *sequence;
-            }
+            },
         }
     }
 }

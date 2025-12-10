@@ -3,26 +3,42 @@
 //! This module provides parallel reading capabilities for segments,
 //! allowing multiple blocks/ranges to be read concurrently.
 
-use crate::block::{Block, BLOCK_SIZE};
-use crate::io::buffer_pool::{BufferPool, PooledBuffer};
-use crate::segment::BlockType;
-use crate::segment_reader::SegmentReader;
-use crate::utils::Deserializer;
+use std::{
+    sync::Arc,
+    thread,
+};
+
 use bytes::BytesMut;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use std::sync::Arc;
-use std::thread;
+use crossbeam_channel::{
+    Receiver,
+    Sender,
+    bounded,
+};
+
+use crate::{
+    block::{
+        BLOCK_SIZE,
+        Block,
+    },
+    io::buffer_pool::{
+        BufferPool,
+        PooledBuffer,
+    },
+    segment::BlockType,
+    segment_reader::SegmentReader,
+    utils::Deserializer,
+};
 
 /// Result of a parallel read operation
-pub struct ReadResult {
+pub(crate) struct ReadResult {
     /// Block index that was read
-    pub block_index: usize,
+    pub(crate) block_index: usize,
 
     /// The deserialized block
-    pub block: Block,
+    pub(crate) block: Block,
 
     /// Type of block (Key or Value)
-    pub block_type: BlockType,
+    pub(crate) block_type: BlockType,
 }
 
 /// Configuration for parallel reading
@@ -151,8 +167,8 @@ impl ParallelReader {
 
             // Choose which handle to read from based on block type
             let handle = match task.block_type {
-                BlockType::Key => task.reader.key_handle(),
-                BlockType::Value => task.reader.val_handle(),
+                | BlockType::Key => task.reader.key_handle(),
+                | BlockType::Value => task.reader.val_handle(),
             };
 
             // Check bounds
@@ -203,14 +219,14 @@ impl ParallelReader {
     /// Tries to receive a completed read result
     ///
     /// Returns None if no results are available.
-    pub fn try_recv(&self) -> Option<ReadResult> {
+    pub(crate) fn try_recv(&self) -> Option<ReadResult> {
         self.result_receiver.try_recv().ok()
     }
 
     /// Receives a completed read result (blocking)
     ///
     /// Returns None if all reader threads have exited.
-    pub fn recv(&self) -> Option<ReadResult> {
+    pub(crate) fn recv(&self) -> Option<ReadResult> {
         self.result_receiver.recv().ok()
     }
 
@@ -260,9 +276,10 @@ impl Drop for ParallelReader {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::segment_builder::SegmentBuilder;
-    use tempfile::TempDir;
 
     fn create_test_reader() -> Arc<SegmentReader> {
         let temp_dir = TempDir::new().unwrap();

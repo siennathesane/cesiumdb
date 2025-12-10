@@ -1,9 +1,19 @@
 //! Workload statistics collection and analysis
 //!
-//! Tracks database workload patterns to enable adaptive compaction strategy selection.
+//! Tracks database workload patterns to enable adaptive compaction strategy
+//! selection.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{
+        AtomicU64,
+        AtomicUsize,
+        Ordering,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
+};
 
 /// Workload pattern classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +38,11 @@ impl WorkloadPattern {
     /// Recommends a compaction strategy for this workload pattern
     pub fn recommended_strategy(&self) -> &'static str {
         match self {
-            Self::WriteHeavy => "Leveled", // Minimize write amplification
-            Self::ReadHeavy => "Tiered",   // Minimize read amplification
-            Self::Balanced => "Hybrid",     // Balance both
-            Self::ScanHeavy => "Leveled",   // Non-overlapping ranges help scans
-            Self::PointLookup => "Tiered",  // Bloom filters help point lookups
+            | Self::WriteHeavy => "Leveled", // Minimize write amplification
+            | Self::ReadHeavy => "Tiered",   // Minimize read amplification
+            | Self::Balanced => "Hybrid",    // Balance both
+            | Self::ScanHeavy => "Leveled",  // Non-overlapping ranges help scans
+            | Self::PointLookup => "Tiered", // Bloom filters help point lookups
         }
     }
 }
@@ -106,7 +116,8 @@ impl WorkloadStats {
     /// Records a Put operation
     pub fn record_put(&self, bytes_written: u64) {
         self.puts.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(bytes_written, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(bytes_written, Ordering::Relaxed);
     }
 
     /// Records a Delete operation
@@ -133,8 +144,10 @@ impl WorkloadStats {
 
     /// Records compaction I/O
     pub fn record_compaction(&self, bytes_read: u64, bytes_written: u64) {
-        self.compaction_bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
-        self.compaction_bytes_written.fetch_add(bytes_written, Ordering::Relaxed);
+        self.compaction_bytes_read
+            .fetch_add(bytes_read, Ordering::Relaxed);
+        self.compaction_bytes_written
+            .fetch_add(bytes_written, Ordering::Relaxed);
         self.compactions_completed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -527,10 +540,16 @@ mod tests {
 
     #[test]
     fn test_pattern_recommendations() {
-        assert_eq!(WorkloadPattern::WriteHeavy.recommended_strategy(), "Leveled");
+        assert_eq!(
+            WorkloadPattern::WriteHeavy.recommended_strategy(),
+            "Leveled"
+        );
         assert_eq!(WorkloadPattern::ReadHeavy.recommended_strategy(), "Tiered");
         assert_eq!(WorkloadPattern::Balanced.recommended_strategy(), "Hybrid");
         assert_eq!(WorkloadPattern::ScanHeavy.recommended_strategy(), "Leveled");
-        assert_eq!(WorkloadPattern::PointLookup.recommended_strategy(), "Tiered");
+        assert_eq!(
+            WorkloadPattern::PointLookup.recommended_strategy(),
+            "Tiered"
+        );
     }
 }
