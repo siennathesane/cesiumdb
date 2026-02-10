@@ -43,7 +43,7 @@ pub struct CompactOutput {
     pub entry_count: u64,
 }
 
-#[instrument(level = "info", skip(iterators))]
+#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
 pub fn compact<I>(
     iterators: Vec<I>,
     output_path: PathBuf,
@@ -205,7 +205,7 @@ where
 /// bytes) to eliminate the deserialize → re-serialize round-trip. This reduces
 /// per-entry heap allocations from 5 to 0 (only 2 total allocations for min/max
 /// key tracking).
-#[instrument(level = "info", skip(iterators))]
+#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
 pub(crate) fn compact_raw<I>(
     iterators: Vec<I>,
     output_path: PathBuf,
@@ -369,7 +369,7 @@ where
 /// memtable.freeze();
 /// let segment = flush_memtable(Arc::new(memtable), path, 1)?;
 /// ```
-#[instrument(level = "info", skip(memtable))]
+#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
 pub fn flush_memtable(
     memtable: Arc<Memtable>,
     output_path: PathBuf,

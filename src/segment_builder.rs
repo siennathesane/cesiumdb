@@ -32,10 +32,12 @@ pub(crate) struct SegmentBuilder {
 }
 
 impl SegmentBuilder {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new(path: PathBuf) -> Result<SegmentBuilder, SegmentError> {
         Ok(Self { root: path })
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new_segment(
         &self,
         id: u64,
@@ -85,6 +87,7 @@ impl SegmentBuilder {
         Ok(segment)
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn open(&self, id: u64) -> Result<Arc<Segment>, SegmentError> {
         let key_segment_id = id;
         let val_segment_id = id + 1;

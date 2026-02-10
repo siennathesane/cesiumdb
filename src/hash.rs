@@ -14,6 +14,7 @@ pub(crate) struct SeedableHasher {
 }
 
 impl SeedableHasher {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new(seed: i64) -> Self {
         Self {
             seed,

@@ -326,6 +326,12 @@ pub struct VersionSet {
     /// in reverse chronological order (newest first).
     pub l0: Vec<Arc<Segment>>,
 
+    /// Key ranges for L0 segments (parallel to l0)
+    ///
+    /// Each entry corresponds to the key range of the segment at the same
+    /// index in the l0 vector. This parallel array is kept in sync with l0.
+    pub l0_key_ranges: Vec<KeyRange>,
+
     /// L1+ levels (key ranges depend on strategy)
     ///
     /// The number of levels grows dynamically based on data size.
@@ -367,6 +373,7 @@ impl VersionSet {
         Self {
             sequence,
             l0: Vec::new(),
+            l0_key_ranges: Vec::new(),
             levels,
             total_segments: 0,
             total_size: 0,
@@ -418,11 +425,27 @@ impl VersionSet {
         }
     }
 
-    /// Adds a segment to L0
-    pub fn add_to_l0(&mut self, segment: Arc<Segment>) {
+    /// Adds a segment to L0 with its key range
+    pub fn add_to_l0(&mut self, segment: Arc<Segment>, key_range: KeyRange) {
         self.total_size += segment.size_in_bytes();
         self.total_segments += 1;
         self.l0.push(segment);
+        self.l0_key_ranges.push(key_range);
+    }
+
+    /// Removes a segment from L0 by ID
+    ///
+    /// Returns the removed segment if found, keeping the parallel key_ranges array in sync.
+    pub fn remove_from_l0(&mut self, segment_id: u64) -> Option<Arc<Segment>> {
+        if let Some(idx) = self.l0.iter().position(|s| s.id() == segment_id) {
+            let segment = self.l0.remove(idx);
+            self.l0_key_ranges.remove(idx);
+            self.total_size -= segment.size_in_bytes();
+            self.total_segments -= 1;
+            Some(segment)
+        } else {
+            None
+        }
     }
 
     /// Finds the level with the highest compaction score

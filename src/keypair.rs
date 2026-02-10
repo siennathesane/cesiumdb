@@ -53,34 +53,42 @@ pub struct Key<T: AsRef<[u8]>> {
 pub type KeyBytes = Key<Bytes>;
 
 impl Key<Bytes> {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new(ns: u64, key: Bytes, ts: u128) -> Self {
         Key { ns, key, ts }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn set_key(&mut self, val: Bytes) {
         self.key = val;
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn key(&self) -> &Bytes {
         &self.key
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn key_len(&self) -> usize {
         self.key.as_ref().len()
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn raw_len(&self) -> usize {
         self.key.as_ref().len() + size_of::<u64>() + size_of::<u128>()
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn is_empty(&self) -> bool {
         self.key.as_ref().is_empty()
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn set_ts(&mut self, ts: u128) {
         self.ts = ts;
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn ts(&self) -> u128 {
         self.ts
     }
@@ -90,14 +98,17 @@ impl Key<Bytes> {
         self.ts == 0
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn set_ns(&mut self, ns: u64) {
         self.ns = ns;
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn ns(&self) -> u64 {
         self.ns
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn as_bytes(&self) -> Bytes {
         self.key.clone()
     }
@@ -112,7 +123,8 @@ impl Key<Bytes> {
 
         bytes.put_u64_le(self.ns);
         bytes.put_slice(self.key.as_ref());
-        bytes.put_u128_le(u128::MAX); // "latest" marker
+        // IMPORTANT: Use big-endian so lexicographic byte comparison gives correct ordering
+        bytes.put_u128(u128::MAX); // "latest" marker
 
         bytes.freeze()
     }
@@ -128,7 +140,8 @@ impl Serializer for Key<Bytes> {
         // this is the serialized key
         bytes.put_u64_le(self.ns);
         bytes.put_slice(self.key.as_ref());
-        bytes.put_u128_le(u128::MAX - self.ts);
+        // IMPORTANT: Use big-endian so lexicographic byte comparison gives correct ordering
+        bytes.put_u128(u128::MAX - self.ts);
 
         bytes.freeze()
     }
@@ -147,7 +160,8 @@ impl Deserializer for Key<Bytes> {
         KeyBytes {
             ns: u64::from_le_bytes(ns_arr),
             key: Bytes::copy_from_slice(&slice[8..slice.len() - 16]),
-            ts: u128::MAX - u128::from_le_bytes(ts_arr),
+            // IMPORTANT: Use big-endian to match serialization
+            ts: u128::MAX - u128::from_be_bytes(ts_arr),
         }
     }
 }
@@ -257,7 +271,8 @@ impl From<Bytes> for Key<Bytes> {
         Key {
             ns: u64::from_le_bytes(ns_arr),
             key: Bytes::copy_from_slice(&val[16..val.len() - 8]),
-            ts: u128::MAX - u128::from_le_bytes(ts_arr),
+            // IMPORTANT: Use big-endian to match serialization
+            ts: u128::MAX - u128::from_be_bytes(ts_arr),
         }
     }
 }
@@ -272,6 +287,7 @@ pub struct Value<T: AsRef<[u8]>> {
 pub type ValueBytes = Value<Bytes>;
 
 impl ValueBytes {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new(ns: u64, val: Bytes) -> Self {
         ValueBytes {
             ns,
@@ -280,6 +296,7 @@ impl ValueBytes {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new_tombstone(ns: u64) -> Self {
         ValueBytes {
             ns,
@@ -288,18 +305,22 @@ impl ValueBytes {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn is_tombstone(&self) -> bool {
         self.tombstone
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn set_ns(&mut self, ns: u64) {
         self.ns = ns
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn ns(&self) -> u64 {
         self.ns
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn from_slice(ns: u64, slice: &[u8]) -> Self {
         ValueBytes {
             ns,
@@ -336,6 +357,7 @@ impl ValueBytes {
         buf.freeze()
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn as_bytes(&self) -> Bytes {
         self.value.clone()
     }

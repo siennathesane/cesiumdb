@@ -273,7 +273,7 @@ mod tests {
         };
         let output = CompactionOutput::new(1, 64 * 1024 * 1024);
 
-        CompactionJob::new(1, CompactionJobType::Flush, input, None, output)
+        CompactionJob::new(1, CompactionJobType::Flush, input, None, output, vec![1])
     }
 
     #[test]

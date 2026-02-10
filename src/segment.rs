@@ -98,6 +98,7 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new(id: u64, block_count: u64, index_size: u64, index_start: u64) -> Self {
         Self {
             id,
@@ -107,6 +108,7 @@ impl Metadata {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn serialized_size(&self) -> usize {
         // 4 fields, each is a u64 (8 bytes)
         4 * size_of::<u64>()
@@ -167,18 +169,22 @@ impl Metadata {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn block_count(&self) -> usize {
         self.block_count as usize
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn index_size(&self) -> usize {
         self.index_size as usize
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn index_start(&self) -> usize {
         self.index_start as usize
     }
@@ -320,6 +326,7 @@ impl Segment {
         self.key_writer.lock().is_none()
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn write(&self, key: &[u8], val: &[u8]) -> Result<(), SegmentError> {
         use crate::errs::BlockError;
 
@@ -369,6 +376,7 @@ impl Segment {
         Ok(())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new_reader(&self) -> Result<SegmentReader, SegmentError> {
         let km: Arc<Map> = match &self.key_handle {
             | Some(handle) => handle.clone(),
@@ -538,6 +546,7 @@ impl Segment {
         Ok(())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn flush(&self) -> Result<(), SegmentError> {
         if self.key_writer.lock().is_none() {
             return Err(ReadOnly);
@@ -737,6 +746,7 @@ impl Segment {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn close(&self) -> Result<(), SegmentError> {
         if self.key_writer.lock().is_none() {
             return Err(ReadOnly);

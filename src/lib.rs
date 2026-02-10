@@ -52,6 +52,7 @@ use crate::{
         DbStorageBuilder,
         DbStorageState,
     },
+    utils::Serializer,
 };
 
 #[cfg(feature = "benchmarks")]
@@ -109,28 +110,32 @@ pub mod version;
 struct OwnedSegmentIterator {
     reader: segment_reader::SegmentReader,
     // We'll iterate lazily by calling reader.scan() on demand
+    // Store serialized KeyBytes bounds (with namespace + timestamp)
     lower: std::ops::Bound<Bytes>,
     upper: std::ops::Bound<Bytes>,
     inner: Option<segment_iterator::SegmentScanIterator<'static>>,
 }
 
 impl OwnedSegmentIterator {
+    /// Create a new owned segment iterator.
+    ///
+    /// Takes KeyBytes bounds (already serialized with namespace + timestamp).
     fn new(
         reader: segment_reader::SegmentReader,
-        lower: std::ops::Bound<&[u8]>,
-        upper: std::ops::Bound<&[u8]>,
+        lower: std::ops::Bound<KeyBytes>,
+        upper: std::ops::Bound<KeyBytes>,
     ) -> Self {
         use std::ops::Bound;
 
-        // Convert bounds to owned Bytes
+        // Serialize KeyBytes bounds to raw bytes
         let lower_bound = match lower {
-            | Bound::Included(b) => Bound::Included(Bytes::copy_from_slice(b)),
-            | Bound::Excluded(b) => Bound::Excluded(Bytes::copy_from_slice(b)),
+            | Bound::Included(k) => Bound::Included(k.serialize()),
+            | Bound::Excluded(k) => Bound::Excluded(k.serialize()),
             | Bound::Unbounded => Bound::Unbounded,
         };
         let upper_bound = match upper {
-            | Bound::Included(b) => Bound::Included(Bytes::copy_from_slice(b)),
-            | Bound::Excluded(b) => Bound::Excluded(Bytes::copy_from_slice(b)),
+            | Bound::Included(k) => Bound::Included(k.serialize()),
+            | Bound::Excluded(k) => Bound::Excluded(k.serialize()),
             | Bound::Unbounded => Bound::Unbounded,
         };
 
@@ -690,32 +695,38 @@ impl DbInner {
 
         // Convert bounds to KeyBytes format (with namespace and timestamp)
         // For namespace isolation, we need to ensure we only scan within the given namespace
+        //
+        // IMPORTANT: KeyBytes serializes timestamps as `u128::MAX - ts`, so:
+        // - ts=0 (newest) serializes to MAX (sorts LAST in byte order)
+        // - ts=MAX (oldest) serializes to 0 (sorts FIRST in byte order)
+        // Therefore, to scan forward seeing newest versions first, we need ts=MAX in lower bound.
         let lower_key = match lower {
             | Bound::Included(k) => {
+                // Start with oldest version (ts=MAX serializes to 0, sorts first)
                 Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
             },
             | Bound::Excluded(k) => {
+                // Exclude oldest version
                 Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
             },
             | Bound::Unbounded => {
-                // Start from the beginning of this namespace with empty key and max timestamp
+                // Start from the beginning of this namespace
                 Bound::Included(KeyBytes::new(ns, Bytes::new(), u128::MAX))
             },
         };
 
         let upper_key = match upper {
             | Bound::Included(k) => {
-                // Include all versions: use lowest timestamp (0)
+                // Include newest version (ts=0 serializes to MAX, sorts last)
                 Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), 0))
             },
             | Bound::Excluded(k) => {
-                // Exclude all versions: use highest timestamp (u128::MAX)
+                // Exclude all versions (ts=MAX serializes to 0, sorts first, so excluded bound excludes all)
                 Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
             },
             | Bound::Unbounded => {
                 // End at the last possible key in this namespace
-                // Since keys are ordered by (ns, key, Reverse(ts)), we need to exclude (ns+1, "", MAX)
-                // to stop before the next namespace
+                // Use next namespace's first key as excluded upper bound
                 Bound::Excluded(KeyBytes::new(ns + 1, Bytes::new(), u128::MAX))
             },
         };
@@ -744,10 +755,10 @@ impl DbInner {
             let guard = self.state.lock();
             let version = guard.version_manager.current();
 
-            // Add L0 segments (can overlap, so all must be scanned)
+    // Add L0 segments (can overlap, so all must be scanned)
             for segment in &version.l0 {
                 if let Ok(reader) = segment.reader() {
-                    let owned_iter = OwnedSegmentIterator::new(reader, lower, upper);
+                    let owned_iter = OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
                     iters.push(Box::new(owned_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
                 }
             }
@@ -756,7 +767,7 @@ impl DbInner {
             for level in &version.levels {
                 for segment in &level.segments {
                     if let Ok(reader) = segment.reader() {
-                        let owned_iter = OwnedSegmentIterator::new(reader, lower, upper);
+                        let owned_iter = OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
                         iters.push(Box::new(owned_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
                     }
                 }
@@ -765,7 +776,10 @@ impl DbInner {
 
         // Create merge iterator
         let merge_iter = merge::MergeIterator::new(iters);
-
+        
+        // Debug: check if merge iterator has any items
+        // NOTE: This will consume the first item, so we need to handle that
+        
         DbScanIterator {
             inner: merge_iter,
             last_key: None,
@@ -1344,6 +1358,28 @@ mod tests {
         assert_eq!(&results[1].0[..], b"b");
         assert_eq!(&results[2].0[..], b"c");
         assert_eq!(&results[3].0[..], b"d");
+    }
+
+    #[test]
+    fn test_scan_mvcc_ordering() {
+        // Simplified test to check iteration order
+        use std::ops::Bound;
+        let db = db_builder();
+
+        // Write in explicit order to track timestamps
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        db.put(b"key1", b"FIRST").unwrap();
+        
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        db.put(b"key1", b"SECOND").unwrap();
+        
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        db.put(b"key1", b"THIRD_NEWEST").unwrap();
+
+        // Scan should return only the newest version
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 1, "Should have 1 unique key");
+        assert_eq!(&results[0].1[..], b"THIRD_NEWEST", "Should return the newest version");
     }
 
     #[test]

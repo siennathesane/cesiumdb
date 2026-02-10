@@ -46,7 +46,8 @@ impl RawEntry {
     /// Reads the timestamp from the last 16 bytes (inverted).
     #[inline]
     pub fn ts(&self) -> u128 {
-        let inverted = u128::from_le_bytes(
+        // IMPORTANT: Timestamps are now stored as big-endian
+        let inverted = u128::from_be_bytes(
             self.key_data[self.key_data.len() - 16..]
                 .try_into()
                 .unwrap(),

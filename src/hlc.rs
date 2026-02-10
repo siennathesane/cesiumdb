@@ -37,6 +37,7 @@ pub struct HybridLogicalClock {
 
 #[allow(clippy::new_without_default)]
 impl HybridLogicalClock {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new() -> Self {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -262,6 +263,7 @@ impl AtomicU128 {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn load(&self, order: Ordering) -> u128 {
         // We need to be careful about the ordering here to prevent torn reads
         let hi = self.hi.load(order);
@@ -269,11 +271,13 @@ impl AtomicU128 {
         ((hi as u128) << 64) | (lo as u128)
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn store(&self, value: u128, order: Ordering) {
         self.hi.store((value >> 64) as u64, order);
         self.lo.store(value as u64, order);
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn compare_exchange(
         &self,
         current: u128,
@@ -312,6 +316,7 @@ impl AtomicU128 {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn fetch_add(&self, val: u128, order: Ordering) -> u128 {
         loop {
             let current = self.load(Ordering::Relaxed);
@@ -323,6 +328,7 @@ impl AtomicU128 {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn fetch_sub(&self, val: u128, order: Ordering) -> u128 {
         self.fetch_add(val.wrapping_neg(), order)
     }

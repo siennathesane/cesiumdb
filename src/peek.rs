@@ -9,6 +9,7 @@ pub(crate) struct Peekable<I: Iterator> {
 }
 
 impl<I: Iterator> Peekable<I> {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new(iter: I) -> Self {
         Self { iter, peeked: None }
     }

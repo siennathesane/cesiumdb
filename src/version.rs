@@ -70,6 +70,12 @@ pub struct VersionManager {
     ///
     /// Incremented atomically for each new version.
     sequence: AtomicU64,
+
+    /// Global segment ID counter
+    ///
+    /// Used by both flush and compaction to allocate unique segment IDs.
+    /// Prevents ID collisions between flush and compaction pathways.
+    next_segment_id: AtomicU64,
 }
 
 impl VersionManager {
@@ -82,15 +88,18 @@ impl VersionManager {
         Self {
             current: RwLock::new(Arc::new(initial_version)),
             sequence: AtomicU64::new(0),
+            next_segment_id: AtomicU64::new(0),
         }
     }
 
     /// Creates a version manager with a specific initial version
     pub fn with_version(version: VersionSet) -> Self {
         let seq = version.sequence;
+        let max_seg_id = version.max_segment_id();
         Self {
             current: RwLock::new(Arc::new(version)),
             sequence: AtomicU64::new(seq),
+            next_segment_id: AtomicU64::new(max_seg_id + 1),
         }
     }
 
@@ -188,6 +197,19 @@ impl VersionManager {
     #[inline]
     pub fn is_current(&self, seq: u64) -> bool {
         self.sequence() == seq
+    }
+
+    /// Allocates a new globally unique segment ID
+    ///
+    /// This method is used by both flush and compaction pathways to ensure
+    /// that segment IDs are unique across the entire database lifecycle.
+    ///
+    /// # Returns
+    /// A unique segment ID that is guaranteed not to conflict with any
+    /// existing or future segments.
+    #[inline]
+    pub fn next_segment_id(&self) -> u64 {
+        self.next_segment_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Gets the number of levels in the current version
@@ -450,7 +472,15 @@ impl VersionEdit {
                     | Ok(s) => s,
                     | Err(e) => return Err(e),
                 };
-                version.add_to_l0(segment);
+                
+                // Use key_range from manifest
+                let range = KeyRange::new(
+                    key_range.0.clone(),
+                    key_range.1.clone(),
+                    *segment_id
+                );
+                
+                version.add_to_l0(segment, range);
                 Ok(())
             },
             | VersionEdit::AddSegment {

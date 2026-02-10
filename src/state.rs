@@ -23,6 +23,7 @@ use parking_lot::{
 use crate::{
     compact::flush_memtable,
     compaction::CompactionManager,
+    levels::KeyRange,
     manifest_reader::ManifestReader,
     manifest_writer::ManifestWriter,
     memtable::{
@@ -54,6 +55,7 @@ pub struct DbStorageBuilder {
 }
 
 impl DbStorageBuilder {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new() -> Self {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
@@ -63,26 +65,31 @@ impl DbStorageBuilder {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn block_size(mut self, block_size: u64) -> Self {
         self.block_size = block_size;
         self
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn target_sst_size(mut self, target_sst_size: u64) -> Self {
         self.target_sst_size = target_sst_size;
         self
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn num_memtable_limit(mut self, num_memtable_limit: u64) -> Self {
         self.num_memtable_limit = num_memtable_limit;
         self
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn base_path(mut self, path: PathBuf) -> Self {
         self.base_path = Some(path);
         self
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn build(self) -> Mutex<DbStorageState> {
         Mutex::new(DbStorageState::new(self))
     }
@@ -112,8 +119,6 @@ pub struct DbStorageState {
     num_memtable_limit: u64,
     /// Base path for SSTable storage
     base_path: Option<Arc<PathBuf>>,
-    /// Next SSTable ID (monotonically increasing)
-    next_sstable_id: Arc<AtomicU64>,
     /// Shutdown signal for background flusher
     shutdown: Arc<AtomicBool>,
     /// Background flusher thread handle
@@ -127,29 +132,24 @@ impl DbStorageState {
         let base_path = opts.base_path.map(Arc::new);
 
         // Recover version set from manifest (if exists) or create new
-        let (version_manager, max_segment_id) = if let Some(ref path) = base_path {
+        let version_manager = if let Some(ref path) = base_path {
             match ManifestReader::recover_version_set(path.as_ref(), DEFAULT_NUM_LEVELS) {
                 | Ok(Some(version_set)) => {
                     tracing::info!("Recovered version set from manifest");
-                    // Find highest segment ID to avoid overwrites
-                    let max_id = version_set.max_segment_id();
-                    (Arc::new(VersionManager::with_version(version_set)), max_id)
+                    Arc::new(VersionManager::with_version(version_set))
                 },
                 | Ok(None) => {
                     tracing::info!("No manifest found, starting fresh");
-                    (Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS)), 0)
+                    Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS))
                 },
                 | Err(e) => {
                     tracing::warn!("Failed to recover from manifest: {:?}, starting fresh", e);
-                    (Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS)), 0)
+                    Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS))
                 },
             }
         } else {
-            (Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS)), 0)
+            Arc::new(VersionManager::new(DEFAULT_NUM_LEVELS))
         };
-
-        // Initialize next_sstable_id to avoid overwriting recovered segments
-        let next_sstable_id = Arc::new(AtomicU64::new(max_segment_id + 1));
 
         // Initialize or open manifest writer
         let manifest = base_path.as_ref().map(|path| {
@@ -180,7 +180,6 @@ impl DbStorageState {
         // Spawn background flusher thread if we have a base_path
         let flusher_thread = if let Some(ref path) = base_path {
             let frozen_clone = Arc::clone(&frozen_memtables);
-            let sstable_id_clone = Arc::clone(&next_sstable_id);
             let version_mgr_clone = Arc::clone(&version_manager);
             let compaction_mgr_clone = compaction_manager.clone();
             let manifest_clone = manifest.clone();
@@ -191,7 +190,6 @@ impl DbStorageState {
             Some(thread::spawn(move || {
                 Self::background_flusher(
                     frozen_clone,
-                    sstable_id_clone,
                     version_mgr_clone,
                     compaction_mgr_clone,
                     manifest_clone,
@@ -213,7 +211,6 @@ impl DbStorageState {
             manifest,
             num_memtable_limit: opts.num_memtable_limit,
             base_path,
-            next_sstable_id,
             shutdown,
             flusher_thread,
         }
@@ -222,7 +219,6 @@ impl DbStorageState {
     /// Background thread that flushes frozen memtables to disk
     fn background_flusher(
         frozen_memtables: Arc<Mutex<Vec<Arc<Memtable>>>>,
-        next_sstable_id: Arc<AtomicU64>,
         version_manager: Arc<VersionManager>,
         compaction_manager: Option<Arc<Mutex<CompactionManager>>>,
         manifest: Option<Arc<Mutex<ManifestWriter>>>,
@@ -246,7 +242,7 @@ impl DbStorageState {
                 };
 
                 // Generate unique SSTable ID
-                let sstable_id = next_sstable_id.fetch_add(1, Ordering::Relaxed);
+                let sstable_id = version_manager.next_segment_id();
 
                 // Build path: base_path/sstables/<id>/
                 let sstable_path = base_path.join("sstables").join(sstable_id.to_string());
@@ -264,6 +260,9 @@ impl DbStorageState {
                 // Flush memtable to disk
                 match flush_memtable(memtable_to_flush.clone(), sstable_path, sstable_id) {
                     | Ok((segment, min_key, max_key)) => {
+                        // Create KeyRange before moving min/max into manifest edit
+                        let key_range = KeyRange::new(min_key.clone(), max_key.clone(), sstable_id);
+
                         // Log to manifest BEFORE updating version (write-ahead)
                         if let Some(ref manifest_writer) = manifest {
                             let edit = VersionEdit::AddL0Segment {
@@ -287,7 +286,7 @@ impl DbStorageState {
 
                         // Register the new L0 SSTable with VersionManager
                         version_manager.update(|version| {
-                            version.add_to_l0(segment.clone());
+                            version.add_to_l0(segment.clone(), key_range);
                         });
 
                         // NOW remove from frozen queue (after registration)
@@ -323,6 +322,7 @@ impl DbStorageState {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn current_memtable(&self) -> Arc<Memtable> {
         self.curr_memtable.read().clone()
     }
@@ -331,6 +331,7 @@ impl DbStorageState {
     ///
     /// Returns a clone of the frozen memtables vector, allowing callers to
     /// iterate over them without holding the lock.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn frozen_memtables_for_scan(&self) -> Vec<Arc<Memtable>> {
         self.frozen_memtables.lock().clone()
     }
@@ -338,6 +339,7 @@ impl DbStorageState {
     /// Searches frozen memtables for a key (newest to oldest).
     ///
     /// Returns the value if found, respecting tombstones.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn get_from_frozen(
         &self,
         key: crate::keypair::KeyBytes,
@@ -362,6 +364,7 @@ impl DbStorageState {
     ///
     /// The old memtable is frozen and added to the queue. The background
     /// flusher thread will write it to disk when the queue exceeds the limit.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new_memtable(&mut self) {
         let next_id = self.curr_memtable.read().clone().id() + 1;
         let new_table = RwLock::new(Arc::new(Memtable::new(
@@ -380,6 +383,7 @@ impl DbStorageState {
     }
 
     /// Triggers a manual compaction of the entire database
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn compact(&self) {
         if let Some(ref manager) = self.compaction_manager {
             manager.lock().compact();
@@ -459,11 +463,14 @@ impl DbStorageState {
                 frozen[0].clone()
             };
 
-            let sstable_id = self.next_sstable_id.fetch_add(1, Ordering::Relaxed);
+            let sstable_id = self.version_manager.next_segment_id();
             let sstable_path = base_path.join("sstables").join(sstable_id.to_string());
 
             match flush_memtable(memtable, sstable_path, sstable_id) {
                 | Ok((segment, min_key, max_key)) => {
+                    // Create KeyRange before moving min/max into manifest edit
+                    let key_range = KeyRange::new(min_key.clone(), max_key.clone(), sstable_id);
+
                     // Log to manifest BEFORE updating version (write-ahead)
                     if let Some(ref manifest_writer) = self.manifest {
                         let edit = VersionEdit::AddL0Segment {
@@ -489,7 +496,7 @@ impl DbStorageState {
 
                     // Register the new L0 SSTable with VersionManager
                     self.version_manager.update(|version| {
-                        version.add_to_l0(segment.clone());
+                        version.add_to_l0(segment.clone(), key_range);
                     });
                     self.frozen_memtables.lock().remove(0);
                 },

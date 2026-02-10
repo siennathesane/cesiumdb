@@ -211,7 +211,7 @@ impl CompactionExecutor {
             .collect();
 
         // Calculate output path (must match recovery path format)
-        let segment_id = job.id; // Use job ID as segment ID for now
+        let segment_id = job.allocated_segment_ids[0]; // Use first pre-allocated segment ID
         let output_dir = self
             .base_path
             .join(format!("L{}", job.output.level))
@@ -367,9 +367,9 @@ impl CompactionExecutor {
 
             // Add output segments to target level
             if job.output.level == 0 {
-                // Add to L0
-                for segment in &result.output_segments {
-                    version.add_to_l0(segment.clone());
+                // Add to L0 with key ranges
+                for (segment, range) in result.output_segments.iter().zip(result.output_ranges.iter()) {
+                    version.add_to_l0(segment.clone(), range.clone());
                 }
             } else {
                 // Add to Ln
@@ -435,7 +435,7 @@ mod tests {
 
         let output = CompactionOutput::new(2, 64 * 1024 * 1024);
 
-        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output);
+        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output, vec![]);
 
         let result = executor.execute_trivial_move(&job);
         assert!(result.is_err());

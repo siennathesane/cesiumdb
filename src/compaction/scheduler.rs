@@ -29,9 +29,11 @@ use crate::{
     },
     levels::{
         CompactionStrategy,
+        KeyRange,
         VersionSet,
     },
     segment::Segment,
+    version::VersionManager,
 };
 
 /// Configuration for the compaction scheduler
@@ -79,20 +81,24 @@ pub struct CompactionScheduler {
 
     /// Round-robin tracker: maps level_num → last compacted segment_id
     last_compacted: RwLock<HashMap<u8, u64>>,
+
+    /// Version manager for allocating segment IDs
+    version_manager: Arc<VersionManager>,
 }
 
 impl CompactionScheduler {
     /// Creates a new scheduler with default configuration
-    pub fn new() -> Self {
-        Self::with_config(SchedulerConfig::default())
+    pub fn new(version_manager: Arc<VersionManager>) -> Self {
+        Self::with_config(SchedulerConfig::default(), version_manager)
     }
 
     /// Creates a new scheduler with custom configuration
-    pub fn with_config(config: SchedulerConfig) -> Self {
+    pub fn with_config(config: SchedulerConfig, version_manager: Arc<VersionManager>) -> Self {
         Self {
             config,
             next_job_id: AtomicU64::new(0),
             last_compacted: RwLock::new(HashMap::new()),
+            version_manager,
         }
     }
 
@@ -157,12 +163,19 @@ impl CompactionScheduler {
 
                 if !has_overlap {
                     // Found a trivial move!
-                    let input = CompactionInput::new(level.level_num, vec![segment.clone()]);
+                    let input = CompactionInput::with_key_range(
+                        level.level_num,
+                        vec![segment.clone()],
+                        &level.key_ranges,
+                    );
 
                     let output =
                         CompactionOutput::new(next_level_num, self.config.target_segment_size);
 
                     let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+
+                    // Trivial moves don't create new segments, so allocate 0 IDs
+                    let allocated_ids: Vec<u64> = vec![];
 
                     return Some(CompactionJob::new(
                         job_id,
@@ -170,6 +183,7 @@ impl CompactionScheduler {
                         input,
                         None,
                         output,
+                        allocated_ids,
                     ));
                 }
             }
@@ -196,7 +210,19 @@ impl CompactionScheduler {
         let batch_size = self.config.l0_compaction_trigger.min(l0_segments.len());
         l0_segments.truncate(batch_size);
 
-        let input = CompactionInput::new(0, l0_segments);
+        // Get corresponding key ranges for the L0 segments
+        let l0_key_ranges: Vec<KeyRange> = l0_segments
+            .iter()
+            .filter_map(|seg| {
+                version
+                    .l0_key_ranges
+                    .iter()
+                    .find(|r| r.segment_id == seg.id())
+                    .cloned()
+            })
+            .collect();
+
+        let input = CompactionInput::with_key_range(0, l0_segments, &l0_key_ranges);
 
         // Find overlapping L1 segments
         let next_level_input = if !version.levels.is_empty() {
@@ -220,7 +246,7 @@ impl CompactionScheduler {
             if overlapping.is_empty() {
                 None
             } else {
-                Some(CompactionInput::new(1, overlapping))
+                Some(CompactionInput::with_key_range(1, overlapping, &l1.key_ranges))
             }
         } else {
             None
@@ -230,12 +256,19 @@ impl CompactionScheduler {
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
+        // Pre-allocate segment IDs for output segments (estimate 1 for now)
+        let num_output_segments = 1;
+        let allocated_ids: Vec<u64> = (0..num_output_segments)
+            .map(|_| self.version_manager.next_segment_id())
+            .collect();
+
         Some(CompactionJob::new(
             job_id,
             CompactionJobType::L0Compaction,
             input,
             next_level_input,
             output,
+            allocated_ids,
         ))
     }
 
@@ -315,7 +348,11 @@ impl CompactionScheduler {
             | None => return None,
         };
 
-        let input = CompactionInput::new(level_num, vec![segment]);
+        let input = CompactionInput::with_key_range(
+            level_num,
+            vec![segment],
+            &level.key_ranges,
+        );
 
         // Find overlapping segments in next level
         let next_level_num = level_num + 1;
@@ -344,7 +381,11 @@ impl CompactionScheduler {
             if overlapping.is_empty() {
                 None
             } else {
-                Some(CompactionInput::new(next_level_num, overlapping))
+                Some(CompactionInput::with_key_range(
+                    next_level_num,
+                    overlapping,
+                    &next_level.key_ranges,
+                ))
             }
         } else {
             None
@@ -354,12 +395,19 @@ impl CompactionScheduler {
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
+        // Pre-allocate segment IDs for output segments (estimate 1 for now)
+        let num_output_segments = 1;
+        let allocated_ids: Vec<u64> = (0..num_output_segments)
+            .map(|_| self.version_manager.next_segment_id())
+            .collect();
+
         Some(CompactionJob::new(
             job_id,
             CompactionJobType::LevelCompaction,
             input,
             next_level_input,
             output,
+            allocated_ids,
         ))
     }
 
@@ -374,12 +422,6 @@ impl CompactionScheduler {
     }
 }
 
-impl Default for CompactionScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,7 +429,8 @@ mod tests {
 
     #[test]
     fn test_scheduler_creation() {
-        let scheduler = CompactionScheduler::new();
+        let version_manager = Arc::new(VersionManager::new(7));
+        let scheduler = CompactionScheduler::new(version_manager);
         assert_eq!(scheduler.config.l0_compaction_trigger, 4);
         assert_eq!(scheduler.config.max_concurrent_jobs, 4);
     }
@@ -402,14 +445,16 @@ mod tests {
             score_threshold: 2.0,
         };
 
-        let scheduler = CompactionScheduler::with_config(config);
+        let version_manager = Arc::new(VersionManager::new(7));
+        let scheduler = CompactionScheduler::with_config(config, version_manager);
         assert_eq!(scheduler.config.l0_compaction_trigger, 8);
         assert_eq!(scheduler.config.target_segment_size, 128 * 1024 * 1024);
     }
 
     #[test]
     fn test_no_compaction_needed_empty_version() {
-        let scheduler = CompactionScheduler::new();
+        let version_manager = Arc::new(VersionManager::new(7));
+        let scheduler = CompactionScheduler::new(version_manager);
         let version = VersionSet::new(0, 7);
 
         let job = scheduler.pick_compaction(&version);
@@ -418,7 +463,8 @@ mod tests {
 
     #[test]
     fn test_should_stop_writes() {
-        let scheduler = CompactionScheduler::new();
+        let version_manager = Arc::new(VersionManager::new(7));
+        let scheduler = CompactionScheduler::new(version_manager);
         let version = VersionSet::new(0, 7);
 
         // Empty L0 should not stop writes
@@ -431,7 +477,8 @@ mod tests {
 
     #[test]
     fn test_job_id_increments() {
-        let scheduler = CompactionScheduler::new();
+        let version_manager = Arc::new(VersionManager::new(7));
+        let scheduler = CompactionScheduler::new(version_manager);
 
         let id1 = scheduler.next_job_id.load(Ordering::SeqCst);
         scheduler.next_job_id.fetch_add(1, Ordering::SeqCst);

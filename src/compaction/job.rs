@@ -96,14 +96,60 @@ pub struct CompactionInput {
 }
 
 impl CompactionInput {
-    /// Creates a new compaction input
-    pub fn new(level: u8, segments: Vec<Arc<Segment>>) -> Self {
+    /// Creates a compaction input with a computed union key range
+    ///
+    /// This method computes the union of all input segment key ranges,
+    /// ensuring overlap detection and parallelization work correctly.
+    ///
+    /// # Arguments
+    /// * `level` - Source level (0 for L0, 1 for L1, etc.)
+    /// * `segments` - Segments to compact
+    /// * `key_ranges` - Parallel array of key ranges (from Level's key_ranges field)
+    ///
+    /// # Panics
+    /// Panics if segments is empty or if any segment is missing a key range
+    pub fn with_key_range(
+        level: u8,
+        segments: Vec<Arc<Segment>>,
+        key_ranges: &[KeyRange],
+    ) -> Self {
+        if segments.is_empty() {
+            panic!("Cannot create CompactionInput with empty segments");
+        }
+
         let total_size: u64 = segments.iter().map(|s| s.size_in_bytes()).sum();
 
-        // Compute the union of all key ranges
-        // TODO: This requires segment metadata we haven't exposed yet
-        // For now, use placeholder values
-        let key_range = KeyRange::new(vec![], vec![], segments[0].id());
+        // Compute union of all key ranges
+        let mut min_key: Option<Vec<u8>> = None;
+        let mut max_key: Option<Vec<u8>> = None;
+
+        for seg in &segments {
+            if let Some(range) = key_ranges.iter().find(|r| r.segment_id == seg.id()) {
+                match &min_key {
+                    None => min_key = Some(range.start.clone()),
+                    Some(current_min) => {
+                        if range.start < *current_min {
+                            min_key = Some(range.start.clone());
+                        }
+                    }
+                }
+
+                match &max_key {
+                    None => max_key = Some(range.end.clone()),
+                    Some(current_max) => {
+                        if range.end > *current_max {
+                            max_key = Some(range.end.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let key_range = KeyRange::new(
+            min_key.expect("Segment should have key range"),
+            max_key.expect("Segment should have key range"),
+            segments[0].id(),
+        );
 
         Self {
             level,
@@ -187,6 +233,12 @@ pub struct CompactionJob {
     ///
     /// Jobs with non-overlapping key ranges can run concurrently.
     pub can_parallelize: bool,
+
+    /// Pre-allocated segment IDs for output segments
+    ///
+    /// These IDs are allocated by the scheduler to prevent ID collisions
+    /// between flush and compaction pathways.
+    pub allocated_segment_ids: Vec<u64>,
 }
 
 impl CompactionJob {
@@ -197,6 +249,7 @@ impl CompactionJob {
         input: CompactionInput,
         next_level_input: Option<CompactionInput>,
         output: CompactionOutput,
+        allocated_segment_ids: Vec<u64>,
     ) -> Self {
         let score = Self::calculate_score(job_type, &input, next_level_input.as_ref());
 
@@ -215,6 +268,7 @@ impl CompactionJob {
             output,
             score,
             can_parallelize,
+            allocated_segment_ids,
         }
     }
 
@@ -443,6 +497,7 @@ mod tests {
             input,
             Some(next_level),
             output,
+            vec![100],
         );
 
         // Write amp = (100 + 400) / 100 = 5.0
@@ -460,7 +515,7 @@ mod tests {
 
         let output = CompactionOutput::new(2, 64 * 1024 * 1024);
 
-        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output);
+        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output, vec![]);
 
         assert_eq!(job.write_amplification(), 0.0);
     }

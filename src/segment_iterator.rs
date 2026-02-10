@@ -37,6 +37,7 @@ pub(crate) struct SegmentBlockIterator<'a> {
 }
 
 impl SegmentBlockIterator<'_> {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new<'a>(reader: &'a mut SegmentReader) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator {
             reader,
@@ -72,6 +73,7 @@ pub(crate) struct SeekingBlockIterator<'a> {
 }
 
 impl<'a> SeekingBlockIterator<'a> {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn new<'b>(
         reader: &'b mut SegmentReader,
         start: usize,
@@ -85,6 +87,7 @@ impl<'a> SeekingBlockIterator<'a> {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn seek(&mut self, block_index: usize) -> Result<(), SegmentError> {
         if block_index >= self.end {
             return Err(ReadOutOfBounds);
@@ -93,10 +96,12 @@ impl<'a> SeekingBlockIterator<'a> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn current_position(&self) -> usize {
         self.current
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn blocks_remaining(&self) -> usize {
         self.end - self.current
     }
@@ -479,6 +484,7 @@ impl<'a> Iterator for RawSegmentScanIterator<'a> {
 }
 
 impl<'a> RawSegmentScanIterator<'a> {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new(
         reader: &'a SegmentReader,
         range: (Bound<&[u8]>, Bound<&[u8]>),

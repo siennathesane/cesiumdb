@@ -47,6 +47,7 @@ pub struct Map {
 }
 
 impl Map {
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new(path: PathBuf, initial_size: u64) -> Result<Self, SegmentError> {
         let file = match OpenOptions::new()
             .read(true)
@@ -86,6 +87,7 @@ impl Map {
         })
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn open(path: PathBuf) -> Result<Self, SegmentError> {
         let file = match OpenOptions::new().read(true).write(true).open(path.clone()) {
             | Ok(v) => v,
@@ -115,6 +117,7 @@ impl Map {
         })
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn open_read_only(path: PathBuf) -> Result<Self, SegmentError> {
         // Note: We open with write permissions to allow mmap creation,
         // but enforce read-only behavior at the API level
@@ -146,6 +149,7 @@ impl Map {
         })
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn grow(&self, new_size: u64) -> Result<(), SegmentError> {
         // Check if map is read-only
         if self.read_only {
@@ -194,6 +198,7 @@ impl Map {
         Ok(())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn shrink(&self, new_size: u64) -> Result<(), SegmentError> {
         let _guard = self.resize_lock.write();
 
@@ -344,6 +349,7 @@ impl Map {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn close(&self) -> Result<(), SegmentError> {
         let _guard = self.resize_lock.write();
 
@@ -361,6 +367,7 @@ impl Map {
         Ok(())
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn len(&self) -> usize {
         let fh = self.file.lock();
         match fh.metadata() {
@@ -369,6 +376,7 @@ impl Map {
         }
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

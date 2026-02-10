@@ -4,6 +4,7 @@
 //! scheduling, execution, and background threads.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc,
@@ -17,13 +18,14 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
     compaction::{
         AdaptationPolicy,
         AdaptiveExecutor,
         CompactionExecutor,
+        CompactionJob,
         CompactionQueue,
         CompactionScheduler,
         ParallelCompactionManager,
@@ -79,6 +81,12 @@ pub struct CompactionManager {
 
     /// Counter for failed compaction jobs
     failed_jobs: Arc<AtomicU64>,
+
+    /// Tracks segments currently being compacted
+    /// 
+    /// Prevents duplicate job scheduling by tracking which segments
+    /// are already in-flight. Cleared when jobs complete.
+    in_flight_segments: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl CompactionManager {
@@ -89,7 +97,7 @@ impl CompactionManager {
         manifest: Option<Arc<Mutex<ManifestWriter>>>,
     ) -> Self {
         let queue = Arc::new(CompactionQueue::new());
-        let scheduler = Arc::new(CompactionScheduler::new());
+        let scheduler = Arc::new(CompactionScheduler::new(Arc::clone(&version_manager)));
         let registry = Arc::new(SegmentRegistry::new());
         let parallel_manager = Arc::new(ParallelCompactionManager::new(4));
         let subcompaction_planner = Arc::new(SubcompactionPlanner::new());
@@ -126,6 +134,7 @@ impl CompactionManager {
             bg_thread: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             failed_jobs: Arc::new(AtomicU64::new(0)),
+            in_flight_segments: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -173,16 +182,23 @@ impl CompactionManager {
     ///
     /// This will compact the entire database or a specific key range.
     pub fn compact(&self) {
-        // Get current version
-        let version = self.version_manager.current();
-
         // Try to schedule compactions repeatedly until no more are needed
         // This will compact multiple levels if necessary
         for _ in 0..10 {
+            // Get FRESH version each iteration (not stale snapshot)
+            let version = self.version_manager.current();
+
             if let Some(job) = self.scheduler.pick_compaction(&version) {
+                // Check for duplicates
+                if self.is_duplicate_job(&job) {
+                    continue; // Skip, try next iteration
+                }
+
+                // Mark segments as in-flight
+                self.mark_in_flight(&job);
                 self.queue.enqueue(job);
             } else {
-                break;
+                break; // No more compactions needed
             }
         }
     }
@@ -256,6 +272,59 @@ impl CompactionManager {
         // Shutdown executor
         if let Some(executor) = self.executor.take() {
             executor.shutdown();
+        }
+    }
+
+    /// Checks if any input segments are already being compacted
+    fn is_duplicate_job(&self, job: &CompactionJob) -> bool {
+        let in_flight = self.in_flight_segments.read();
+
+        // Check input segments
+        for seg in &job.input.segments {
+            if in_flight.contains(&seg.id()) {
+                return true;
+            }
+        }
+
+        // Check next level inputs
+        if let Some(ref next_input) = job.next_level_input {
+            for seg in &next_input.segments {
+                if in_flight.contains(&seg.id()) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Marks job segments as in-flight
+    fn mark_in_flight(&self, job: &CompactionJob) {
+        let mut in_flight = self.in_flight_segments.write();
+
+        for seg in &job.input.segments {
+            in_flight.insert(seg.id());
+        }
+
+        if let Some(ref next_input) = job.next_level_input {
+            for seg in &next_input.segments {
+                in_flight.insert(seg.id());
+            }
+        }
+    }
+
+    /// Clears in-flight status after job completes
+    pub fn clear_in_flight(&self, job: &CompactionJob) {
+        let mut in_flight = self.in_flight_segments.write();
+
+        for seg in &job.input.segments {
+            in_flight.remove(&seg.id());
+        }
+
+        if let Some(ref next_input) = job.next_level_input {
+            for seg in &next_input.segments {
+                in_flight.remove(&seg.id());
+            }
         }
     }
 }

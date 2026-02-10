@@ -12,6 +12,8 @@ default_features = []
 # you have to enable benchmarks to run them. this is due to criterion only being able to access the public API, but i
 # don't want to expose most of the API to the public.
 benchmarks = []
+# Enable OpenTelemetry instrumentation for production observability
+telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 
 [dependencies]
 bloom2 = { git = "https://github.com/domodwyer/bloom2.git", rev = "4154df9347fa0c28c3420635e6603e26e8a9a58c", features = ["bytes"] } # no support yet, might just permanently vendor
@@ -31,11 +33,15 @@ rand = "0.9.0" # has no_std support
 rayon = "1.10" # parallel iterators for concurrent shard writes
 thiserror = "2.0" # it looks like there is no_std support
 tracing = "0.1"
+# OpenTelemetry for optional production telemetry (enable with "telemetry" feature)
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
 rand = { version = "0.9", features = ["small_rng"] }
 tempfile = "3.14.0"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [profile.bench]
 debug = true

@@ -111,7 +111,7 @@ pub struct SegmentReader {
 }
 
 impl SegmentReader {
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
@@ -120,7 +120,7 @@ impl SegmentReader {
         Self::with_config(key_handle, val_handle, key_index, ReadConfig::default())
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn with_config(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
@@ -168,7 +168,7 @@ impl SegmentReader {
         })
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, SegmentError> {
         // Strip timestamp (last 16 bytes) before index lookup
         // Index hashes [ns:8][user_key] to map all versions to same block
@@ -255,7 +255,7 @@ impl SegmentReader {
         Ok(None)
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn read_key_block(
         &self,
         block_index: usize,
@@ -273,7 +273,7 @@ impl SegmentReader {
         Ok(block)
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     /// Helper method to read a potentially multi-block entry.
     ///
     /// # Arguments
@@ -354,7 +354,7 @@ impl SegmentReader {
         self.read_multiblock_entry(flag, data, key_block_index + 1)
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn read_value(
         &self,
         val_block_index: usize,
@@ -482,6 +482,7 @@ impl SegmentReader {
         Err(ReadOutOfBounds)
     }
 
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn visible_blocks(&self) -> (usize, usize) {
         (self.visible_key_blocks, self.visible_val_blocks)
     }
@@ -496,17 +497,17 @@ impl SegmentReader {
         &self.val_handle
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn iter<'a>(&'a mut self) -> SegmentBlockIterator<'a> {
         SegmentBlockIterator::new(self)
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn seeking_iter<'a>(&'a mut self) -> SeekingBlockIterator<'a> {
         SeekingBlockIterator::new(self, 0, self.num_blocks)
     }
 
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     /// Internal method to read a single block without caching
     fn read_block_at(
         &self,
@@ -565,7 +566,7 @@ impl SegmentReader {
     ///   Included, exclusive if Excluded)
     /// * `upper_bound` - The upper bound of the key range (inclusive if
     ///   Included, exclusive if Excluded)
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn scan<'a>(
         &'a self,
         lower_bound: Bound<&[u8]>,
@@ -599,7 +600,7 @@ impl SegmentReader {
     ///
     /// Same logic as `scan()` but returns `RawSegmentScanIterator` which yields
     /// `RawEntry` instead of `(KeyBytes, ValueBytes)`.
-    #[instrument(level = "trace")]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn scan_raw<'a>(
         &'a self,
         lower_bound: Bound<&[u8]>,

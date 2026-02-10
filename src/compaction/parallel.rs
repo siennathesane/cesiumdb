@@ -242,6 +242,7 @@ mod tests {
             output,
             score: 1.0,
             can_parallelize,
+            allocated_segment_ids: vec![id],
         }
     }
 
