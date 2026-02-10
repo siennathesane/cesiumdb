@@ -103,6 +103,129 @@ mod stats;
 pub mod utils;
 pub mod version;
 
+/// Wrapper that owns a SegmentReader and its iterator together.
+///
+/// This solves the lifetime issue where SegmentScanIterator borrows from SegmentReader.
+struct OwnedSegmentIterator {
+    reader: segment_reader::SegmentReader,
+    // We'll iterate lazily by calling reader.scan() on demand
+    lower: std::ops::Bound<Bytes>,
+    upper: std::ops::Bound<Bytes>,
+    inner: Option<segment_iterator::SegmentScanIterator<'static>>,
+}
+
+impl OwnedSegmentIterator {
+    fn new(
+        reader: segment_reader::SegmentReader,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Self {
+        use std::ops::Bound;
+
+        // Convert bounds to owned Bytes
+        let lower_bound = match lower {
+            | Bound::Included(b) => Bound::Included(Bytes::copy_from_slice(b)),
+            | Bound::Excluded(b) => Bound::Excluded(Bytes::copy_from_slice(b)),
+            | Bound::Unbounded => Bound::Unbounded,
+        };
+        let upper_bound = match upper {
+            | Bound::Included(b) => Bound::Included(Bytes::copy_from_slice(b)),
+            | Bound::Excluded(b) => Bound::Excluded(Bytes::copy_from_slice(b)),
+            | Bound::Unbounded => Bound::Unbounded,
+        };
+
+        Self {
+            reader,
+            lower: lower_bound,
+            upper: upper_bound,
+            inner: None,
+        }
+    }
+}
+
+impl Iterator for OwnedSegmentIterator {
+    type Item = (KeyBytes, ValueBytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Create iterator on first call (lazy initialization)
+        if self.inner.is_none() {
+            // SAFETY: We're creating a self-referential struct here.
+            // The reader and iterator are both owned by self and will be dropped together.
+            // The 'static lifetime is a lie, but safe because:
+            // 1. We never move self.reader after creating the iterator
+            // 2. Both are dropped together when OwnedSegmentIterator is dropped
+            let reader_ptr = &self.reader as *const segment_reader::SegmentReader;
+            let iter = unsafe {
+                let lower_ref = match &self.lower {
+                    | std::ops::Bound::Included(b) => std::ops::Bound::Included(&b[..]),
+                    | std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(&b[..]),
+                    | std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                };
+                let upper_ref = match &self.upper {
+                    | std::ops::Bound::Included(b) => std::ops::Bound::Included(&b[..]),
+                    | std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(&b[..]),
+                    | std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                };
+                (*reader_ptr).scan(lower_ref, upper_ref)
+            };
+            self.inner = Some(unsafe { std::mem::transmute(iter) });
+        }
+
+        // Iterate, skipping errors
+        loop {
+            match self.inner.as_mut()?.next()? {
+                | Ok(pair) => return Some(pair),
+                | Err(_) => continue, // Skip corrupt entries
+            }
+        }
+    }
+}
+
+/// Iterator over a range of key-value pairs from the database.
+///
+/// This iterator merges results from memtables and all LSM levels,
+/// automatically handling deduplication (newer versions shadow older),
+/// tombstone filtering, and maintaining sorted order.
+pub struct DbScanIterator {
+    inner: merge::MergeIterator<Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>>,
+    last_key: Option<(u64, Bytes)>, // (namespace, key) for deduplication
+}
+
+impl Iterator for DbScanIterator {
+    type Item = (Bytes, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next() {
+                | Some((key, value)) => {
+                    let current_ns = key.ns();
+                    let current_key = key.as_bytes();
+
+                    // Check if this is a duplicate key (different timestamp of same key)
+                    if let Some((last_ns, ref last_key_bytes)) = self.last_key {
+                        if last_ns == current_ns && last_key_bytes == &current_key {
+                            // Skip older version of the same key
+                            continue;
+                        }
+                    }
+
+                    // Update last seen key
+                    self.last_key = Some((current_ns, current_key.clone()));
+
+                    // Filter out tombstones
+                    if value.is_tombstone() {
+                        continue;
+                    }
+
+                    // Convert KeyBytes/ValueBytes to Bytes for public API
+                    return Some((current_key, value.as_bytes()));
+                },
+                | None => return None,
+            }
+        }
+    }
+}
+
 /// The core Cesium database! The API is simple by design, and focused on
 /// performance. It is designed for heavy concurrency, implements sharding, and
 /// Multi-Version Concurrency Control (MVCC).
@@ -164,6 +287,52 @@ impl Db {
     /// Delete a key.
     pub fn delete(&self, key: &[u8]) -> Result<(), CesiumError> {
         self.delete_ns(DEFAULT_NS, key)
+    }
+
+    /// Scan a range of keys in a specific namespace.
+    ///
+    /// Returns an iterator over key-value pairs within the specified bounds.
+    /// The iterator merges results from memtables and all LSM levels,
+    /// automatically handling deduplication and tombstone filtering.
+    ///
+    /// # Arguments
+    ///
+    /// * `ns` - The namespace to scan
+    /// * `lower` - Lower bound (Unbounded, Included, or Excluded)
+    /// * `upper` - Upper bound (Unbounded, Included, or Excluded)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::ops::Bound;
+    /// use cesiumdb::{Db, DbOptions};
+    ///
+    /// let db = Db::open(DbOptions::default());
+    /// let start = b"key-00000".to_vec();
+    /// let end = b"key-99999".to_vec();
+    ///
+    /// for (key, value) in db.scan_ns(0, Bound::Included(&start), Bound::Excluded(&end)) {
+    ///     println!("Key: {:?}, Value: {:?}", key, value);
+    /// }
+    /// ```
+    pub fn scan_ns(
+        &self,
+        ns: u64,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> DbScanIterator {
+        self.inner.scan(ns, lower, upper)
+    }
+
+    /// Scan a range of keys in the default namespace.
+    ///
+    /// See [`scan_ns`](Self::scan_ns) for more details.
+    pub fn scan(
+        &self,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> DbScanIterator {
+        self.scan_ns(DEFAULT_NS, lower, upper)
     }
 
     /// Write a batch of records to the database. It is safe to mix namespaced
@@ -509,6 +678,98 @@ impl DbInner {
 
         // 4. Not found anywhere
         Ok(None)
+    }
+
+    fn scan(
+        &self,
+        ns: u64,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> DbScanIterator {
+        use std::ops::Bound;
+
+        // Convert bounds to KeyBytes format (with namespace and timestamp)
+        // For namespace isolation, we need to ensure we only scan within the given namespace
+        let lower_key = match lower {
+            | Bound::Included(k) => {
+                Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
+            },
+            | Bound::Excluded(k) => {
+                Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
+            },
+            | Bound::Unbounded => {
+                // Start from the beginning of this namespace with empty key and max timestamp
+                Bound::Included(KeyBytes::new(ns, Bytes::new(), u128::MAX))
+            },
+        };
+
+        let upper_key = match upper {
+            | Bound::Included(k) => {
+                // Include all versions: use lowest timestamp (0)
+                Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), 0))
+            },
+            | Bound::Excluded(k) => {
+                // Exclude all versions: use highest timestamp (u128::MAX)
+                Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
+            },
+            | Bound::Unbounded => {
+                // End at the last possible key in this namespace
+                // Since keys are ordered by (ns, key, Reverse(ts)), we need to exclude (ns+1, "", MAX)
+                // to stop before the next namespace
+                Bound::Excluded(KeyBytes::new(ns + 1, Bytes::new(), u128::MAX))
+            },
+        };
+
+        let mut iters: Vec<Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>> = Vec::new();
+
+        // 1. Add current memtable iterator
+        {
+            let guard = self.state.lock();
+            let memtable_iter = guard.current_memtable().scan(lower_key.clone(), upper_key.clone());
+            iters.push(Box::new(memtable_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+        }
+
+        // 2. Add frozen memtables iterators (newest to oldest)
+        {
+            let guard = self.state.lock();
+            let frozen = guard.frozen_memtables_for_scan();
+            for memtable in frozen.iter().rev() {
+                let iter = memtable.scan(lower_key.clone(), upper_key.clone());
+                iters.push(Box::new(iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+            }
+        }
+
+        // 3. Add segment iterators from all levels
+        {
+            let guard = self.state.lock();
+            let version = guard.version_manager.current();
+
+            // Add L0 segments (can overlap, so all must be scanned)
+            for segment in &version.l0 {
+                if let Ok(reader) = segment.reader() {
+                    let owned_iter = OwnedSegmentIterator::new(reader, lower, upper);
+                    iters.push(Box::new(owned_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+                }
+            }
+
+            // Add segments from L1-L7
+            for level in &version.levels {
+                for segment in &level.segments {
+                    if let Ok(reader) = segment.reader() {
+                        let owned_iter = OwnedSegmentIterator::new(reader, lower, upper);
+                        iters.push(Box::new(owned_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+                    }
+                }
+            }
+        }
+
+        // Create merge iterator
+        let merge_iter = merge::MergeIterator::new(iters);
+
+        DbScanIterator {
+            inner: merge_iter,
+            last_key: None,
+        }
     }
 
     fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(
@@ -958,5 +1219,152 @@ mod tests {
         let retrieved = result.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().len(), val.len());
+    }
+
+    // ===== Scan API Tests =====
+
+    #[test]
+    fn test_scan_empty_db() {
+        use std::ops::Bound;
+        let db = db_builder();
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_scan_single_memtable() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 3);
+        assert_eq!(&results[0].0[..], b"a");
+        assert_eq!(&results[0].1[..], b"1");
+        assert_eq!(&results[1].0[..], b"b");
+        assert_eq!(&results[1].1[..], b"2");
+        assert_eq!(&results[2].0[..], b"c");
+        assert_eq!(&results[2].1[..], b"3");
+    }
+
+    #[test]
+    fn test_scan_with_tombstones() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.delete(b"b").unwrap();
+
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 2, "Should filter out tombstone for 'b'");
+        assert_eq!(&results[0].0[..], b"a");
+        assert_eq!(&results[1].0[..], b"c");
+    }
+
+    #[test]
+    fn test_scan_unbounded() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        for i in 0..10 {
+            let key = format!("key-{:02}", i);
+            let val = format!("val-{:02}", i);
+            db.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_scan_bounded() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.put(b"d", b"4").unwrap();
+        db.put(b"e", b"5").unwrap();
+
+        // Scan [b, d) should return b and c
+        let results: Vec<_> = db.scan(
+            Bound::Included(b"b"),
+            Bound::Excluded(b"d")
+        ).collect();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(&results[0].0[..], b"b");
+        assert_eq!(&results[0].1[..], b"2");
+        assert_eq!(&results[1].0[..], b"c");
+        assert_eq!(&results[1].1[..], b"3");
+    }
+
+    #[test]
+    fn test_scan_namespace_isolation() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        db.put_ns(1, b"key", b"ns1-value").unwrap();
+        db.put_ns(2, b"key", b"ns2-value").unwrap();
+        db.put_ns(1, b"key2", b"ns1-value2").unwrap();
+
+        let results_ns1: Vec<_> = db.scan_ns(1, Bound::Unbounded, Bound::Unbounded).collect();
+        let results_ns2: Vec<_> = db.scan_ns(2, Bound::Unbounded, Bound::Unbounded).collect();
+
+        assert_eq!(results_ns1.len(), 2);
+        assert_eq!(results_ns2.len(), 1);
+        assert_eq!(&results_ns2[0].1[..], b"ns2-value");
+    }
+
+    #[test]
+    fn test_scan_across_frozen_memtables() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        // Write some data
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        // Force sync to freeze memtable
+        db.sync().unwrap();
+
+        // Write more data to new memtable
+        db.put(b"c", b"3").unwrap();
+        db.put(b"d", b"4").unwrap();
+
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 4, "Should scan across both frozen and current memtable");
+        assert_eq!(&results[0].0[..], b"a");
+        assert_eq!(&results[1].0[..], b"b");
+        assert_eq!(&results[2].0[..], b"c");
+        assert_eq!(&results[3].0[..], b"d");
+    }
+
+    #[test]
+    fn test_scan_with_mvcc() {
+        use std::ops::Bound;
+        let db = db_builder();
+
+        // Write initial values
+        db.put(b"key1", b"v1").unwrap();
+        db.put(b"key2", b"v2").unwrap();
+
+        // Update values (creates new versions)
+        db.put(b"key1", b"v1-updated").unwrap();
+
+        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+        assert_eq!(results.len(), 2);
+
+        // Should see newest version
+        assert_eq!(&results[0].0[..], b"key1");
+        assert_eq!(&results[0].1[..], b"v1-updated");
+        assert_eq!(&results[1].0[..], b"key2");
+        assert_eq!(&results[1].1[..], b"v2");
     }
 }

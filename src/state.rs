@@ -327,6 +327,14 @@ impl DbStorageState {
         self.curr_memtable.read().clone()
     }
 
+    /// Returns a snapshot of frozen memtables for scanning.
+    ///
+    /// Returns a clone of the frozen memtables vector, allowing callers to
+    /// iterate over them without holding the lock.
+    pub fn frozen_memtables_for_scan(&self) -> Vec<Arc<Memtable>> {
+        self.frozen_memtables.lock().clone()
+    }
+
     /// Searches frozen memtables for a key (newest to oldest).
     ///
     /// Returns the value if found, respecting tombstones.
