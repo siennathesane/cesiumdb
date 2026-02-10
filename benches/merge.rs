@@ -22,10 +22,14 @@ use criterion::{
     criterion_group,
     criterion_main,
 };
+use mimalloc::MiMalloc;
 use rand::{
     Rng,
-    thread_rng,
+    rng,
 };
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 struct TestData {
     tables: Vec<Memtable>,
@@ -35,7 +39,7 @@ struct TestData {
 impl TestData {
     fn new(size: usize, memtable_count: usize) -> Self {
         let clock = HybridLogicalClock::new();
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut tables = Vec::with_capacity(memtable_count);
 
         // Create memtables
@@ -51,10 +55,10 @@ impl TestData {
 
             // Create overlapping data across memtables
             for table_idx in 0..memtable_count {
-                if rng.gen_bool(0.3) {
+                if rng.random_bool(0.3) {
                     // 30% chance of key appearing in each table
                     let ts = clock.time();
-                    let ts_offset = rng.gen_range(1..1000);
+                    let ts_offset = rng.random_range(1..1000);
 
                     let key = KeyBytes::new(DEFAULT_NS, Bytes::from(key.clone()), ts + ts_offset);
                     let val = ValueBytes::new(DEFAULT_NS, Bytes::from(val.clone()));
@@ -172,11 +176,11 @@ fn bench_latest_versions(c: &mut Criterion) {
                     b.iter_batched(
                         || TestData::new(size, *memtables),
                         |test_data| {
-                            let mut rng = thread_rng();
+                            let mut rng = rng();
 
                             // Get 1000 random latest versions
                             for _ in 0..1000 {
-                                let idx = rng.gen_range(0..size);
+                                let idx = rng.random_range(0..size);
                                 let current_key = format!("key_{:010}", idx);
                                 let next_key = format!("key_{:010}", idx + 1);
 

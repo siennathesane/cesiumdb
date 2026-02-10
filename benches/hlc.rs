@@ -7,6 +7,10 @@ use criterion::{
     criterion_group,
     criterion_main,
 };
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 pub fn clock_gettime(c: &mut Criterion) {
     let clock = HybridLogicalClock::new();

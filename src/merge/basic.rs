@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
 use std::{
-    cell::RefCell,
     cmp::{
         Ordering,
         Reverse,
@@ -10,12 +9,9 @@ use std::{
     collections::BinaryHeap,
 };
 
-use crate::{
-    keypair::{
-        KeyBytes,
-        ValueBytes,
-    },
-    peek::Peekable,
+use crate::keypair::{
+    KeyBytes,
+    ValueBytes,
 };
 
 /// MergeIterator is a merge iterator that merges multiple iterators into one.
@@ -39,9 +35,13 @@ where
         let heap = iters
             .into_iter()
             .enumerate()
-            .map(|(idx, iter)| HeapItem {
-                iter: RefCell::new(Peekable::new(iter)),
-                index: idx as u64,
+            .map(|(idx, mut iter)| {
+                let peeked = iter.next();
+                HeapItem {
+                    iter,
+                    peeked,
+                    index: idx as u64,
+                }
             })
             .collect();
         Self { iters: heap }
@@ -56,21 +56,20 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let smallest = match self.iters.pop() {
+            let mut smallest = match self.iters.pop() {
                 | None => return None,
                 | Some(v) => v,
             };
 
-            // Get next item and check if we have more items
-            let has_more = {
-                let mut iter = smallest.iter.borrow_mut();
-                iter.peek().is_some()
-            };
+            // Take the peeked value
+            let current_item = smallest.peeked.take();
 
-            let next_item = smallest.iter.borrow_mut().next();
+            // Peek the next value
+            smallest.peeked = smallest.iter.next();
+            let has_more = smallest.peeked.is_some();
 
             // Decide whether to push back the iterator based on conditions
-            match next_item {
+            match current_item {
                 | Some((key, value)) => {
                     // Skip pointer entries (ts == 0) unless it's the last item
                     if key.ts() == 0 {
@@ -97,8 +96,12 @@ where
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let mut size = 0;
-        for iter in self.iters.iter() {
-            size += iter.iter.borrow().size_hint().0;
+        for item in self.iters.iter() {
+            size += item.iter.size_hint().0;
+            // Add 1 if there's a peeked item
+            if item.peeked.is_some() {
+                size += 1;
+            }
         }
         (size, None)
     }
@@ -107,7 +110,8 @@ where
 pub(crate) struct HeapItem<I>
 where
     I: Iterator<Item = (KeyBytes, ValueBytes)>, {
-    iter: RefCell<Peekable<I>>,
+    iter: I,
+    peeked: Option<(KeyBytes, ValueBytes)>,
     index: u64,
 }
 
@@ -139,11 +143,8 @@ where
 {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        match (
-            self.iter.borrow_mut().peek(),
-            other.iter.borrow_mut().peek(),
-        ) {
-            | (Some((left, _)), Some((right, _))) => right.cmp(left),
+        match (&self.peeked, &other.peeked) {
+            | (Some((left, _)), Some((right, _))) => right.simd_cmp(left),
             | (Some(_), None) => Ordering::Less,
             | (None, Some(_)) => Ordering::Greater,
             | (None, None) => other.index.cmp(&self.index),

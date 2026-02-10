@@ -31,9 +31,13 @@ use criterion::{
     criterion_group,
     criterion_main,
 };
+use mimalloc::MiMalloc;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::Rng;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 use tempfile::{
     TempDir,
     tempdir,
@@ -257,11 +261,11 @@ fn bench_segment_get(c: &mut Criterion, dir: &TempDir) {
                         // create reader at the start of each benchmark iteration
                         let reader = Arc::get_mut(segment).unwrap().new_reader().unwrap();
                         // benchmark: perform random gets
-                        let mut rng = rand::thread_rng();
+                        let mut rng = rand::rng();
 
                         // pick 20 random keys to look up
                         for _ in 0..20 {
-                            let idx = rng.gen_range(0..keys.len());
+                            let idx = rng.random_range(0..keys.len());
                             // just black_box the result without unwrapping
                             black_box(reader.get(&keys[idx]));
                         }
@@ -321,9 +325,7 @@ fn bench_segment_scan(c: &mut Criterion, dir: &TempDir) {
                                 // store the raw key for later range bounds
                                 keys.push(key_bytes.clone().into());
 
-                                segment_ref
-                                    .write(&key_bytes, &value.serialize())
-                                    .unwrap();
+                                segment_ref.write(&key_bytes, &value.serialize()).unwrap();
                             }
 
                             segment_ref.flush().unwrap();

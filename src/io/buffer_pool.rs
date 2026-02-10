@@ -3,10 +3,20 @@
 //! This module provides a thread-safe pool of reusable buffers to minimize
 //! allocations during compaction and I/O operations.
 
-use bytes::{Bytes, BytesMut};
+use std::sync::{
+    Arc,
+    atomic::{
+        AtomicU64,
+        AtomicUsize,
+        Ordering,
+    },
+};
+
+use bytes::{
+    Bytes,
+    BytesMut,
+};
 use crossbeam_queue::SegQueue;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 /// Default buffer size (64 KB)
 pub const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
@@ -392,9 +402,9 @@ mod tests {
         let mut buffer = pool.get();
 
         // Test resize
-        buffer.resize(10, 0xFF);
+        buffer.resize(10, 0xff);
         assert_eq!(buffer.len(), 10);
-        assert_eq!(buffer[0], 0xFF);
+        assert_eq!(buffer[0], 0xff);
 
         // Test clear
         buffer.clear();

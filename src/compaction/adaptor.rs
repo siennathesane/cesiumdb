@@ -1,11 +1,24 @@
 //! Workload-adaptive compaction strategy selector
 //!
-//! Automatically adjusts compaction strategies based on observed workload patterns.
+//! Automatically adjusts compaction strategies based on observed workload
+//! patterns.
 
-use crate::compaction::workload::{WorkloadAnalysis, WorkloadPattern, WorkloadStats};
-use crate::levels::CompactionStrategy;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{
+        Duration,
+        Instant,
+    },
+};
+
+use crate::{
+    compaction::workload::{
+        WorkloadAnalysis,
+        WorkloadPattern,
+        WorkloadStats,
+    },
+    levels::CompactionStrategy,
+};
 
 /// Adaptation policy configuration
 #[derive(Debug, Clone)]
@@ -94,43 +107,43 @@ impl WorkloadAdaptor {
 
         // Determine recommended strategy based on workload pattern
         let recommended = match analysis.pattern {
-            WorkloadPattern::WriteHeavy => {
+            | WorkloadPattern::WriteHeavy => {
                 // Minimize write amplification
                 CompactionStrategy::Leveled {
                     fanout: 10,
                     target_file_count: 10,
                 }
-            }
-            WorkloadPattern::ReadHeavy => {
+            },
+            | WorkloadPattern::ReadHeavy => {
                 // Minimize read amplification
                 CompactionStrategy::Tiered {
                     size_ratio: 2.0,
                     min_merge_width: 2,
                     max_merge_width: 4,
                 }
-            }
-            WorkloadPattern::ScanHeavy => {
+            },
+            | WorkloadPattern::ScanHeavy => {
                 // Non-overlapping ranges help scans
                 CompactionStrategy::Leveled {
                     fanout: 10,
                     target_file_count: 10,
                 }
-            }
-            WorkloadPattern::PointLookup => {
+            },
+            | WorkloadPattern::PointLookup => {
                 // Bloom filters help point lookups
                 CompactionStrategy::Tiered {
                     size_ratio: 2.0,
                     min_merge_width: 2,
                     max_merge_width: 4,
                 }
-            }
-            WorkloadPattern::Balanced => {
+            },
+            | WorkloadPattern::Balanced => {
                 // Hybrid approach
                 CompactionStrategy::Leveled {
                     fanout: 8,
                     target_file_count: 8,
                 }
-            }
+            },
         };
 
         // Check if we should switch strategies
@@ -166,19 +179,10 @@ impl WorkloadAdaptor {
     /// Checks if two strategies are equivalent
     fn strategies_equivalent(&self, a: &CompactionStrategy, b: &CompactionStrategy) -> bool {
         match (a, b) {
-            (
-                CompactionStrategy::Tiered { .. },
-                CompactionStrategy::Tiered { .. },
-            ) => true,
-            (
-                CompactionStrategy::Leveled { .. },
-                CompactionStrategy::Leveled { .. },
-            ) => true,
-            (
-                CompactionStrategy::Universal { .. },
-                CompactionStrategy::Universal { .. },
-            ) => true,
-            _ => false,
+            | (CompactionStrategy::Tiered { .. }, CompactionStrategy::Tiered { .. }) => true,
+            | (CompactionStrategy::Leveled { .. }, CompactionStrategy::Leveled { .. }) => true,
+            | (CompactionStrategy::Universal { .. }, CompactionStrategy::Universal { .. }) => true,
+            | _ => false,
         }
     }
 
@@ -210,15 +214,15 @@ pub enum ChangeReason {
 impl std::fmt::Display for ChangeReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WorkloadPatternChange(pattern) => {
+            | Self::WorkloadPatternChange(pattern) => {
                 write!(f, "Workload pattern changed to {:?}", pattern)
-            }
-            Self::HighReadAmplification(amp) => {
+            },
+            | Self::HighReadAmplification(amp) => {
                 write!(f, "High read amplification ({:.2}x)", amp)
-            }
-            Self::HighWriteAmplification(amp) => {
+            },
+            | Self::HighWriteAmplification(amp) => {
                 write!(f, "High write amplification ({:.2}x)", amp)
-            }
+            },
         }
     }
 }

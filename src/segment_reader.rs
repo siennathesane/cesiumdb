@@ -13,6 +13,7 @@ use bytes::{
 };
 use crossbeam_queue::ArrayQueue;
 use tracing::instrument;
+
 use crate::{
     block::{
         BLOCK_SIZE,
@@ -43,6 +44,7 @@ use crate::{
         DEFAULT_SEGMENT_SIZE,
     },
     segment_iterator::{
+        RawSegmentScanIterator,
         SeekingBlockIterator,
         SegmentBlockIterator,
         SegmentScanIterator,
@@ -64,14 +66,48 @@ impl Default for ReadConfig {
     }
 }
 
+/// Simple fixed-size block cache using ring buffer
+#[derive(Debug)]
+struct BlockCache<const N: usize> {
+    entries: [(usize, Option<crate::block::ReadOnlyBlock>); N],
+    next: usize,
+}
+
+impl<const N: usize> BlockCache<N> {
+    fn new() -> Self {
+        Self {
+            entries: core::array::from_fn(|_| (0, None)),
+            next: 0,
+        }
+    }
+
+    #[inline]
+    fn get(&self, block_index: usize) -> Option<&crate::block::ReadOnlyBlock> {
+        // Linear search - faster than HashMap for N <= 8
+        for (idx, block) in &self.entries {
+            if *idx == block_index {
+                return block.as_ref();
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn insert(&mut self, block_index: usize, block: crate::block::ReadOnlyBlock) {
+        self.entries[self.next] = (block_index, Some(block));
+        self.next = (self.next + 1) % N;
+    }
+}
+
 #[derive(Debug)]
 pub struct SegmentReader {
     key_handle: Arc<Map>,
     val_handle: Arc<Map>,
-    pub(crate) key_index: Arc<parking_lot::Mutex<Index>>,
+    pub(crate) key_index: Arc<parking_lot::RwLock<Index>>,
     pub(crate) visible_key_blocks: usize,
     visible_val_blocks: usize,
     pub(crate) num_blocks: usize,
+    value_block_cache: parking_lot::Mutex<BlockCache<8>>,
 }
 
 impl SegmentReader {
@@ -79,21 +115,16 @@ impl SegmentReader {
     pub fn new(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
-        key_index: Arc<parking_lot::Mutex<Index>>,
+        key_index: Arc<parking_lot::RwLock<Index>>,
     ) -> Result<Self, SegmentError> {
-        Self::with_config(
-            key_handle,
-            val_handle,
-            key_index,
-            ReadConfig::default(),
-        )
+        Self::with_config(key_handle, val_handle, key_index, ReadConfig::default())
     }
 
     #[instrument(level = "trace")]
     pub(crate) fn with_config(
         key_handle: Arc<Map>,
         val_handle: Arc<Map>,
-        key_index: Arc<parking_lot::Mutex<Index>>,
+        key_index: Arc<parking_lot::RwLock<Index>>,
         config: ReadConfig,
     ) -> Result<Self, SegmentError> {
         let segment_size = key_handle.len();
@@ -104,14 +135,16 @@ impl SegmentReader {
 
         // Use the actual number of blocks that were written, not the file size
         // The file might be larger than the actual data due to pre-allocation
-        let index_blocks = key_index.lock().num_blocks() as usize;
+        let index_blocks = key_index.read().num_blocks() as usize;
         let num_blocks = segment_size / BLOCK_SIZE;
 
         // Determine visible blocks:
-        // - If index has num_blocks set (from metadata), use it (handles empty segments correctly)
+        // - If index has num_blocks set (from metadata), use it (handles empty segments
+        //   correctly)
         // - Otherwise (test segments or old files), fall back to file size
-        // We can't perfectly distinguish "empty segment" from "uninitialized test segment",
-        // but we can check if the file is pre-allocated to max size (64MB) with no data
+        // We can't perfectly distinguish "empty segment" from "uninitialized test
+        // segment", but we can check if the file is pre-allocated to max size
+        // (64MB) with no data
         let visible_key_blocks = if index_blocks > 0 {
             // Metadata says there are blocks - trust it
             index_blocks
@@ -131,18 +164,29 @@ impl SegmentReader {
             visible_key_blocks,
             visible_val_blocks,
             num_blocks,
+            value_block_cache: parking_lot::Mutex::new(BlockCache::new()),
         })
     }
 
     #[instrument(level = "trace")]
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, SegmentError> {
+        // Strip timestamp (last 16 bytes) before index lookup
+        // Index hashes [ns:8][user_key] to map all versions to same block
+        // Keys must be serialized: [ns:8][user_key][timestamp:16], minimum 24 bytes
+        debug_assert!(
+            key.len() >= 24,
+            "Key too short: {} bytes. Keys must be serialized with KeyBytes::serialize()",
+            key.len()
+        );
+        let key_without_ts = &key[..key.len() - 16];
+
         // First check the bloom filter - quick reject if not present
-        if !self.key_index.lock().may_contain(key) {
+        if !self.key_index.read().may_contain(key_without_ts) {
             return Ok(None);
         }
 
         // Find which block might contain this key
-        let key_block_offset = match self.key_index.lock().get_block(key) {
+        let key_block_offset = match self.key_index.read().get_block(key_without_ts) {
             | Some(v) => v,
             | None => {
                 return Ok(None);
@@ -212,7 +256,10 @@ impl SegmentReader {
     }
 
     #[instrument(level = "trace")]
-    pub(crate) fn read_key_block(&self, block_index: usize) -> Result<Block, SegmentError> {
+    pub(crate) fn read_key_block(
+        &self,
+        block_index: usize,
+    ) -> Result<crate::block::ReadOnlyBlock, SegmentError> {
         if block_index >= self.visible_key_blocks {
             return Err(ReadOutOfBounds);
         }
@@ -232,7 +279,8 @@ impl SegmentReader {
     /// # Arguments
     /// * `flag` - Entry flag from the initial block
     /// * `initial_data` - Data from the initial block entry
-    /// * `starting_block` - Block index where the entry starts (for multi-block entries, where to continue reading)
+    /// * `starting_block` - Block index where the entry starts (for multi-block
+    ///   entries, where to continue reading)
     ///
     /// # Returns
     /// The complete entry data, reassembled if it was split across blocks
@@ -245,8 +293,8 @@ impl SegmentReader {
         use EntryFlag::*;
 
         match flag {
-            Complete => Ok(Bytes::copy_from_slice(initial_data)),
-            Start => {
+            | Complete => Ok(Bytes::copy_from_slice(initial_data)),
+            | Start => {
                 let mut buffer = BytesMut::with_capacity(initial_data.len() * 2);
                 buffer.extend_from_slice(initial_data);
 
@@ -254,26 +302,31 @@ impl SegmentReader {
                 let mut found_end = false;
 
                 while current_block_index < self.visible_key_blocks && !found_end {
-                    let next_block = self.read_key_block(current_block_index)?;
+                    let next_block = match self.read_key_block(current_block_index) {
+                        | Ok(b) => b,
+                        | Err(e) => return Err(e),
+                    };
 
                     if next_block.num_entries() == 0 {
                         current_block_index += 1;
                         continue;
                     }
 
-                    let (next_flag, next_data) = next_block.get(0)
-                        .ok_or(CorruptedBlock)?;
+                    let (next_flag, next_data) = match next_block.get(0).ok_or(CorruptedBlock) {
+                        | Ok(v) => v,
+                        | Err(e) => return Err(e),
+                    };
 
                     match next_flag {
-                        Middle => {
+                        | Middle => {
                             buffer.extend_from_slice(next_data);
                             current_block_index += 1;
                         },
-                        End => {
+                        | End => {
                             buffer.extend_from_slice(next_data);
                             found_end = true;
                         },
-                        _ => return Err(CorruptedBlock),
+                        | _ => return Err(CorruptedBlock),
                     }
                 }
 
@@ -283,13 +336,19 @@ impl SegmentReader {
 
                 Ok(buffer.freeze())
             },
-            Middle | End => Err(CorruptedBlock),
+            | Middle | End => Err(CorruptedBlock),
         }
     }
 
     fn read_key(&self, key_block_index: usize, entry_index: usize) -> Result<Bytes, SegmentError> {
-        let block = self.read_key_block(key_block_index)?;
-        let (flag, data) = block.get(entry_index).ok_or(MissingKey)?;
+        let block = match self.read_key_block(key_block_index) {
+            | Ok(b) => b,
+            | Err(e) => return Err(e),
+        };
+        let (flag, data) = match block.get(entry_index).ok_or(MissingKey) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
 
         // Use helper to handle multi-block entries
         self.read_multiblock_entry(flag, data, key_block_index + 1)
@@ -306,12 +365,30 @@ impl SegmentReader {
             return Err(ReadOutOfBounds);
         }
 
-        // Read the value block
-        let block = match self.read_block_at(val_block_index, Value) {
-            | Ok(v) => v,
-            | Err(e) => {
-                return Err(e);
-            },
+        // Try to get from cache first
+        let block = {
+            let cache = self.value_block_cache.lock();
+            if let Some(cached_block) = cache.get(val_block_index) {
+                // Cache hit - clone the block
+                cached_block.clone()
+            } else {
+                // Cache miss - drop lock before expensive read
+                drop(cache);
+
+                // Read the value block from disk
+                let block = match self.read_block_at(val_block_index, Value) {
+                    | Ok(v) => v,
+                    | Err(e) => {
+                        return Err(e);
+                    },
+                };
+
+                // Insert into cache
+                self.value_block_cache
+                    .lock()
+                    .insert(val_block_index, block.clone());
+                block
+            }
         };
 
         // Check if the entry exists
@@ -393,7 +470,10 @@ impl SegmentReader {
 
     fn find_key(&self, key_hash: u64, key_block_offset: u64) -> Result<Bytes, SegmentError> {
         let block_index = key_block_offset as usize;
-        let block = self.read_key_block(block_index)?;
+        let block = match self.read_key_block(block_index) {
+            | Ok(b) => b,
+            | Err(e) => return Err(e),
+        };
 
         if let Some((flag, data)) = block.get(0) {
             return self.read_multiblock_entry(flag, data, block_index + 1);
@@ -432,30 +512,51 @@ impl SegmentReader {
         &self,
         block_index: usize,
         block_type: BlockType,
-    ) -> Result<Block, SegmentError> {
+    ) -> Result<crate::block::ReadOnlyBlock, SegmentError> {
         let offset = block_index * BLOCK_SIZE;
-        let mut buffer = BytesMut::zeroed(BLOCK_SIZE);
 
-        match block_type {
+        // Directly create Bytes from mmap without intermediate copy
+        let bytes = match block_type {
             | Key => {
                 if offset + BLOCK_SIZE > self.key_handle.len() {
                     return Err(ReadOutOfBounds);
                 }
 
-                buffer.copy_from_slice(&self.key_handle[offset..offset + BLOCK_SIZE]);
+                match self.key_handle.read_range(offset..offset + BLOCK_SIZE, |slice| {
+                    Bytes::copy_from_slice(slice)
+                }) {
+                    | Ok(b) => b,
+                    | Err(e) => return Err(e),
+                }
             },
             | Value => {
                 if offset + BLOCK_SIZE > self.val_handle.len() {
                     return Err(ReadOutOfBounds);
                 }
 
-                buffer.copy_from_slice(&self.val_handle[offset..offset + BLOCK_SIZE]);
+                match self.val_handle.read_range(offset..offset + BLOCK_SIZE, |slice| {
+                    Bytes::copy_from_slice(slice)
+                }) {
+                    | Ok(b) => b,
+                    | Err(e) => return Err(e),
+                }
             },
-        }
+        };
 
-        let block = Block::deserialize(buffer.freeze());
+        let block = crate::block::ReadOnlyBlock::deserialize(bytes);
 
         Ok(block)
+    }
+
+    /// Check if a key might be in this segment using the bloom filter.
+    ///
+    /// This is a fast negative check - if it returns false, the key is
+    /// definitely not in the segment. If it returns true, the key might
+    /// be in the segment (subject to false positive rate).
+    ///
+    /// The key should have the timestamp stripped (last 16 bytes removed).
+    pub fn may_contain(&self, key_without_timestamp: &[u8]) -> bool {
+        self.key_index.read().may_contain(key_without_timestamp)
     }
 
     /// Create a new iterator to scan a range of keys in the segment.
@@ -473,8 +574,16 @@ impl SegmentReader {
         // Determine starting block based on lower bound
         let start_block = match lower_bound {
             | Bound::Included(key) | Bound::Excluded(key) => {
+                // Strip timestamp (last 16 bytes) before index lookup
+                // Index hashes [ns:8][user_key] to map all versions to same block
+                debug_assert!(
+                    key.len() >= 24,
+                    "Scan key too short: {} bytes. Keys must be serialized",
+                    key.len()
+                );
+                let key_without_ts = &key[..key.len() - 16];
                 // Use the index to find the block that would contain this key
-                match self.key_index.lock().get_block(key) {
+                match self.key_index.read().get_block(key_without_ts) {
                     | Some(block_offset) => block_offset as usize,
                     | None => 0, // Start from the beginning if not found
                 }
@@ -482,7 +591,37 @@ impl SegmentReader {
             | Bound::Unbounded => 0, // Start from the beginning
         };
 
-        SegmentScanIterator::new(self, (lower_bound, upper_bound))
+        SegmentScanIterator::new(self, (lower_bound, upper_bound), start_block)
+    }
+
+    /// Create a raw scan iterator for compaction (zero-copy, no
+    /// deserialization).
+    ///
+    /// Same logic as `scan()` but returns `RawSegmentScanIterator` which yields
+    /// `RawEntry` instead of `(KeyBytes, ValueBytes)`.
+    #[instrument(level = "trace")]
+    pub(crate) fn scan_raw<'a>(
+        &'a self,
+        lower_bound: Bound<&[u8]>,
+        upper_bound: Bound<&[u8]>,
+    ) -> RawSegmentScanIterator<'a> {
+        let start_block = match lower_bound {
+            | Bound::Included(key) | Bound::Excluded(key) => {
+                debug_assert!(
+                    key.len() >= 24,
+                    "Scan key too short: {} bytes. Keys must be serialized",
+                    key.len()
+                );
+                let key_without_ts = &key[..key.len() - 16];
+                match self.key_index.read().get_block(key_without_ts) {
+                    | Some(block_offset) => block_offset as usize,
+                    | None => 0,
+                }
+            },
+            | Bound::Unbounded => 0,
+        };
+
+        RawSegmentScanIterator::new(self, (lower_bound, upper_bound), start_block)
     }
 
     /// Get the total number of blocks in this segment
@@ -510,6 +649,14 @@ mod tests {
         },
         map::Map,
     };
+
+    // Helper to create a serialized test key: [ns:8][user_key][timestamp:16]
+    fn create_test_key(user_key: &[u8]) -> Vec<u8> {
+        let mut key = vec![0u8; 8]; // namespace (8 bytes)
+        key.extend_from_slice(user_key); // user key
+        key.extend_from_slice(&[0u8; 16]); // timestamp (16 bytes)
+        key
+    }
 
     // Helper function to create a temporary Map with specified size
     fn create_test_map(size: usize) -> (tempfile::TempDir, Arc<Map>) {
@@ -593,7 +740,11 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let reader = SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index)));
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        );
         assert!(reader.is_ok());
 
         let reader = reader.unwrap();
@@ -610,7 +761,11 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let result = SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index)));
+        let result = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        );
         assert!(result.is_err());
         assert!(matches!(result.err().unwrap(), InvalidSize));
     }
@@ -623,8 +778,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // Read each block and verify contents
         for i in 0..4 {
@@ -642,8 +801,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         let result = reader.read_key_block(2); // Only 2 blocks exist (0 and 1)
         assert!(result.is_err());
@@ -658,8 +821,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // First read
         let block0 = reader.read_key_block(0).unwrap();
@@ -686,8 +853,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // Access blocks in non-sequential order
         let indices = [3, 1, 5, 0, 7, 2];
@@ -706,10 +877,15 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let mut reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
-        let blocks: Vec<Block> = reader.iter().map(|result| result.unwrap()).collect();
+        let blocks: Vec<crate::block::ReadOnlyBlock> =
+            reader.iter().map(|result| result.unwrap()).collect();
 
         assert_eq!(blocks.len(), 3);
 
@@ -726,8 +902,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let mut reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
         let mut iter = reader.seeking_iter();
 
         // Start at beginning
@@ -759,8 +939,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let mut reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // Test regular iterator
         let iter = reader.iter();
@@ -772,8 +956,12 @@ mod tests {
         let key_index2 = Index::new(1, 1234);
         let val_index2 = Index::new(1, 1234);
 
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index2))).unwrap();
+        let mut reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index2)),
+        )
+        .unwrap();
 
         // Test seeking iterator
         let mut seeking_iter = reader.seeking_iter();
@@ -792,8 +980,12 @@ mod tests {
         let key_index = Index::new(1, 1234);
         let val_index = Index::new(1, 1234);
 
-        let mut reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let mut reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
         let mut iter = reader.seeking_iter();
 
         assert_eq!(iter.blocks_remaining(), 5);
@@ -811,16 +1003,18 @@ mod tests {
     fn test_get_with_complete_key() {
         let (dir, key_map, val_map, mut key_index, mut val_index) = prepare_test_segment_for_get();
 
-        // create test key and value
-        let key = b"test_key";
+        // create test key and value (key must be serialized)
+        let key = create_test_key(b"test_key");
         let value = b"test_value";
 
         // Value is at block 0, entry 0
-        let key_with_metadata = add_key_metadata(key, 0, 0);
+        let key_with_metadata = add_key_metadata(&key, 0, 0);
 
         // create blocks
         let mut key_block = Block::new();
-        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
+        key_block
+            .add_entry(&key_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         let mut val_block = Block::new();
         val_block.add_entry(value, EntryFlag::Complete).unwrap();
@@ -829,19 +1023,24 @@ mod tests {
         write_block_to_mapfor_get(&key_map, 0, &key_block);
         write_block_to_mapfor_get(&val_map, 0, &val_block);
 
-        // update indexes (index the original key without metadata)
-        key_index.insert_item(key);
+        // update indexes (index key without timestamp - strip last 16 bytes)
+        let key_without_ts = &key[..key.len() - 16];
+        key_index.insert_item(key_without_ts);
         key_index.inc_block_count(1);
 
-        val_index.insert_item(key);
+        val_index.insert_item(key_without_ts);
         val_index.inc_block_count(1);
 
         // create segment reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // test get
-        let result = reader.get(key).unwrap();
+        let result = reader.get(&key).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().as_ref(), value);
     }
@@ -851,12 +1050,16 @@ mod tests {
         let (dir, key_map, val_map, key_index, val_index) = prepare_test_segment_for_get();
 
         // create segment reader without any data
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
-        // test get with non-existent key
-        let nonexistent_key = b"nonexistent_key";
-        let result = reader.get(nonexistent_key).unwrap();
+        // test get with non-existent key (must be serialized)
+        let nonexistent_key = create_test_key(b"nonexistent_key");
+        let result = reader.get(&nonexistent_key).unwrap();
         assert!(result.is_none());
     }
 
@@ -864,19 +1067,21 @@ mod tests {
     fn test_get_with_multiblock_key() {
         let (dir, key_map, val_map, mut key_index, mut val_index) = prepare_test_segment_for_get();
 
-        // create a key
-        let key = b"test_key";
+        // create a key (must be serialized)
+        let key = create_test_key(b"test_key");
 
         // Create a moderately sized value that will span two blocks
         // Using a much smaller fixed size to avoid any size calculation issues
         let large_value = vec![b'v'; 1000]; // 1000 bytes is safe and still tests the functionality
 
         // Value starts at block 0, entry 0
-        let key_with_metadata = add_key_metadata(key, 0, 0);
+        let key_with_metadata = add_key_metadata(&key, 0, 0);
 
         // create and prepare key block
         let mut key_block = Block::new();
-        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
+        key_block
+            .add_entry(&key_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         // create and prepare value blocks (start, end)
         let mut val_block1 = Block::new();
@@ -894,19 +1099,24 @@ mod tests {
         write_block_to_mapfor_get(&val_map, 0, &val_block1);
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2);
 
-        // update indexes (index the original key without metadata)
-        key_index.insert_item(key);
+        // update indexes (index key without timestamp - strip last 16 bytes)
+        let key_without_ts = &key[..key.len() - 16];
+        key_index.insert_item(key_without_ts);
         key_index.inc_block_count(1);
 
-        val_index.insert_item(key);
-        val_index.inc_block_count(2);  // Value spans 2 blocks
+        val_index.insert_item(key_without_ts);
+        val_index.inc_block_count(2); // Value spans 2 blocks
 
         // create segment reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // test get with large value
-        let result = reader.get(key).unwrap();
+        let result = reader.get(&key).unwrap();
         assert!(result.is_some());
 
         let retrieved_value = result.unwrap();
@@ -918,18 +1128,20 @@ mod tests {
     fn test_get_with_multiblock_key_and_value() {
         let (dir, key_map, val_map, mut key_index, mut val_index) = prepare_test_segment_for_get();
 
-        // Create a simple, small key for easier debugging
-        let key = b"multi_key";
+        // Create a simple, small key for easier debugging (must be serialized)
+        let key = create_test_key(b"multi_key");
 
         // Create smaller value that spans blocks but is easier to debug
         let value = vec![b'v'; 800];
 
         // Value starts at block 0, entry 0
-        let key_with_metadata = add_key_metadata(key, 0, 0);
+        let key_with_metadata = add_key_metadata(&key, 0, 0);
 
         // Create key block - just use a simple single-block key
         let mut key_block = Block::new();
-        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
+        key_block
+            .add_entry(&key_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         // Create value blocks with smaller chunks
         let mut val_block1 = Block::new();
@@ -945,27 +1157,35 @@ mod tests {
         write_block_to_mapfor_get(&val_map, 0, &val_block1);
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2);
 
-        // Update indexes - make sure the same exact key is used
-        key_index.insert_item(key);
+        // Update indexes - index key without timestamp - strip last 16 bytes
+        let key_without_ts = &key[..key.len() - 16];
+        key_index.insert_item(key_without_ts);
         key_index.inc_block_count(1);
 
-        val_index.insert_item(key);
-        val_index.inc_block_count(2);  // Value spans 2 blocks
+        val_index.insert_item(key_without_ts);
+        val_index.inc_block_count(2); // Value spans 2 blocks
 
         // Debug: Verify the key is in the index
-        assert!(key_index.may_contain(key), "Key should be in bloom filter");
-        let block_offset = key_index.get_block(key);
+        assert!(
+            key_index.may_contain(key_without_ts),
+            "Key should be in bloom filter"
+        );
+        let block_offset = key_index.get_block(key_without_ts);
         assert!(
             block_offset.is_some(),
             "Block for key should be found in index"
         );
 
         // Create segment reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // Test get with the key
-        let result = reader.get(key);
+        let result = reader.get(&key);
 
         assert!(result.is_ok(), "Result should be Ok");
         let result_value = result.unwrap();
@@ -985,12 +1205,16 @@ mod tests {
         key_index.insert_item(b"other_key2");
 
         // create segment reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
-        // our test key should not be in the bloom filter
-        let test_key = b"test_key";
-        let result = reader.get(test_key).unwrap();
+        // our test key should not be in the bloom filter (must be serialized)
+        let test_key = create_test_key(b"test_key");
+        let result = reader.get(&test_key).unwrap();
         assert!(result.is_none());
         // The early bloom filter check should prevent block lookups
     }
@@ -999,16 +1223,22 @@ mod tests {
     fn test_get_with_empty_blocks() {
         let (dir, key_map, val_map, mut key_index, val_index) = prepare_test_segment_for_get();
 
-        // create test key and add to bloom filter, but don't add blocks
-        let key = b"test_key";
-        key_index.insert_item(key);
+        // create test key and add to bloom filter, but don't add blocks (must be
+        // serialized)
+        let key = create_test_key(b"test_key");
+        let key_without_ts = &key[..key.len() - 16];
+        key_index.insert_item(key_without_ts);
 
         // create segment reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // key is in bloom filter but not in any block
-        let result = reader.get(key).unwrap();
+        let result = reader.get(&key).unwrap();
         assert!(result.is_none());
     }
 
@@ -1016,15 +1246,17 @@ mod tests {
     fn test_get_with_corrupted_blocks() {
         let (dir, key_map, val_map, mut key_index, mut val_index) = prepare_test_segment_for_get();
 
-        // create test key
-        let key = b"test_key";
+        // create test key (must be serialized)
+        let key = create_test_key(b"test_key");
 
         // Value starts at block 0, entry 0
-        let key_with_metadata = add_key_metadata(key, 0, 0);
+        let key_with_metadata = add_key_metadata(&key, 0, 0);
 
         // create key block with valid entry
         let mut key_block = Block::new();
-        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
+        key_block
+            .add_entry(&key_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         // add corrupted value block (with wrong flag sequence)
         let mut val_block = Block::new();
@@ -1034,19 +1266,24 @@ mod tests {
         write_block_to_mapfor_get(&key_map, 0, &key_block);
         write_block_to_mapfor_get(&val_map, 0, &val_block);
 
-        // update indexes (index the original key without metadata)
-        key_index.insert_item(key);
+        // update indexes (index key without timestamp - strip last 16 bytes)
+        let key_without_ts = &key[..key.len() - 16];
+        key_index.insert_item(key_without_ts);
         key_index.inc_block_count(1);
 
-        val_index.insert_item(key);
+        val_index.insert_item(key_without_ts);
         val_index.inc_block_count(1);
 
         // create segment reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // should return error due to corrupted blocks (missing End flag)
-        let result = reader.get(key);
+        let result = reader.get(&key);
         assert!(result.is_err());
         assert!(matches!(result.err().unwrap(), CorruptedBlock));
     }
@@ -1055,29 +1292,36 @@ mod tests {
     fn test_get_with_multiple_keys_in_block() {
         let (dir, key_map, val_map, mut key_index, mut val_index) = prepare_test_segment_for_get();
 
-        // create test keys
-        let key1 = b"test_key1";
-        let key2 = b"test_key2";
-        let key3 = b"test_key3";
+        // create test keys (must be serialized)
+        let key1 = create_test_key(b"test_key1");
+        let key2 = create_test_key(b"test_key2");
+        let key3 = create_test_key(b"test_key3");
 
         let val1 = b"value1";
         let val2 = b"value2";
         let val3 = b"value3";
 
-        // Add metadata: key1 -> val_block 0, entry 0; key2 -> val_block 1, entry 0; key3 -> val_block 2, entry 0
-        let key1_with_metadata = add_key_metadata(key1, 0, 0);
-        let key2_with_metadata = add_key_metadata(key2, 1, 0);
-        let key3_with_metadata = add_key_metadata(key3, 2, 0);
+        // Add metadata: key1 -> val_block 0, entry 0; key2 -> val_block 1, entry 0;
+        // key3 -> val_block 2, entry 0
+        let key1_with_metadata = add_key_metadata(&key1, 0, 0);
+        let key2_with_metadata = add_key_metadata(&key2, 1, 0);
+        let key3_with_metadata = add_key_metadata(&key3, 2, 0);
 
         // Create individual blocks for each key
         let mut key_block1 = Block::new();
-        key_block1.add_entry(&key1_with_metadata, EntryFlag::Complete).unwrap();
+        key_block1
+            .add_entry(&key1_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         let mut key_block2 = Block::new();
-        key_block2.add_entry(&key2_with_metadata, EntryFlag::Complete).unwrap();
+        key_block2
+            .add_entry(&key2_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         let mut key_block3 = Block::new();
-        key_block3.add_entry(&key3_with_metadata, EntryFlag::Complete).unwrap();
+        key_block3
+            .add_entry(&key3_with_metadata, EntryFlag::Complete)
+            .unwrap();
 
         // Create individual blocks for each value
         let mut val_block1 = Block::new();
@@ -1098,39 +1342,47 @@ mod tests {
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE, &val_block2); // Block 1
         write_block_to_mapfor_get(&val_map, BLOCK_SIZE * 2, &val_block3); // Block 2
 
-        // Add to indexes - index the original keys (without metadata)
-        key_index.insert_item(key1);  // Block 0
+        // Add to indexes - index keys without timestamp - strip last 16 bytes
+        let key1_without_ts = &key1[..key1.len() - 16];
+        let key2_without_ts = &key2[..key2.len() - 16];
+        let key3_without_ts = &key3[..key3.len() - 16];
+
+        key_index.insert_item(key1_without_ts); // Block 0
         key_index.inc_block_count(1);
 
-        key_index.insert_item(key2);  // Block 1
+        key_index.insert_item(key2_without_ts); // Block 1
         key_index.inc_block_count(1);
 
-        key_index.insert_item(key3);  // Block 2
+        key_index.insert_item(key3_without_ts); // Block 2
         key_index.inc_block_count(1);
 
-        val_index.insert_item(key1);  // Block 0
+        val_index.insert_item(key1_without_ts); // Block 0
         val_index.inc_block_count(1);
 
-        val_index.insert_item(key2);  // Block 1
+        val_index.insert_item(key2_without_ts); // Block 1
         val_index.inc_block_count(1);
 
-        val_index.insert_item(key3);  // Block 2
+        val_index.insert_item(key3_without_ts); // Block 2
         val_index.inc_block_count(1);
 
         // Create reader
-        let reader =
-            SegmentReader::new(key_map.clone(), val_map.clone(), Arc::new(parking_lot::Mutex::new(key_index))).unwrap();
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
 
         // Test get for each key
-        let result1 = reader.get(key1).unwrap();
+        let result1 = reader.get(&key1).unwrap();
         assert!(result1.is_some());
         assert_eq!(result1.unwrap().as_ref(), val1);
 
-        let result2 = reader.get(key2).unwrap();
+        let result2 = reader.get(&key2).unwrap();
         assert!(result2.is_some());
         assert_eq!(result2.unwrap().as_ref(), val2);
 
-        let result3 = reader.get(key3).unwrap();
+        let result3 = reader.get(&key3).unwrap();
         assert!(result3.is_some());
         assert_eq!(result3.unwrap().as_ref(), val3);
     }

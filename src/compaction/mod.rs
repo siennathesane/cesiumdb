@@ -9,26 +9,66 @@
 //! - Adaptive resource management
 //! - Workload-aware strategy selection
 
-pub mod job;
-pub mod scheduler;
-pub mod executor;
-pub mod queue;
-pub mod registry;
 pub mod adaptive;
-pub mod workload;
 pub mod adaptor;
+pub mod executor;
+pub mod job;
+pub mod manager;
 pub mod parallel;
-pub mod subcompaction;
+pub mod queue;
 pub mod range_deletion;
+pub mod registry;
+pub mod scheduler;
+pub mod subcompaction;
+pub mod workload;
 
-pub use job::{CompactionJob, CompactionJobType};
-pub use scheduler::CompactionScheduler;
+pub use adaptive::{
+    AdaptiveExecutor,
+    ResourceLimits,
+    ResourceUsage,
+};
+pub use adaptor::{
+    AdaptationPolicy,
+    StrategyRecommendation,
+    WorkloadAdaptor,
+};
 pub use executor::CompactionExecutor;
-pub use queue::{CompactionQueue, JobPriority, QueueStats};
-pub use registry::{SegmentRegistry, RegistryStats};
-pub use adaptive::{AdaptiveExecutor, ResourceLimits, ResourceUsage};
-pub use workload::{WorkloadStats, WorkloadPattern, WorkloadAnalysis};
-pub use adaptor::{WorkloadAdaptor, AdaptationPolicy, StrategyRecommendation};
-pub use parallel::{ParallelCompactionCoordinator, ParallelCompactionManager, ParallelStats};
-pub use subcompaction::{SubcompactionPlanner, SubcompactionConfig, SubcompactionJob, SubcompactionStats};
-pub use range_deletion::{RangeTombstone, RangeTombstoneManager, RangeDeletionStats};
+pub use job::{
+    CompactionJob,
+    CompactionJobType,
+};
+pub use manager::{
+    CompactionManager,
+    CompactionStats,
+};
+pub use parallel::{
+    ParallelCompactionCoordinator,
+    ParallelCompactionManager,
+    ParallelStats,
+};
+pub use queue::{
+    CompactionQueue,
+    JobPriority,
+    QueueStats,
+};
+pub use range_deletion::{
+    RangeDeletionStats,
+    RangeTombstone,
+    RangeTombstoneManager,
+};
+pub use registry::{
+    RegistryStats,
+    SegmentRegistry,
+};
+pub use scheduler::CompactionScheduler;
+pub use subcompaction::{
+    SubcompactionConfig,
+    SubcompactionJob,
+    SubcompactionPlanner,
+    SubcompactionStats,
+};
+pub use workload::{
+    WorkloadAnalysis,
+    WorkloadPattern,
+    WorkloadStats,
+};

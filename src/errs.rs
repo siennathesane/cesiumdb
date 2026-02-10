@@ -9,6 +9,24 @@ use thiserror::Error;
 use crate::segment::BlockType;
 
 #[derive(Error, Debug)]
+pub enum ManifestError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("corrupted manifest header")]
+    CorruptedHeader,
+    #[error("invalid magic number: expected 0x43455349, got {0:#x}")]
+    InvalidMagic(u32),
+    #[error("unsupported manifest version: {0}")]
+    UnsupportedVersion(u32),
+    #[error("CRC mismatch: expected {expected:#x}, got {actual:#x}")]
+    CrcMismatch { expected: u32, actual: u32 },
+    #[error("invalid VersionEdit type: {0:#x}")]
+    InvalidEditType(u8),
+    #[error("segment error: {0}")]
+    SegmentError(#[from] SegmentError),
+}
+
+#[derive(Error, Debug)]
 pub enum CesiumError {
     #[error("memtable error")]
     MemtableError(MemtableError),
@@ -20,6 +38,26 @@ pub enum CesiumError {
     SegmentError(SegmentError),
     #[error("journal error")]
     JournalError(JournalError),
+    #[error("compaction error: {0}")]
+    CompactionError(#[from] CompactionError),
+    #[error("manifest error: {0}")]
+    ManifestError(#[from] ManifestError),
+}
+
+#[derive(Error, Debug)]
+pub enum CompactionError {
+    #[error("compaction not initialized")]
+    NotInitialized,
+    #[error("compaction job failed: {0}")]
+    JobFailed(String),
+    #[error("version changed during compaction")]
+    VersionChanged,
+    #[error("segment error: {0}")]
+    SegmentError(#[from] SegmentError),
+    #[error("I/O error: {0}")]
+    IoError(#[from] io::Error),
+    #[error("shutting down")]
+    ShuttingDown,
 }
 
 #[derive(Error, Debug)]
@@ -133,7 +171,10 @@ mod tests {
     #[test]
     fn test_memtable_error_display() {
         let err = MemtableError::DataExceedsMaximum;
-        assert_eq!(err.to_string(), "data insertion would exceed maximum capacity");
+        assert_eq!(
+            err.to_string(),
+            "data insertion would exceed maximum capacity"
+        );
 
         let err = MemtableError::MemtableIsFrozen;
         assert_eq!(err.to_string(), "memtable is frozen");
@@ -184,7 +225,10 @@ mod tests {
         assert_eq!(err.to_string(), "corrupted block");
 
         let err = SegmentError::Closing;
-        assert_eq!(err.to_string(), "segment is closing, no more blocks can be written");
+        assert_eq!(
+            err.to_string(),
+            "segment is closing, no more blocks can be written"
+        );
 
         let err = SegmentError::NotClosing;
         assert_eq!(err.to_string(), "segment is not closing");
@@ -206,7 +250,11 @@ mod tests {
     fn test_fs_error_display() {
         let err = FsError::InvalidHeaderFormat("bad header".to_string());
         let err_str = err.to_string();
-        assert!(err_str.contains("invalid header format"), "Error string: {}", err_str);
+        assert!(
+            err_str.contains("invalid header format"),
+            "Error string: {}",
+            err_str
+        );
         // Note: The error format doesn't include the string parameter in display
 
         let err = FsError::NoContiguousSpace;
@@ -353,7 +401,10 @@ mod tests {
         let block_err = BlockError::BlockFull;
         let cesium_err = CesiumError::BlockError(block_err);
 
-        assert!(matches!(cesium_err, CesiumError::BlockError(BlockError::BlockFull)));
+        assert!(matches!(
+            cesium_err,
+            CesiumError::BlockError(BlockError::BlockFull)
+        ));
     }
 
     #[test]

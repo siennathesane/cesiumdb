@@ -26,6 +26,7 @@ use bytes::Bytes;
 use crossbeam_channel::{
     Sender,
     bounded,
+    unbounded,
 };
 use crossbeam_skiplist::{
     SkipMap,
@@ -37,6 +38,7 @@ use crossbeam_skiplist::{
 use gxhash::gxhash64;
 use parking_lot::Mutex;
 use rand::random;
+use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::{
@@ -60,7 +62,9 @@ use crate::{
     },
 };
 
-pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 2 << 28; // 256MiB
+// Default shard size: 64MB per shard for Scylla-style sharding
+// With 8-10 cores, this gives ~512-640MB total memtable memory
+pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 64 * 1024 * 1024; // 64MiB per shard
 
 #[derive(Debug)]
 pub struct Memtable {
@@ -71,6 +75,9 @@ pub struct Memtable {
     map: Arc<SkipMap<Bytes, Bytes>>,
     size: AtomicU64,
     max_size: AtomicU64,
+    entry_count: AtomicU64,
+    total_bytes_written: AtomicU64, // For calculating actual average entry size
+    max_entries: AtomicU64,         // Atomic for dynamic adjustment
     frozen: Arc<AtomicBool>,
     // TODO(@siennathesane): add optional wal hook to memtable
     // nb (sienna): the retrieval performance on the memtable is so fucking good
@@ -80,25 +87,49 @@ pub struct Memtable {
 impl Memtable {
     pub fn new(id: u64, max_size: u64) -> Self {
         let frozen = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = bounded::<Bytes>(1_000);
+        let (tx, rx) = unbounded::<Bytes>();
         let gx_seed: Arc<i64> = Arc::new(random());
         let bloom = Arc::new(Mutex::new(
             BloomFilterBuilder::default().size(KeyBytes3).build(),
         ));
 
-        // background thread because
+        // background thread for batched bloom filter updates
         let frozen_clone = frozen.clone();
         let bloom_clone = bloom.clone();
         let seed_clone = gx_seed.clone();
         thread::spawn(move || {
+            let mut batch = Vec::with_capacity(1000);
             while !frozen_clone.load(Relaxed) {
-                while let Ok(_key_ptr) = rx.recv() {
-                    bloom_clone.lock().insert(&gxhash64(&_key_ptr, *seed_clone))
+                // Blocking receive for first key
+                if let Ok(key) = rx.recv() {
+                    batch.push(key);
+
+                    // Drain available keys without blocking (up to batch size)
+                    while batch.len() < 1000 {
+                        match rx.try_recv() {
+                            | Ok(key) => batch.push(key),
+                            | Err(_) => break,
+                        }
+                    }
+
+                    // Lock once and insert all hashed keys
+                    {
+                        let mut bloom = bloom_clone.lock();
+                        for key_ptr in batch.drain(..) {
+                            bloom.insert(&gxhash64(&key_ptr, *seed_clone));
+                        }
+                    }
                 }
             }
             STATS.current_threads.fetch_sub(1, Relaxed);
         });
         STATS.current_threads.fetch_add(1, Relaxed);
+
+        // Conservative initial estimate: assume 1.5KB average, swap at 50%
+        // This will be dynamically adjusted based on actual observed entry sizes
+        // Swapping at 50% keeps SkipMap depth under ~14 levels for optimal CAS
+        // performance
+        let initial_max_entries = ((max_size as f64 / 1536.0) * 0.5) as u64;
 
         Memtable {
             id,
@@ -108,6 +139,9 @@ impl Memtable {
             map: Arc::new(SkipMap::new()),
             size: AtomicU64::new(0),
             max_size: AtomicU64::new(max_size),
+            entry_count: AtomicU64::new(0),
+            total_bytes_written: AtomicU64::new(0),
+            max_entries: AtomicU64::new(initial_max_entries),
             frozen,
         }
     }
@@ -139,10 +173,13 @@ impl Memtable {
     #[instrument(level = "debug")]
     #[inline]
     pub fn put(&self, key: KeyBytes, val: ValueBytes) -> Result<(), MemtableError> {
-        self.put_batch(&[(key, val)])
+        match self.put_batch(&[(key, val)]) {
+            | Ok(_) => Ok(()),
+            | Err(e) => Err(e),
+        }
     }
 
-    /// Puts a batch of [`data`] into the memtable.
+    /// Puts a batch of `data` into the memtable.
     ///
     /// With versioned keys, it can make O(1) lookups impossible while retaining
     /// the version history. To work around that, the memtable uses a "key
@@ -154,15 +191,26 @@ impl Memtable {
     /// 2.2s on a Macbook M1 Pro. This optimization allows for O(2) lookups.
     #[instrument(level = "debug")]
     #[inline]
-    pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<(), MemtableError> {
+    pub fn put_batch(&self, data: &[(KeyBytes, ValueBytes)]) -> Result<usize, MemtableError> {
         // we don't want to write to a frozen memtable
         if self.frozen.load(Relaxed) {
             return Err(MemtableIsFrozen);
         }
 
+        let mut written = 0;
         for (key, val) in data.iter() {
-            let _key = key.clone().serialize();
-            let _key_ptr = key.clone().serialize_for_latest();
+            // Check entry count FIRST to prevent SkipMap depth degradation
+            let current_entries = self.entry_count.load(Relaxed);
+            if current_entries >= self.max_entries.load(Relaxed) {
+                // Memtable is at optimal depth threshold - force swap
+                if written == 0 {
+                    return Err(DataExceedsMaximum);
+                }
+                return Ok(written);
+            }
+
+            let _key = key.serialize();
+            let _key_ptr = key.serialize_for_latest();
             let _val = val.serialize();
             // the key * value both have two u32 bits associated with them
             // on physical storage, so we account for that. we also have to
@@ -170,22 +218,42 @@ impl Memtable {
             // key)
             let payload_size = ((_key.len() * 3) + _val.len() + size_of::<u128>()) as u64;
 
-            // we don't want to exceed it
+            // Also check size limit (backup safety check)
             if payload_size + self.size.load(Relaxed) > self.max_size.load(Relaxed) {
-                return Err(DataExceedsMaximum);
+                // Return how many we wrote successfully
+                if written == 0 {
+                    return Err(DataExceedsMaximum);
+                }
+                return Ok(written);
             }
 
             self.map.insert(_key.clone(), _val);
             self.map.insert(_key_ptr.clone(), _key);
             self.size.fetch_add(payload_size, Relaxed);
+            self.total_bytes_written.fetch_add(payload_size, Relaxed);
+            self.entry_count.fetch_add(1, Relaxed);
+
+            // Dynamic adjustment: recalculate max_entries every 1000 entries
+            // based on actual observed average entry size
+            if current_entries > 0 && current_entries % 1000 == 0 {
+                let total_bytes = self.total_bytes_written.load(Relaxed);
+                let avg_entry_size = total_bytes / current_entries;
+
+                // Recalculate: 50% of max_size divided by actual average entry size
+                let new_max_entries =
+                    ((self.max_size.load(Relaxed) as f64 * 0.5) / avg_entry_size as f64) as u64;
+                self.max_entries.store(new_max_entries, Relaxed);
+            }
 
             // send to the background to prevent a massive performance hit
             let _ = self.tx.send(_key_ptr);
 
+            written += 1;
+
             // TODO(@siennathesane): wal hook on put_batch
         }
 
-        Ok(())
+        Ok(written)
     }
 
     #[instrument(level = "debug")]
@@ -210,6 +278,14 @@ impl Memtable {
 
     pub fn freeze(&self) {
         self.frozen.store(true, Relaxed);
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Relaxed)
+    }
+
+    pub fn contains(&self, key: &KeyBytes) -> bool {
+        self.get(key.clone()).is_some()
     }
 }
 
@@ -252,7 +328,10 @@ impl Iterator for MemtableIterator {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let entry = self.inner.next()?;
+            let entry = match self.inner.next() {
+                | Some(e) => e,
+                | None => return None,
+            };
             let key = KeyBytes::deserialize(entry.key().clone());
 
             // Skip "latest" pointer entries (these have ts=0 after inversion)
@@ -275,18 +354,24 @@ impl Iterator for MemtableIterator {
 #[cfg(test)]
 mod tests {
     #[cfg(not(loom))]
-    use std::{sync::Arc, thread};
-
-    #[cfg(loom)]
-    use loom::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicU64, Ordering},
-        },
+    use std::{
+        sync::Arc,
         thread,
     };
 
     use bytes::Bytes;
+    #[cfg(loom)]
+    use loom::{
+        sync::{
+            Arc,
+            atomic::{
+                AtomicBool,
+                AtomicU64,
+                Ordering,
+            },
+        },
+        thread,
+    };
     use rand::{
         Rng,
         RngCore,
@@ -368,7 +453,7 @@ mod tests {
         let memtable = Memtable::new(0, MAX_SIZE);
         let clock = HybridLogicalClock::new();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let buf = &mut [0_u8; MAX_SIZE as usize];
         rng.fill_bytes(buf);
 
@@ -389,7 +474,7 @@ mod tests {
         memtable.freeze();
         let clock = HybridLogicalClock::new();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let buf = &mut [0_u8; MAX_SIZE as usize];
         rng.fill_bytes(buf);
 
@@ -409,7 +494,10 @@ mod tests {
         let key = KeyBytes::new(DEFAULT_NS, Bytes::from("nonexistent"), 0);
 
         let result = memtable.get(key);
-        assert!(result.is_none(), "get on nonexistent key should return None");
+        assert!(
+            result.is_none(),
+            "get on nonexistent key should return None"
+        );
     }
 
     #[test]
@@ -427,7 +515,10 @@ mod tests {
 
         let new_size = memtable.size();
         assert!(new_size > 0, "size should increase after put");
-        assert!(new_size > initial_size, "size should be greater than initial");
+        assert!(
+            new_size > initial_size,
+            "size should be greater than initial"
+        );
     }
 
     #[test]
@@ -438,7 +529,10 @@ mod tests {
         let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), 0);
 
         let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
-        assert!(iter.next().is_none(), "scan on empty memtable should return no items");
+        assert!(
+            iter.next().is_none(),
+            "scan on empty memtable should return no items"
+        );
     }
 
     #[test]
@@ -468,7 +562,11 @@ mod tests {
 
         // insert multiple keys
         for i in 0..10 {
-            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{:02}", i)), clock.time());
+            let key = KeyBytes::new(
+                DEFAULT_NS,
+                Bytes::from(format!("key-{:02}", i)),
+                clock.time(),
+            );
             let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
             assert!(memtable.put(key, val).is_ok());
         }
@@ -480,7 +578,10 @@ mod tests {
         let items: Vec<_> = iter.collect();
 
         // should return items in the range
-        assert!(items.len() >= 1, "scan with bounds should return items in range");
+        assert!(
+            items.len() >= 1,
+            "scan with bounds should return items in range"
+        );
     }
 
     #[test]
@@ -566,7 +667,11 @@ mod tests {
         for ns in 0..5 {
             let key = KeyBytes::new(ns, key_name.clone(), 0);
             let result = memtable.get(key);
-            assert!(result.is_some(), "key in namespace {} should be retrievable", ns);
+            assert!(
+                result.is_some(),
+                "key in namespace {} should be retrievable",
+                ns
+            );
         }
     }
 
@@ -587,7 +692,8 @@ mod tests {
         let (lower, _upper) = iter.size_hint();
 
         // size_hint should return reasonable bounds
-        assert!(lower >= 0, "size hint lower bound should be non-negative");
+        // lower is usize, always >= 0, just verify we get a reasonable hint
+        let _ = lower;
     }
 
     #[test]
@@ -620,7 +726,10 @@ mod tests {
 
         // get should still work efficiently
         let result = memtable.get(KeyBytes::new(DEFAULT_NS, key_name, 0));
-        assert!(result.is_some(), "should retrieve latest version efficiently");
+        assert!(
+            result.is_some(),
+            "should retrieve latest version efficiently"
+        );
     }
 
     #[test]
@@ -638,7 +747,19 @@ mod tests {
         }
 
         let result = memtable.put_batch(&batch);
-        assert!(result.is_err(), "batch exceeding max size should fail");
+        // With partial write support, should write as many as fit
+        match result {
+            | Ok(written) => {
+                assert!(
+                    written < batch.len(),
+                    "should not write all entries when exceeding max"
+                );
+                assert!(written > 0, "should write at least some entries");
+            },
+            | Err(_) => {
+                // Also acceptable if even first entry doesn't fit
+            },
+        }
     }
 
     #[test]
@@ -654,7 +775,8 @@ mod tests {
 
             // Insert some data
             for i in 0..5 {
-                let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
+                let key =
+                    KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
                 let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
                 assert!(memtable.put(key, val).is_ok());
             }
@@ -667,11 +789,15 @@ mod tests {
         // Iterator should still work even though memtable is gone
         // This proves the Arc keeps the SkipMap alive
         let items: Vec<_> = iter.collect();
-        assert!(items.len() >= 1, "iterator should work after memtable is dropped");
+        assert!(
+            items.len() >= 1,
+            "iterator should work after memtable is dropped"
+        );
     }
 
     // Loom tests for atomic operation patterns
-    // These test the concurrency patterns used in memtable without the crossbeam dependencies
+    // These test the concurrency patterns used in memtable without the crossbeam
+    // dependencies
 
     #[test]
     #[cfg(loom)]
@@ -715,8 +841,8 @@ mod tests {
             // If frozen, we might have 0 or 1 writes depending on interleaving
             // This demonstrates the TOCTOU race condition
             if is_frozen && total_writes > 0 {
-                // This can happen: check passed, then freeze happened, then write completed
-                // This is the race condition!
+                // This can happen: check passed, then freeze happened, then
+                // write completed This is the race condition!
             }
         });
     }
@@ -765,7 +891,11 @@ mod tests {
             // Both operations might succeed due to TOCTOU, resulting in > max_size
             if wrote1 && wrote2 {
                 // This demonstrates the race: both checked, both passed, total exceeds max
-                assert!(final_size == 110, "Both writes succeeded, total = {}", final_size);
+                assert!(
+                    final_size == 110,
+                    "Both writes succeeded, total = {}",
+                    final_size
+                );
             }
         });
     }
@@ -840,9 +970,7 @@ mod tests {
                 f1.store(true, Relaxed);
             });
 
-            let t2 = thread::spawn(move || {
-                f2.load(Relaxed)
-            });
+            let t2 = thread::spawn(move || f2.load(Relaxed));
 
             t1.join().unwrap();
             let saw_frozen = t2.join().unwrap();

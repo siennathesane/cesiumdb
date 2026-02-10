@@ -5,18 +5,39 @@
 //! - Writing output segments
 //! - Updating the version set
 
-use crate::compaction::job::{CompactionJob, CompactionJobType};
-use crate::compact::compact;
-use crate::errs::SegmentError;
-use crate::levels::{KeyRange, VersionSet};
-use crate::memtable::Memtable;
-use crate::segment::Segment;
-use crate::segment_reader::SegmentReader;
-use crate::version::VersionManager;
-use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    ops::Bound,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::Arc,
+};
+
+use parking_lot::Mutex;
 use thiserror::Error;
+
+use crate::{
+    compact::compact_raw,
+    compaction::job::{
+        CompactionJob,
+        CompactionJobType,
+    },
+    errs::SegmentError,
+    levels::{
+        KeyRange,
+        VersionSet,
+    },
+    manifest_writer::ManifestWriter,
+    memtable::Memtable,
+    segment::Segment,
+    segment_reader::SegmentReader,
+    utils::Serializer,
+    version::{
+        VersionEdit,
+        VersionManager,
+    },
+};
 
 /// Compaction executor errors
 #[derive(Error, Debug)]
@@ -35,6 +56,9 @@ pub enum ExecutorError {
 
     #[error("Invalid job type: {0:?}")]
     InvalidJobType(CompactionJobType),
+
+    #[error("Flush jobs are handled by the background flusher, not the compaction executor")]
+    FlushNotRouted,
 }
 
 /// Result of a compaction job execution
@@ -65,15 +89,23 @@ pub struct CompactionExecutor {
     /// Version manager for atomic updates
     version_manager: Arc<VersionManager>,
 
+    /// Manifest writer for crash recovery
+    manifest: Option<Arc<Mutex<ManifestWriter>>>,
+
     /// Base directory for segment files
     base_path: PathBuf,
 }
 
 impl CompactionExecutor {
     /// Creates a new compaction executor
-    pub fn new(version_manager: Arc<VersionManager>, base_path: PathBuf) -> Self {
+    pub fn new(
+        version_manager: Arc<VersionManager>,
+        base_path: PathBuf,
+        manifest: Option<Arc<Mutex<ManifestWriter>>>,
+    ) -> Self {
         Self {
             version_manager,
+            manifest,
             base_path,
         }
     }
@@ -91,15 +123,24 @@ impl CompactionExecutor {
 
         // Execute based on job type
         let result = match job.job_type {
-            CompactionJobType::TrivialMove => self.execute_trivial_move(job)?,
-            CompactionJobType::Flush => {
-                // TODO: Flush requires memtable access
-                return Err(ExecutorError::InvalidJobType(job.job_type));
-            }
-            CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction => {
-                self.execute_merge_compaction(job)?
-            }
-            CompactionJobType::Manual => self.execute_merge_compaction(job)?,
+            | CompactionJobType::TrivialMove => match self.execute_trivial_move(job) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            },
+            | CompactionJobType::Flush => {
+                // Flushes go through the background flusher in state.rs, not the executor
+                return Err(ExecutorError::FlushNotRouted);
+            },
+            | CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction => {
+                match self.execute_merge_compaction(job) {
+                    | Ok(v) => v,
+                    | Err(e) => return Err(e),
+                }
+            },
+            | CompactionJobType::Manual => match self.execute_merge_compaction(job) {
+                | Ok(v) => v,
+                | Err(e) => return Err(e),
+            },
         };
 
         // Verify version hasn't changed
@@ -108,7 +149,9 @@ impl CompactionExecutor {
         }
 
         // Update version set
-        self.install_compaction_result(job, &result)?;
+        if let Err(e) = self.install_compaction_result(job, &result) {
+            return Err(e);
+        }
 
         Ok(result)
     }
@@ -137,7 +180,10 @@ impl CompactionExecutor {
     }
 
     /// Executes a merge compaction (L0→L1 or Ln→Ln+1)
-    fn execute_merge_compaction(&self, job: &CompactionJob) -> Result<CompactionResult, ExecutorError> {
+    fn execute_merge_compaction(
+        &self,
+        job: &CompactionJob,
+    ) -> Result<CompactionResult, ExecutorError> {
         if job.input.segments.is_empty() {
             return Err(ExecutorError::NoInputSegments);
         }
@@ -148,44 +194,50 @@ impl CompactionExecutor {
             all_inputs.extend(next_level.segments.clone());
         }
 
-        // Create readers and iterators for all input segments
+        // Create readers and raw iterators for all input segments
         // We need to keep readers alive for the duration of iteration
-        let readers: Vec<_> = all_inputs
+        let readers: Vec<_> = match all_inputs
             .iter()
             .map(|seg| seg.reader())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            | Ok(v) => v,
+            | Err(e) => return Err(ExecutorError::SegmentError(e)),
+        };
 
         let iterators: Vec<_> = readers
             .iter()
-            .map(|reader| {
-                let iter = reader.scan(Bound::Unbounded, Bound::Unbounded);
-                // Filter and unwrap Results - skip errors
-                iter.filter_map(|r| r.ok())
-            })
+            .map(|reader| reader.scan_raw(Bound::Unbounded, Bound::Unbounded))
             .collect();
 
-        // Calculate output path
-        let output_dir = self.base_path.join(format!("L{}", job.output.level));
+        // Calculate output path (must match recovery path format)
         let segment_id = job.id; // Use job ID as segment ID for now
+        let output_dir = self
+            .base_path
+            .join(format!("L{}", job.output.level))
+            .join("sstables")
+            .join(segment_id.to_string());
 
-        // Run the compaction
-        let output_segment = compact(iterators, output_dir, segment_id)?;
+        // Run the zero-copy raw compaction
+        let compact_output = match compact_raw(iterators, output_dir, segment_id) {
+            | Ok(v) => v,
+            | Err(e) => return Err(ExecutorError::SegmentError(e)),
+        };
 
-        // TODO: Track statistics
         let bytes_read = job.total_input_size();
-        let bytes_written = output_segment.size_in_bytes();
+        let bytes_written = compact_output.segment.size_in_bytes();
 
-        // TODO: Compute key range from output segment
-        // For now, use a placeholder
-        let output_range = KeyRange::new(vec![], vec![], segment_id);
+        // Use key range from compaction output (NO re-scan needed!)
+        let output_range =
+            KeyRange::new(compact_output.min_key, compact_output.max_key, segment_id);
 
         let inputs_to_delete: Vec<u64> = all_inputs.iter().map(|s| s.id()).collect();
 
         Ok(CompactionResult {
-            output_segments: vec![output_segment],
+            output_segments: vec![compact_output.segment],
             output_ranges: vec![output_range],
             inputs_to_delete,
-            entries_processed: 0, // TODO: Track this
+            entries_processed: compact_output.entry_count,
             bytes_read,
             bytes_written,
         })
@@ -197,14 +249,101 @@ impl CompactionExecutor {
         job: &CompactionJob,
         result: &CompactionResult,
     ) -> Result<(), ExecutorError> {
+        // Log to manifest BEFORE updating version (write-ahead)
+        if let Some(ref manifest_writer) = self.manifest {
+            // Log removals
+            match job.job_type {
+                | CompactionJobType::L0Compaction => {
+                    // Remove from L0
+                    for segment_id in &result.inputs_to_delete {
+                        let edit = VersionEdit::RemoveL0Segment {
+                            segment_id: *segment_id,
+                        };
+                        if let Err(e) = manifest_writer.lock().append_edit(&edit) {
+                            tracing::error!(error = ?e, "Failed to log RemoveL0Segment to manifest");
+                        }
+                    }
+                },
+                | CompactionJobType::LevelCompaction | CompactionJobType::TrivialMove => {
+                    // Remove from source level
+                    for segment_id in &result.inputs_to_delete {
+                        let edit = VersionEdit::RemoveSegment {
+                            level: job.input.level,
+                            segment_id: *segment_id,
+                        };
+                        if let Err(e) = manifest_writer.lock().append_edit(&edit) {
+                            tracing::error!(error = ?e, "Failed to log RemoveSegment to manifest");
+                        }
+                    }
+
+                    // Also remove from next level if present
+                    if let Some(ref next_input) = job.next_level_input {
+                        for segment_id in &result.inputs_to_delete {
+                            let edit = VersionEdit::RemoveSegment {
+                                level: next_input.level,
+                                segment_id: *segment_id,
+                            };
+                            if let Err(e) = manifest_writer.lock().append_edit(&edit) {
+                                tracing::error!(error = ?e, "Failed to log RemoveSegment to manifest");
+                            }
+                        }
+                    }
+                },
+                | _ => {},
+            }
+
+            // Log additions
+            if job.output.level == 0 {
+                // Add to L0
+                for (segment, range) in result
+                    .output_segments
+                    .iter()
+                    .zip(result.output_ranges.iter())
+                {
+                    let edit = VersionEdit::AddL0Segment {
+                        segment_id: segment.id(),
+                        key_range: (range.start.to_vec(), range.end.to_vec()),
+                        size: segment.size_in_bytes(),
+                    };
+                    if let Err(e) = manifest_writer.lock().append_edit(&edit) {
+                        tracing::error!(error = ?e, "Failed to log AddL0Segment to manifest");
+                    }
+                }
+            } else {
+                // Add to Ln
+                for (segment, range) in result
+                    .output_segments
+                    .iter()
+                    .zip(result.output_ranges.iter())
+                {
+                    let edit = VersionEdit::AddSegment {
+                        level: job.output.level,
+                        segment_id: segment.id(),
+                        key_range: (range.start.to_vec(), range.end.to_vec()),
+                        size: segment.size_in_bytes(),
+                    };
+                    if let Err(e) = manifest_writer.lock().append_edit(&edit) {
+                        tracing::error!(error = ?e, "Failed to log AddSegment to manifest");
+                    }
+                }
+            }
+
+            // Sync manifest periodically
+            if manifest_writer.lock().entry_count() % 10 == 0 {
+                let _ = manifest_writer.lock().sync();
+            }
+        }
+
         self.version_manager.update(|version| {
             // Remove input segments
             match job.job_type {
-                CompactionJobType::L0Compaction => {
+                | CompactionJobType::L0Compaction => {
                     // Remove from L0
-                    version.l0.retain(|s| !result.inputs_to_delete.contains(&s.id()));
-                }
-                CompactionJobType::LevelCompaction | CompactionJobType::TrivialMove => {
+                    version
+                        .l0
+                        .retain(|s| !result.inputs_to_delete.contains(&s.id()));
+                },
+                | CompactionJobType::LevelCompaction | CompactionJobType::TrivialMove => {
                     // Remove from source level
                     let level_idx = job.input.level as usize - 1;
                     if level_idx < version.levels.len() {
@@ -222,8 +361,8 @@ impl CompactionExecutor {
                             }
                         }
                     }
-                }
-                _ => {}
+                },
+                | _ => {},
             }
 
             // Add output segments to target level
@@ -241,7 +380,8 @@ impl CompactionExecutor {
                         .iter()
                         .zip(result.output_ranges.iter())
                     {
-                        version.levels[output_level_idx].add_segment(segment.clone(), range.clone());
+                        version.levels[output_level_idx]
+                            .add_segment(segment.clone(), range.clone());
                     }
                 }
             }
@@ -258,27 +398,33 @@ impl CompactionExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::levels::VersionSet;
-    use crate::version::VersionManager;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        levels::VersionSet,
+        version::VersionManager,
+    };
 
     #[test]
     fn test_executor_creation() {
         let temp_dir = TempDir::new().unwrap();
         let vm = Arc::new(VersionManager::new(7));
-        let executor = CompactionExecutor::new(vm, temp_dir.path().to_path_buf());
+        let executor = CompactionExecutor::new(vm, temp_dir.path().to_path_buf(), None);
 
         assert_eq!(executor.base_path(), temp_dir.path());
     }
 
     #[test]
     fn test_trivial_move_no_inputs() {
-        use crate::compaction::job::{CompactionInput, CompactionOutput};
+        use crate::compaction::job::{
+            CompactionInput,
+            CompactionOutput,
+        };
 
         let temp_dir = TempDir::new().unwrap();
         let vm = Arc::new(VersionManager::new(7));
-        let executor = CompactionExecutor::new(vm, temp_dir.path().to_path_buf());
+        let executor = CompactionExecutor::new(vm, temp_dir.path().to_path_buf(), None);
 
         let input = CompactionInput {
             level: 1,

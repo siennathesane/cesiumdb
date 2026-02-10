@@ -41,30 +41,53 @@ pub enum EntryFlag {
     End      = 3, // End of a multi-block entry
 }
 
-/// A single block of data in the table. The block is a fixed size and is
-/// divided into two parts:
-/// 1. The offsets: a list of 4-byte integers that point to the start of each
-///    entry in the block.
-/// 2. The entries: the actual data stored in the block.
+/// A mutable block used during segment writing. Uses BytesMut staging buffers.
 #[derive(Debug)]
 pub(crate) struct Block {
     /// The number of entries in the block.
     num_entries: u16,
-    /// The entry offsets, it's just a [u16].
+    /// The entry offsets (BytesMut for now, will be replaced with direct mmap
+    /// writes)
     offsets: BytesMut,
-    /// The actual entries, it's just a single flag byte followed by the
-    /// [[Bytes]].
+    /// The actual entries (BytesMut for now, will be replaced with direct mmap
+    /// writes)
     entries: BytesMut,
 }
 
+/// A block builder that writes directly to a mmap buffer (zero-copy writes)
+pub(crate) struct BlockBuilder<'a> {
+    /// Direct pointer to mmap buffer (BLOCK_SIZE bytes)
+    buffer: &'a mut [u8],
+    /// Number of entries written
+    num_entries: u16,
+    /// Temporary storage for offsets (will be written to buffer during
+    /// finalize)
+    offsets: Vec<u16>,
+    /// Temporary storage for entries (will be written to buffer during
+    /// finalize)
+    entries: Vec<u8>,
+}
+
+/// A read-only block used after deserialization. Uses Bytes for cheap cloning
+/// (just Arc bumps).
+#[derive(Debug, Clone)]
+pub(crate) struct ReadOnlyBlock {
+    /// The number of entries in the block.
+    num_entries: u16,
+    /// The entry offsets, it's just a [u16]. Uses Bytes for zero-copy cloning.
+    offsets: Bytes,
+    /// The actual entries, it's just a single flag byte followed by the data.
+    /// Uses Bytes for zero-copy cloning.
+    entries: Bytes,
+}
+
 impl Block {
-    /// Create a new block. Creating the block will allocate the necessary
-    /// memory upfront.
+    /// Create a new block with BytesMut staging buffers
     pub(crate) fn new() -> Self {
         Block {
             num_entries: 0,
-            offsets: BytesMut::with_capacity(MAX_ENTRIES),
-            entries: BytesMut::with_capacity(BLOCK_SIZE - MAX_ENTRIES),
+            offsets: BytesMut::new(),
+            entries: BytesMut::new(),
         }
     }
 
@@ -109,10 +132,7 @@ impl Block {
     /// - Caller must ensure exclusive access to the dst memory region
     pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
         // SAFETY: Verify alignment invariants in debug builds
-        debug_assert!(
-            !dst.is_null(),
-            "Destination pointer must not be null"
-        );
+        debug_assert!(!dst.is_null(), "Destination pointer must not be null");
         debug_assert!(
             dst as usize % std::mem::align_of::<u16>() == 0,
             "Destination pointer must be 2-byte aligned for u16 writes"
@@ -190,7 +210,7 @@ impl Block {
 
     /// Returns an iterator over the entries in the block.
     #[inline]
-    pub fn iter(&self) -> BlockIterator {
+    pub fn iter(&self) -> BlockIterator<'_> {
         BlockIterator {
             entries: self.entries.as_ref(),
             offsets: self.offsets.as_ref(),
@@ -253,32 +273,213 @@ impl Block {
     }
 }
 
-impl Deserializer for Block {
+// BlockBuilder - writes directly to mmap (zero-copy)
+impl<'a> BlockBuilder<'a> {
+    /// Create a new builder from a mmap slice (must be BLOCK_SIZE bytes)
+    pub(crate) fn new(buffer: &'a mut [u8]) -> Self {
+        assert_eq!(
+            buffer.len(),
+            BLOCK_SIZE,
+            "Buffer must be exactly BLOCK_SIZE"
+        );
+
+        // Zero the buffer
+        buffer.fill(0);
+
+        Self {
+            buffer,
+            num_entries: 0,
+            offsets: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Create a BlockBuilder from pre-built vecs (zero-copy construction)
+    /// This avoids copying from PendingEntry -> BlockBuilder
+    pub(crate) fn from_parts(buffer: &'a mut [u8], offsets: Vec<u16>, entries: Vec<u8>) -> Self {
+        assert_eq!(
+            buffer.len(),
+            BLOCK_SIZE,
+            "Buffer must be exactly BLOCK_SIZE"
+        );
+
+        // Zero the buffer
+        buffer.fill(0);
+
+        let num_entries = offsets.len() as u16;
+
+        Self {
+            buffer,
+            num_entries,
+            offsets,
+            entries,
+        }
+    }
+
+    /// Add an entry to the block (stored in Vec, written during finalize)
+    /// This matches Block::add_entry() behavior but uses Vec instead of
+    /// BytesMut
+    pub(crate) fn add_entry(&mut self, entry: &[u8], flag: EntryFlag) -> Result<(), BlockError> {
+        let entry_size = entry.len() + size_of::<u8>(); // data + flag byte
+        let required_space = entry_size + size_of::<u16>(); // entry + offset
+
+        // Calculate current space used
+        let current_used = size_of::<u16>() // num_entries header
+            + (self.offsets.len() * size_of::<u16>())
+            + self.entries.len();
+
+        // Check if entry will fit
+        if current_used + required_space > BLOCK_SIZE {
+            return if self.num_entries == 0 {
+                Err(TooLargeForBlock)
+            } else {
+                Err(BlockFull)
+            };
+        }
+
+        // Calculate cumulative offset (same as Block does)
+        let current_offset = if self.num_entries > 0 {
+            self.offsets[self.offsets.len() - 1]
+        } else {
+            0
+        };
+        let next_offset = current_offset + (entry_size as u16);
+
+        // Append offset (matches Block::add_entry)
+        self.offsets.push(next_offset);
+
+        // Append flag + data (matches Block::add_entry)
+        self.entries.push(flag as u8);
+        self.entries.extend_from_slice(entry);
+
+        self.num_entries += 1;
+        Ok(())
+    }
+
+    /// Finalize the block by writing to the mmap buffer
+    /// Layout: [num_entries:2][offsets...][entries...]
+    pub(crate) fn finalize(self) {
+        // Write num_entries header
+        let num_entries_bytes = self.num_entries.to_le_bytes();
+        self.buffer[0] = num_entries_bytes[0];
+        self.buffer[1] = num_entries_bytes[1];
+
+        // Write all offsets
+        let mut offset_pos = 2;
+        for offset in &self.offsets {
+            let offset_bytes = offset.to_le_bytes();
+            self.buffer[offset_pos] = offset_bytes[0];
+            self.buffer[offset_pos + 1] = offset_bytes[1];
+            offset_pos += 2;
+        }
+
+        // Write all entries
+        let entries_start = 2 + (self.offsets.len() * 2);
+        self.buffer[entries_start..entries_start + self.entries.len()]
+            .copy_from_slice(&self.entries);
+    }
+
+    #[inline]
+    pub(crate) fn num_entries(&self) -> u16 {
+        self.num_entries
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.num_entries == 0
+    }
+}
+
+// ReadOnlyBlock methods - same interface as Block for reading
+impl ReadOnlyBlock {
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<(EntryFlag, &[u8])> {
+        if index >= self.num_entries as usize {
+            return None;
+        }
+
+        let start_offset = if index == 0 {
+            0
+        } else {
+            let offset_idx = (index - 1) * 2;
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
+        };
+
+        let end_offset = if index < self.num_entries as usize - 1 {
+            let offset_idx = index * 2;
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
+        } else {
+            self.entries.len()
+        };
+
+        let entry_data = &self.entries[start_offset..end_offset];
+        let flag = match entry_data[0] {
+            | 0 => EntryFlag::Complete,
+            | 1 => EntryFlag::Start,
+            | 2 => EntryFlag::Middle,
+            | 3 => EntryFlag::End,
+            | _ => unreachable!("invalid entry flag"),
+        };
+
+        Some((flag, &entry_data[1..]))
+    }
+
+    #[inline]
+    pub fn num_entries(&self) -> u16 {
+        self.num_entries
+    }
+
+    #[inline]
+    pub fn iter(&self) -> BlockIterator<'_> {
+        BlockIterator {
+            entries: self.entries.as_ref(),
+            offsets: self.offsets.as_ref(),
+            current: 0,
+            num_entries: self.num_entries,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn offsets(&self) -> &[u8] {
+        self.offsets.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn entries(&self) -> &[u8] {
+        self.entries.as_ref()
+    }
+}
+
+impl Deserializer for ReadOnlyBlock {
     fn deserialize(payload: Bytes) -> Self {
-        let mut block = Block::new();
-
         // First two bytes are num_entries
-        block.num_entries = u16::from_le_bytes([payload[0], payload[1]]);
+        let num_entries = u16::from_le_bytes([payload[0], payload[1]]);
 
-        // If we have entries, process them
-        if block.num_entries > 0 {
+        // Use zero-copy slices from the payload - just Arc increments!
+        let (offsets, entries) = if num_entries > 0 {
             // Read all offsets first
-            let offsets_end = size_of::<u16>() + (block.num_entries as usize * size_of::<u16>());
-            let offsets_data = &payload[size_of::<u16>()..offsets_end];
-            block.offsets.extend_from_slice(offsets_data);
+            let offsets_end = size_of::<u16>() + (num_entries as usize * size_of::<u16>());
+            let offsets_slice = payload.slice(size_of::<u16>()..offsets_end);
 
             // Calculate entries size using last offset
             let last_offset = u16::from_le_bytes([
-                offsets_data[offsets_data.len() - 2],
-                offsets_data[offsets_data.len() - 1],
+                offsets_slice[offsets_slice.len() - 2],
+                offsets_slice[offsets_slice.len() - 1],
             ]) as usize;
 
-            // Copy entries data
-            let entries_data = &payload[offsets_end..offsets_end + last_offset];
-            block.entries.extend_from_slice(entries_data);
-        }
+            // Zero-copy entries slice - just Arc increments!
+            let entries_slice = payload.slice(offsets_end..offsets_end + last_offset);
 
-        block
+            (offsets_slice, entries_slice)
+        } else {
+            (Bytes::new(), Bytes::new())
+        };
+
+        ReadOnlyBlock {
+            num_entries,
+            offsets,
+            entries,
+        }
     }
 }
 
@@ -561,7 +762,7 @@ mod tests {
         data.put_u16_le(0); // num_entries = 0
         data.resize(BLOCK_SIZE, 0);
 
-        let block = Block::deserialize(data.freeze());
+        let block = ReadOnlyBlock::deserialize(data.freeze());
         assert_eq!(block.num_entries, 0);
         assert!(block.offsets().is_empty());
         assert!(block.entries().is_empty());
@@ -577,7 +778,7 @@ mod tests {
         data.put_slice(b"hello");
         data.resize(BLOCK_SIZE, 0);
 
-        let block = Block::deserialize(data.freeze());
+        let block = ReadOnlyBlock::deserialize(data.freeze());
         assert_eq!(block.num_entries, 1);
         assert_eq!(block.offsets().len(), 2); // one u16 offset
         assert_eq!(block.entries().len(), 5); // "hello"
@@ -595,7 +796,7 @@ mod tests {
         data.put_slice(b"123"); // second entry
         data.resize(BLOCK_SIZE, 0);
 
-        let block = Block::deserialize(data.freeze());
+        let block = ReadOnlyBlock::deserialize(data.freeze());
         assert_eq!(block.num_entries, 2);
         assert_eq!(block.offsets().len(), 4); // two u16 offsets
         assert_eq!(block.entries().len(), 8); // "hello123"
@@ -673,5 +874,41 @@ mod tests {
         for (i, entry) in entries.iter().enumerate() {
             assert_eq!(block.get(i), Some((EntryFlag::Complete, entry.as_slice())));
         }
+    }
+
+    #[test]
+    fn test_blockbuilder_matches_block_output() {
+        // Test that BlockBuilder produces the same binary output as Block
+        let data1 = b"hello";
+        let data2 = b"world";
+        let data3 = b"test";
+
+        // Build with Block
+        let mut block = Block::new();
+        block.add_entry(data1, EntryFlag::Complete).unwrap();
+        block.add_entry(data2, EntryFlag::Complete).unwrap();
+        block.add_entry(data3, EntryFlag::Complete).unwrap();
+
+        let mut block_buffer = vec![0u8; BLOCK_SIZE];
+        unsafe {
+            block.finalize(block_buffer.as_mut_ptr());
+        }
+
+        // Build with BlockBuilder
+        let mut builder_buffer = vec![0u8; BLOCK_SIZE];
+        {
+            let mut builder = BlockBuilder::new(&mut builder_buffer);
+            builder.add_entry(data1, EntryFlag::Complete).unwrap();
+            builder.add_entry(data2, EntryFlag::Complete).unwrap();
+            builder.add_entry(data3, EntryFlag::Complete).unwrap();
+            builder.finalize();
+        }
+
+        // Compare the outputs - they should be identical
+        assert_eq!(
+            &block_buffer[..],
+            &builder_buffer[..],
+            "BlockBuilder and Block should produce identical output"
+        );
     }
 }

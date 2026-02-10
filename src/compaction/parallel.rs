@@ -3,11 +3,17 @@
 //! Enables multiple compaction jobs to run concurrently when they have
 //! non-overlapping key ranges, maximizing throughput.
 
-use crate::compaction::job::CompactionJob;
-use crate::levels::KeyRange;
+use std::{
+    collections::HashSet,
+    sync::Arc,
+};
+
 use parking_lot::RwLock;
-use std::collections::HashSet;
-use std::sync::Arc;
+
+use crate::{
+    compaction::job::CompactionJob,
+    levels::KeyRange,
+};
 
 /// Tracks active compaction jobs to prevent conflicts
 pub struct ParallelCompactionCoordinator {
@@ -185,8 +191,7 @@ impl ParallelCompactionManager {
     /// Executes a job with parallel coordination
     pub fn execute_parallel<F, R>(&self, job: &CompactionJob, f: F) -> R
     where
-        F: FnOnce() -> R,
-    {
+        F: FnOnce() -> R, {
         // Mark as active
         self.coordinator.mark_active(job);
 
@@ -208,9 +213,18 @@ impl ParallelCompactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compaction::job::{CompactionInput, CompactionJobType, CompactionOutput};
+    use crate::compaction::job::{
+        CompactionInput,
+        CompactionJobType,
+        CompactionOutput,
+    };
 
-    fn create_test_job(id: u64, start: Vec<u8>, end: Vec<u8>, can_parallelize: bool) -> CompactionJob {
+    fn create_test_job(
+        id: u64,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        can_parallelize: bool,
+    ) -> CompactionJob {
         let input = CompactionInput {
             level: 0,
             segments: vec![],
@@ -345,9 +359,7 @@ mod tests {
 
         let job1 = create_test_job(1, b"a".to_vec(), b"m".to_vec(), true);
 
-        let result = manager.execute_parallel(&job1, || {
-            42
-        });
+        let result = manager.execute_parallel(&job1, || 42);
 
         assert_eq!(result, 42);
         assert_eq!(manager.stats().active_jobs, 0);

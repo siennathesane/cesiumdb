@@ -9,7 +9,20 @@ pub mod buffer_pool;
 pub mod parallel_reader;
 pub mod parallel_writer;
 
-pub use buffer_pool::{BufferPool, BufferPoolStats, PooledBuffer};
-pub use buffer_pool::{DEFAULT_BUFFER_SIZE, DEFAULT_MAX_POOLED};
-pub use parallel_reader::{ParallelReader, ParallelReaderConfig, ReadResult};
-pub use parallel_writer::{ParallelWriter, ParallelWriterConfig, WriteResult};
+pub use buffer_pool::{
+    BufferPool,
+    BufferPoolStats,
+    DEFAULT_BUFFER_SIZE,
+    DEFAULT_MAX_POOLED,
+    PooledBuffer,
+};
+pub use parallel_reader::{
+    ParallelReader,
+    ParallelReaderConfig,
+    ReadResult,
+};
+pub use parallel_writer::{
+    ParallelWriter,
+    ParallelWriterConfig,
+    WriteResult,
+};

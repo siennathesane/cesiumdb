@@ -118,8 +118,12 @@ impl SegmentBuilder {
         let mdata_size = size_of::<Metadata>();
         let metadata_offset = key_file_size - mdata_size;
 
-        let key_mdata_payload = key_mmap[metadata_offset..key_file_size].as_ref();
-        let key_metadata = Metadata::from(Bytes::copy_from_slice(key_mdata_payload));
+        let key_metadata = match key_mmap.read_range(metadata_offset..key_file_size, |slice| {
+            Metadata::from(Bytes::copy_from_slice(slice))
+        }) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
 
         // Validate index location
         let index_start = key_metadata.index_start();
@@ -164,21 +168,30 @@ impl SegmentBuilder {
             // (index_start=0 for empty segments, so we can't read from there)
             Index::new(key_metadata.id(), 0)
         } else {
-            let key_index_payload =
-                key_mmap[index_start as usize..(index_start + index_size) as usize].as_ref();
+            match key_mmap.read_range(
+                index_start as usize..(index_start + index_size) as usize,
+                |key_index_payload| {
+                    if key_index_payload.len() < MIN_INDEX_SIZE {
+                        return Err(SegmentError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Index data too small: {}", key_index_payload.len()),
+                        )));
+                    }
 
-            if key_index_payload.len() < MIN_INDEX_SIZE {
-                return Err(SegmentError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Index data too small: {}", key_index_payload.len()),
-                )));
+                    Ok(Index::from(Bytes::copy_from_slice(key_index_payload)))
+                },
+            ) {
+                | Ok(result) => match result {
+                    | Ok(v) => v,
+                    | Err(e) => return Err(e),
+                },
+                | Err(e) => return Err(e),
             }
-
-            Index::from(Bytes::copy_from_slice(key_index_payload))
         };
 
-        // Update the index's num_blocks from the metadata (the index is deserialized with whatever
-        // was saved, but the authoritative block count is in the metadata)
+        // Update the index's num_blocks from the metadata (the index is deserialized
+        // with whatever was saved, but the authoritative block count is in the
+        // metadata)
         key_index.set_num_blocks(key_metadata.block_count() as u64);
 
         // Repeat similar process for value segment
@@ -207,14 +220,19 @@ impl SegmentBuilder {
 
         let val_metadata_offset = val_file_size - mdata_size;
 
-        let val_mdata_payload = val_mmap[val_metadata_offset..val_file_size].as_ref();
-        let val_metadata = Metadata::from(Bytes::copy_from_slice(val_mdata_payload));
+        let val_metadata = match val_mmap.read_range(val_metadata_offset..val_file_size, |slice| {
+            Metadata::from(Bytes::copy_from_slice(slice))
+        }) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
 
-        // Value segments no longer have indices - value locations are stored in key metadata
-        // So we skip reading the value index entirely
+        // Value segments no longer have indices - value locations are stored in key
+        // metadata So we skip reading the value index entirely
 
         let key_handle = Arc::new(key_mmap);
         let val_handle = Arc::new(val_mmap);
+        let val_block_count = val_metadata.block_count() as u64;
 
         Segment::open(
             key_handle,
@@ -222,6 +240,7 @@ impl SegmentBuilder {
             key_metadata.id(),
             val_handle,
             val_metadata.id(),
+            val_block_count,
         )
     }
 }
@@ -445,10 +464,11 @@ mod tests {
             let segment =
                 Arc::get_mut(&mut segment_arc).expect("Failed to get mutable reference to segment");
 
-            // Write data
+            // Write data (keys must be serialized)
             for (key, value) in &test_data[0..10] {
+                use crate::utils::Serializer;
                 segment
-                    .write(key.as_ref(), value.as_ref())
+                    .write(key.serialize().as_ref(), value.serialize().as_ref())
                     .expect("Failed to write to segment");
             }
             segment.flush().expect("Failed to flush segment");
@@ -465,13 +485,17 @@ mod tests {
                 .new_reader()
                 .expect("Failed to create reader");
 
-            // Verify data
+            // Verify data (keys must be serialized for get)
             for (key, expected_value) in &test_data[0..10] {
+                use crate::utils::Serializer;
                 let result = reader
-                    .get(key.as_ref())
+                    .get(key.serialize().as_ref())
                     .expect("Error during get operation");
                 assert!(result.is_some(), "Key not found in reopened segment");
-                assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+                assert_eq!(
+                    result.unwrap().as_ref(),
+                    expected_value.serialize().as_ref()
+                );
             }
         }
     }
@@ -500,10 +524,11 @@ mod tests {
             let segment =
                 Arc::get_mut(&mut segment_arc).expect("Failed to get mutable reference to segment");
 
-            // Write data to this segment
+            // Write data to this segment (keys must be serialized)
             for (key, value) in &test_data {
+                use crate::utils::Serializer;
                 segment
-                    .write(key.as_ref(), value.as_ref())
+                    .write(key.serialize().as_ref(), value.serialize().as_ref())
                     .expect("Failed to write to segment");
             }
             segment.flush().expect("Failed to flush segment");
@@ -517,13 +542,17 @@ mod tests {
                 .new_reader()
                 .expect("Failed to create reader");
 
-            // Verify data
+            // Verify data (keys must be serialized for get)
             for (key, expected_value) in &test_data {
+                use crate::utils::Serializer;
                 let result = reader
-                    .get(key.as_ref())
+                    .get(key.serialize().as_ref())
                     .expect("Error during get operation");
                 assert!(result.is_some(), "Key not found in segment");
-                assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+                assert_eq!(
+                    result.unwrap().as_ref(),
+                    expected_value.serialize().as_ref()
+                );
             }
         }
     }

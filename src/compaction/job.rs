@@ -1,10 +1,14 @@
 //! Compaction job structures
 //!
-//! This module defines the different types of compaction jobs and their metadata.
+//! This module defines the different types of compaction jobs and their
+//! metadata.
 
-use crate::levels::KeyRange;
-use crate::segment::Segment;
 use std::sync::Arc;
+
+use crate::{
+    levels::KeyRange,
+    segment::Segment,
+};
 
 /// Type of compaction operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +61,11 @@ impl CompactionJobType {
     /// Lower values = higher priority
     pub fn base_priority(&self) -> u32 {
         match self {
-            Self::TrivialMove => 0,  // Instant, no I/O
-            Self::Flush => 1,        // Blocks writes
-            Self::L0Compaction => 2, // Hurts read performance
-            Self::LevelCompaction => 3,
-            Self::Manual => 2, // User-initiated, should be fast
+            | Self::TrivialMove => 0,  // Instant, no I/O
+            | Self::Flush => 1,        // Blocks writes
+            | Self::L0Compaction => 2, // Hurts read performance
+            | Self::LevelCompaction => 3,
+            | Self::Manual => 2, // User-initiated, should be fast
         }
     }
 
@@ -198,7 +202,10 @@ impl CompactionJob {
 
         // Trivial moves and flushes can always parallelize
         // Level compactions can parallelize if ranges don't overlap
-        let can_parallelize = matches!(job_type, CompactionJobType::TrivialMove | CompactionJobType::Flush);
+        let can_parallelize = matches!(
+            job_type,
+            CompactionJobType::TrivialMove | CompactionJobType::Flush
+        );
 
         Self {
             id,
@@ -220,16 +227,16 @@ impl CompactionJob {
         next_level_input: Option<&CompactionInput>,
     ) -> f64 {
         match job_type {
-            CompactionJobType::TrivialMove => {
+            | CompactionJobType::TrivialMove => {
                 // Always highest priority (free operation)
                 100.0
-            }
-            CompactionJobType::Flush => {
+            },
+            | CompactionJobType::Flush => {
                 // Priority based on number of frozen memtables
                 // More frozen = more urgent
                 input.num_segments() as f64 * 10.0
-            }
-            CompactionJobType::L0Compaction => {
+            },
+            | CompactionJobType::L0Compaction => {
                 // L0 file count is the main factor
                 // Each additional file hurts read performance
                 let l0_files = input.num_segments() as f64;
@@ -242,13 +249,11 @@ impl CompactionJob {
                 let size_score = (l0_size / (64.0 * 1024.0 * 1024.0)) * 2.0; // Normalize by 64MB
 
                 file_score + size_score
-            }
-            CompactionJobType::LevelCompaction => {
+            },
+            | CompactionJobType::LevelCompaction => {
                 // Score based on size ratio to target
                 let input_size = input.total_size as f64;
-                let next_level_size = next_level_input
-                    .map(|n| n.total_size as f64)
-                    .unwrap_or(0.0);
+                let next_level_size = next_level_input.map(|n| n.total_size as f64).unwrap_or(0.0);
 
                 // Higher scores when level is over target
                 // Target growth: 10x per level
@@ -257,11 +262,11 @@ impl CompactionJob {
 
                 // Score > 1.0 means level is over target
                 total_size / target_size
-            }
-            CompactionJobType::Manual => {
+            },
+            | CompactionJobType::Manual => {
                 // User-triggered compactions have high priority
                 50.0
-            }
+            },
         }
     }
 
@@ -292,16 +297,16 @@ impl CompactionJob {
         }
 
         match self.job_type {
-            CompactionJobType::TrivialMove => 0.0, // No writes
-            CompactionJobType::Flush => 1.0,       // 1:1 write ratio
-            CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction => {
+            | CompactionJobType::TrivialMove => 0.0, // No writes
+            | CompactionJobType::Flush => 1.0,       // 1:1 write ratio
+            | CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction => {
                 // Total bytes written / bytes from source level
                 self.total_input_size() as f64 / self.input.total_size as f64
-            }
-            CompactionJobType::Manual => {
+            },
+            | CompactionJobType::Manual => {
                 // Variable, depends on overlap
                 self.total_input_size() as f64 / self.input.total_size as f64
-            }
+            },
         }
     }
 
@@ -350,9 +355,18 @@ mod tests {
 
     #[test]
     fn test_job_type_priority() {
-        assert!(CompactionJobType::TrivialMove.base_priority() < CompactionJobType::Flush.base_priority());
-        assert!(CompactionJobType::Flush.base_priority() < CompactionJobType::L0Compaction.base_priority());
-        assert!(CompactionJobType::L0Compaction.base_priority() < CompactionJobType::LevelCompaction.base_priority());
+        assert!(
+            CompactionJobType::TrivialMove.base_priority() <
+                CompactionJobType::Flush.base_priority()
+        );
+        assert!(
+            CompactionJobType::Flush.base_priority() <
+                CompactionJobType::L0Compaction.base_priority()
+        );
+        assert!(
+            CompactionJobType::L0Compaction.base_priority() <
+                CompactionJobType::LevelCompaction.base_priority()
+        );
     }
 
     #[test]
@@ -365,8 +379,7 @@ mod tests {
 
     #[test]
     fn test_compaction_output_builder() {
-        let output = CompactionOutput::new(1, 64 * 1024 * 1024)
-            .with_max_segments(10);
+        let output = CompactionOutput::new(1, 64 * 1024 * 1024).with_max_segments(10);
 
         assert_eq!(output.level, 1);
         assert_eq!(output.target_segment_size, 64 * 1024 * 1024);
@@ -378,7 +391,7 @@ mod tests {
         // Flush jobs score based on number of memtables
         let input = CompactionInput {
             level: 0,
-            segments: vec![],  // Would normally contain memtable references
+            segments: vec![], // Would normally contain memtable references
             key_range: KeyRange::new(vec![], vec![], 0),
             total_size: 256 * 1024 * 1024, // 256 MB
         };
@@ -400,11 +413,7 @@ mod tests {
             total_size: 64 * 1024 * 1024,
         };
 
-        let score = CompactionJob::calculate_score(
-            CompactionJobType::TrivialMove,
-            &input,
-            None,
-        );
+        let score = CompactionJob::calculate_score(CompactionJobType::TrivialMove, &input, None);
 
         // Trivial moves should have highest score
         assert_eq!(score, 100.0);
@@ -451,13 +460,7 @@ mod tests {
 
         let output = CompactionOutput::new(2, 64 * 1024 * 1024);
 
-        let job = CompactionJob::new(
-            1,
-            CompactionJobType::TrivialMove,
-            input,
-            None,
-            output,
-        );
+        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output);
 
         assert_eq!(job.write_amplification(), 0.0);
     }

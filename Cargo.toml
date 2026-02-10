@@ -28,6 +28,7 @@ mimalloc = { version = "0.1.43" } # maybe there's no_std support? big question m
 once_cell = "1.20.2"
 parking_lot = { version = "0.12.3", features = ["deadlock_detection"] } # we would need to find a replacement for this, maybe lock_api?
 rand = "0.9.0" # has no_std support
+rayon = "1.10" # parallel iterators for concurrent shard writes
 thiserror = "2.0" # it looks like there is no_std support
 tracing = "0.1"
 
@@ -35,6 +36,9 @@ tracing = "0.1"
 criterion = "0.5"
 rand = { version = "0.9", features = ["small_rng"] }
 tempfile = "3.14.0"
+
+[profile.bench]
+debug = true
 
 [[bench]]
 name = "hlc"
@@ -51,6 +55,12 @@ harness = false
 [[bench]]
 name = "segment"
 harness = false
+required-features = ["benchmarks"]
+
+[[bench]]
+name = "compaction"
+harness = false
+required-features = ["benchmarks"]
 
 [build-dependencies]
 cbindgen = "0.27.0"

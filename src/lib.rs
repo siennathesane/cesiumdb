@@ -26,7 +26,6 @@ compile_warn!("cesiumdb is not tested on 32-bit systems");
 use std::sync::Arc;
 
 use bytes::Bytes;
-use mimalloc::MiMalloc;
 use parking_lot::Mutex;
 
 use crate::{
@@ -55,31 +54,49 @@ use crate::{
     },
 };
 
-#[cfg(not(miri))]
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
+#[cfg(feature = "benchmarks")]
 pub mod block;
+#[cfg(not(feature = "benchmarks"))]
+pub(crate) mod block;
+
 mod block_alloc;
+
+#[cfg(feature = "benchmarks")]
 pub mod compact;
+#[cfg(not(feature = "benchmarks"))]
+pub(crate) mod compact;
+
 pub mod compaction;
 pub mod errs;
 mod hash;
 pub mod hlc;
 mod index;
-pub mod io;
+pub(crate) mod io;
 pub mod keypair;
 pub mod levels;
-mod manifest;
+pub(crate) mod manifest;
+pub(crate) mod manifest_reader;
+pub(crate) mod manifest_writer;
+
+#[cfg(feature = "benchmarks")]
 pub mod map;
+#[cfg(not(feature = "benchmarks"))]
+pub(crate) mod map;
+
 pub mod memtable;
 pub mod merge;
 pub mod peek;
+pub(crate) mod raw_entry;
 pub mod segment;
 mod segment_builder;
 mod segment_iterator;
-pub mod segment_reader;
+pub(crate) mod segment_reader;
+
+#[cfg(feature = "benchmarks")]
 pub mod segment_writer;
+#[cfg(not(feature = "benchmarks"))]
+pub(crate) mod segment_writer;
+
 pub mod simd;
 pub(crate) mod state;
 mod stats;
@@ -173,10 +190,41 @@ impl Db {
         self.inner.sync()
     }
 
-    /// Close the database. This drops all associated resources and the handle
-    /// will no longer be valid.
+    /// Close the database. This performs an orderly shutdown:
+    /// 1. Freezes the current memtable
+    /// 2. Waits for background flusher to drain all frozen memtables
+    /// 3. Shuts down the compaction manager
     pub fn close(&self) -> Result<(), CesiumError> {
-        todo!()
+        self.inner.state.lock().shutdown()
+    }
+
+    /// Triggers a manual compaction of the entire database.
+    ///
+    /// This is a synchronous operation that will compact all levels.
+    /// Useful for:
+    /// - Reclaiming space after deletions
+    /// - Optimizing read performance
+    /// - Forcing cleanup of old versions
+    pub fn compact(&self) -> Result<(), CesiumError> {
+        let guard = self.inner.state.lock();
+        guard.compact();
+        Ok(())
+    }
+
+    /// Returns current compaction statistics.
+    ///
+    /// This provides insights into:
+    /// - Number of queued/in-progress/completed jobs
+    /// - Parallel execution utilization
+    /// - Current workload pattern
+    pub fn compaction_stats(&self) -> Result<crate::compaction::CompactionStats, CesiumError> {
+        let guard = self.inner.state.lock();
+        match guard.compaction_stats() {
+            | Some(stats) => Ok(stats),
+            | None => Err(CesiumError::CompactionError(
+                crate::errs::CompactionError::NotInitialized,
+            )),
+        }
     }
 }
 
@@ -237,14 +285,61 @@ impl DbOptions {
         self
     }
 
+    /// Sets the data directory for persistent storage.
+    ///
+    /// When set, enables:
+    /// - Background compaction threads
+    /// - Persistent SSTable storage
+    /// - Automatic flush-to-disk
+    pub fn data_dir(&mut self, path: std::path::PathBuf) -> &mut Self {
+        self.engine_opts = self.engine_opts.clone().base_path(path);
+        self
+    }
+
+    /// Sets the memtable size in bytes (default: configured in memtable
+    /// module).
+    ///
+    /// Smaller memtables = more frequent flushes, less memory usage
+    /// Larger memtables = fewer flushes, more memory usage
+    pub fn memtable_size(&mut self, size: u64) -> &mut Self {
+        // Note: This would need to be added to DbStorageBuilder
+        // For now, this is a placeholder
+        self
+    }
+
+    /// Sets the maximum number of memtables before blocking writes.
+    ///
+    /// This is the num_memtable_limit parameter.
+    pub fn max_memtables(&mut self, count: u64) -> &mut Self {
+        self.engine_opts = self.engine_opts.clone().num_memtable_limit(count);
+        self
+    }
+
     pub fn build(&self) -> Arc<Db> {
-        let state = DbStorageBuilder::new()
+        let mut builder = DbStorageBuilder::new()
             .block_size(self.engine_opts.block_size)
             .target_sst_size(self.engine_opts.target_sst_size)
-            .num_memtable_limit(self.engine_opts.num_memtable_limit)
-            .build();
+            .num_memtable_limit(self.engine_opts.num_memtable_limit);
 
-        let inner = DbInner { state };
+        if let Some(ref path) = self.engine_opts.base_path {
+            builder = builder.base_path(path.clone());
+        }
+
+        let state = builder.build();
+
+        // Create warm thread pool for parallel LSM reads
+        // Use half the available cores for reads to leave room for writes
+        let num_read_threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(2))
+            .unwrap_or(4);
+
+        let read_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_read_threads)
+            .thread_name(|i| format!("lsm-reader-{}", i))
+            .build()
+            .expect("failed to create read thread pool");
+
+        let inner = DbInner { state, read_pool };
 
         Arc::new(Db {
             inner: Arc::new(inner),
@@ -270,14 +365,16 @@ pub enum Batch<K: AsRef<[u8]>, V: AsRef<[u8]>> {
 #[repr(C)]
 struct DbInner {
     state: Mutex<DbStorageState>,
+    /// Warm thread pool for parallel LSM reads across levels
+    read_pool: rayon::ThreadPool,
 }
 
 impl DbInner {
     fn get(&self, key: KeyBytes) -> Result<Option<ValueBytes>, CesiumError> {
-        // check the current memtable
+        // 1. Check current memtable (hottest data)
         {
             let guard = self.state.lock();
-            let val = guard.current_memtable().get(key);
+            let val = guard.current_memtable().get(key.clone());
             if let Some(val) = val {
                 // Return None for tombstones
                 if val.is_tombstone() {
@@ -286,6 +383,131 @@ impl DbInner {
                 return Ok(Some(val));
             }
         }
+
+        // 2. Check frozen memtables (newest to oldest)
+        {
+            let guard = self.state.lock();
+            if let Some(val) = guard.get_from_frozen(key.clone()) {
+                if val.is_tombstone() {
+                    return Ok(None);
+                }
+                return Ok(Some(val));
+            }
+        }
+
+        // 3. Check L0-L7 via VersionManager (parallelized)
+        {
+            use rayon::prelude::*;
+
+            use crate::utils::Serializer;
+
+            let guard = self.state.lock();
+            let version = guard.version_manager.current();
+            let key_bytes = key.serialize();
+
+            // Check L0 (newest to oldest - reverse chronological)
+            // L0 must be checked sequentially because newer segments override older ones
+            // We need to search by key prefix (ns + key) to find any version
+            // Since timestamps are stored as (u128::MAX - ts), newest=0, oldest=u128::MAX
+            let key_prefix_lower = {
+                use bytes::{
+                    BufMut,
+                    BytesMut,
+                };
+                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len() + 16);
+                bytes.put_u64_le(key.ns());
+                bytes.put_slice(key.as_bytes().as_ref());
+                bytes.put_u128_le(0); // newest possible (u128::MAX - u128::MAX = 0)
+                bytes.freeze()
+            };
+            let key_prefix_upper = {
+                use bytes::{
+                    BufMut,
+                    BytesMut,
+                };
+                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len() + 16);
+                bytes.put_u64_le(key.ns());
+                bytes.put_slice(key.as_bytes().as_ref());
+                bytes.put_u128_le(u128::MAX); // oldest possible (u128::MAX - 0 = u128::MAX)
+                bytes.freeze()
+            };
+
+            // Prepare key without timestamp for bloom filter checks (L1-L7 only)
+            let key_for_bloom = {
+                use bytes::{
+                    BufMut,
+                    BytesMut,
+                };
+                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len());
+                bytes.put_u64_le(key.ns());
+                bytes.put_slice(key.as_bytes().as_ref());
+                bytes.freeze()
+            };
+
+            // Check L0 segments in reverse chronological order (newest first)
+            for segment in version.l0.iter().rev() {
+                let reader = match segment.reader() {
+                    | Ok(r) => r,
+                    | Err(_) => continue,
+                };
+
+                // Scan for keys matching this prefix (any timestamp)
+                use std::ops::Bound;
+                let mut scan_iter = reader.scan(
+                    Bound::Included(key_prefix_lower.as_ref()),
+                    Bound::Included(key_prefix_upper.as_ref()),
+                );
+
+                // Take the first match (newest version due to timestamp ordering)
+                // scan_iter returns (KeyBytes, ValueBytes) already deserialized
+                if let Some(Ok((_, val))) = scan_iter.next() {
+                    if val.is_tombstone() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(val));
+                }
+            }
+
+            // Check L1-L7 in parallel using warm thread pool
+            // Keys don't overlap within a level in leveled compaction, so parallel search
+            // is safe
+            let key_prefix_lower_clone = key_prefix_lower.clone();
+            let key_prefix_upper_clone = key_prefix_upper.clone();
+            let key_for_bloom_clone = key_for_bloom.clone();
+            let result = self.read_pool.install(|| {
+                version.levels.par_iter().find_map_any(|level| {
+                    // Within each level, search segments
+                    for segment in &level.segments {
+                        if let Ok(reader) = segment.reader() {
+                            // Fast bloom filter check - skip segments that definitely don't have
+                            // this key
+                            if !reader.may_contain(&key_for_bloom_clone) {
+                                continue;
+                            }
+
+                            use std::ops::Bound;
+                            let mut scan_iter = reader.scan(
+                                Bound::Included(key_prefix_lower_clone.as_ref()),
+                                Bound::Included(key_prefix_upper_clone.as_ref()),
+                            );
+                            if let Some(Ok((_, val))) = scan_iter.next() {
+                                return Some(val);
+                            }
+                        }
+                    }
+                    None
+                })
+            });
+
+            if let Some(val) = result {
+                if val.is_tombstone() {
+                    return Ok(None);
+                }
+                return Ok(Some(val));
+            }
+        }
+
+        // 4. Not found anywhere
         Ok(None)
     }
 
@@ -307,20 +529,84 @@ impl DbInner {
                 | _ => None, // filter out invalid enums
             })
             .collect::<Vec<_>>();
-        {
-            let guard = self.state.lock();
-            let mtable = guard.current_memtable();
 
-            // TODO(@siennathesane): add memtable swap logic here
-            match mtable.put_batch(_batch.as_ref()) {
-                | Ok(_) => Ok(()),
-                | Err(e) => Err(MemtableError(e)),
-            }
+        // Fast path: try to write entire batch to current memtable
+        let mtable = {
+            let guard = self.state.lock();
+            guard.current_memtable()
+        };
+
+        match mtable.put_batch(_batch.as_ref()) {
+            | Ok(written) if written == _batch.len() => {
+                // All written, done!
+                Ok(())
+            },
+            | Ok(written) => {
+                // Partial write - need to handle remaining with memtable swaps
+                let mut offset = written;
+                while offset < _batch.len() {
+                    // Swap memtable
+                    let new_mtable = {
+                        let mut guard = self.state.lock();
+                        guard.new_memtable();
+                        guard.current_memtable()
+                    };
+
+                    // Write remaining to new memtable
+                    match new_mtable.put_batch(&_batch[offset..]) {
+                        | Ok(w) => {
+                            offset += w;
+                            if offset >= _batch.len() {
+                                return Ok(());
+                            }
+                        },
+                        | Err(e) => {
+                            use crate::errs::MemtableError as MtError;
+                            // If frozen, retry with current memtable (which was swapped)
+                            if matches!(e, MtError::MemtableIsFrozen) {
+                                continue; // Retry loop with current memtable
+                            }
+                            return Err(MemtableError(e));
+                        },
+                    }
+                }
+                Ok(())
+            },
+            | Err(e) => {
+                use crate::errs::MemtableError as MtError;
+                match e {
+                    | MtError::DataExceedsMaximum => {
+                        // First entry doesn't fit - swap and retry whole batch
+                        let new_mtable = {
+                            let mut guard = self.state.lock();
+                            guard.new_memtable();
+                            guard.current_memtable()
+                        };
+                        match new_mtable.put_batch(_batch.as_ref()) {
+                            | Ok(_) => Ok(()),
+                            | Err(e) => Err(MemtableError(e)),
+                        }
+                    },
+                    | MtError::MemtableIsFrozen => {
+                        // Memtable was frozen during write - get current and retry
+                        // (background flusher swaps memtables asynchronously)
+                        let new_mtable = {
+                            let guard = self.state.lock();
+                            guard.current_memtable()
+                        };
+                        match new_mtable.put_batch(_batch.as_ref()) {
+                            | Ok(_) => Ok(()),
+                            | Err(e) => Err(MemtableError(e)),
+                        }
+                    },
+                    | _ => Err(MemtableError(e)),
+                }
+            },
         }
     }
 
     fn sync(&self) -> Result<(), CesiumError> {
-        todo!()
+        self.state.lock().sync()
     }
 }
 
@@ -414,7 +700,10 @@ mod tests {
         // test get on empty db
         let result = db.get(b"nonexistent");
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "get on empty db should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "get on empty db should return None"
+        );
 
         // insert and retrieve
         let key = b"test-key";
@@ -424,13 +713,19 @@ mod tests {
         let result = db.get(key);
         assert!(result.is_ok());
         let retrieved = result.unwrap();
-        assert!(retrieved.is_some(), "get should return Some for existing key");
+        assert!(
+            retrieved.is_some(),
+            "get should return Some for existing key"
+        );
         assert_eq!(&retrieved.unwrap()[..], val, "retrieved value should match");
 
         // test get on different key
         let result = db.get(b"different-key");
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "get on non-existent key should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "get on non-existent key should return None"
+        );
     }
 
     #[test]
@@ -452,7 +747,11 @@ mod tests {
         assert!(result.is_ok());
         let retrieved = result.unwrap();
         assert!(retrieved.is_some());
-        assert_eq!(&retrieved.unwrap()[..], val3, "get should return the latest value");
+        assert_eq!(
+            &retrieved.unwrap()[..],
+            val3,
+            "get should return the latest value"
+        );
     }
 
     #[test]
@@ -533,7 +832,10 @@ mod tests {
         // verify key doesn't exist in default namespace
         let result = db.get(key);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "key should not exist in default namespace");
+        assert!(
+            result.unwrap().is_none(),
+            "key should not exist in default namespace"
+        );
     }
 
     #[test]
@@ -558,7 +860,10 @@ mod tests {
         // verify the key no longer exists (tombstone filters it out)
         let result = db.get_ns(ns, key);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "deleted key in namespace should return None");
+        assert!(
+            result.unwrap().is_none(),
+            "deleted key in namespace should return None"
+        );
     }
 
     #[test]
@@ -581,12 +886,19 @@ mod tests {
         let time2 = db.time();
 
         // time should be monotonically increasing
-        assert!(time2 >= time1, "clock should return monotonically increasing values");
+        assert!(
+            time2 >= time1,
+            "clock should return monotonically increasing values"
+        );
     }
 
     #[test]
     fn test_db_batch_mixed_operations() {
-        use crate::Batch::{Delete, DeleteNs, PutNs};
+        use crate::Batch::{
+            Delete,
+            DeleteNs,
+            PutNs,
+        };
 
         let db = db_builder();
 

@@ -3,15 +3,34 @@
 //! This module provides parallel reading capabilities for segments,
 //! allowing multiple blocks/ranges to be read concurrently.
 
-use crate::block::{Block, BLOCK_SIZE};
-use crate::io::buffer_pool::{BufferPool, PooledBuffer};
-use crate::segment::BlockType;
-use crate::segment_reader::SegmentReader;
-use crate::utils::Deserializer;
-use bytes::BytesMut;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use std::sync::Arc;
-use std::thread;
+use std::{
+    sync::Arc,
+    thread,
+};
+
+use bytes::{
+    Bytes,
+    BytesMut,
+};
+use crossbeam_channel::{
+    Receiver,
+    Sender,
+    bounded,
+};
+
+use crate::{
+    block::{
+        BLOCK_SIZE,
+        Block,
+    },
+    io::buffer_pool::{
+        BufferPool,
+        PooledBuffer,
+    },
+    segment::BlockType,
+    segment_reader::SegmentReader,
+    utils::Deserializer,
+};
 
 /// Result of a parallel read operation
 pub struct ReadResult {
@@ -19,7 +38,7 @@ pub struct ReadResult {
     pub block_index: usize,
 
     /// The deserialized block
-    pub block: Block,
+    pub block: crate::block::ReadOnlyBlock,
 
     /// Type of block (Key or Value)
     pub block_type: BlockType,
@@ -149,10 +168,12 @@ impl ParallelReader {
             // Read the block from the segment using the internal API
             let offset = task.block_index * BLOCK_SIZE;
 
-            // Choose which handle to read from based on block type
+            // CRITICAL: Clone the Arc to ensure the Map stays alive during the read
+            // If we just borrow &Arc<Map>, the task could be dropped mid-read causing
+            // SIGBUS
             let handle = match task.block_type {
-                BlockType::Key => task.reader.key_handle(),
-                BlockType::Value => task.reader.val_handle(),
+                | BlockType::Key => Arc::clone(task.reader.key_handle()),
+                | BlockType::Value => Arc::clone(task.reader.val_handle()),
             };
 
             // Check bounds
@@ -161,12 +182,19 @@ impl ParallelReader {
                 continue;
             }
 
-            // Read the block data
-            let mut buffer = BytesMut::zeroed(BLOCK_SIZE);
-            buffer.copy_from_slice(&handle[offset..offset + BLOCK_SIZE]);
+            // Read the block data directly to Bytes (avoid zeroing)
+            let bytes = handle
+                .read_range(offset..offset + BLOCK_SIZE, |slice| {
+                    Bytes::copy_from_slice(slice)
+                })
+                .ok();
+
+            if bytes.is_none() {
+                continue;
+            }
 
             // Deserialize into a block
-            let block = Block::deserialize(buffer.freeze());
+            let block = crate::block::ReadOnlyBlock::deserialize(bytes.unwrap());
 
             let result = ReadResult {
                 block_index: task.block_index,
@@ -260,9 +288,10 @@ impl Drop for ParallelReader {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::segment_builder::SegmentBuilder;
-    use tempfile::TempDir;
 
     fn create_test_reader() -> Arc<SegmentReader> {
         let temp_dir = TempDir::new().unwrap();

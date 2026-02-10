@@ -154,7 +154,7 @@ unsafe fn simd_memcmp_sse2(a: &[u8], b: &[u8]) -> Ordering {
         let mask = _mm_movemask_epi8(cmp);
 
         // If not all bytes are equal
-        if mask != 0xFFFF {
+        if mask != 0xffff {
             // Find first differing byte
             let diff_byte = (!mask as u16).trailing_zeros() as usize;
             let idx = offset + diff_byte;
@@ -180,16 +180,22 @@ unsafe fn simd_memcmp_neon(a: &[u8], b: &[u8]) -> Ordering {
     while offset + 16 <= len {
         // SAFETY: We've verified the offset is in bounds
         let chunk_a = unsafe { vld1q_u8(a.as_ptr().add(offset)) };
+        // SAFETY: We've verified the offset is in bounds
         let chunk_b = unsafe { vld1q_u8(b.as_ptr().add(offset)) };
 
+        // SAFETY: chunk_a and chunk_b are valid SIMD vectors
         let cmp = unsafe { vceqq_u8(chunk_a, chunk_b) };
 
         // Extract comparison results to lanes
+        // SAFETY: cmp is a valid SIMD vector
         let result_low = unsafe { vget_low_u8(cmp) };
+        // SAFETY: cmp is a valid SIMD vector
         let result_high = unsafe { vget_high_u8(cmp) };
 
         // Check if all bytes are equal
+        // SAFETY: result_low and result_high are valid SIMD vectors
         let all_equal = unsafe { vmin_u8(result_low, result_high) };
+        // SAFETY: all_equal is a valid SIMD vector, lane 0 is valid
         let all_equal_scalar = unsafe { vget_lane_u64(vreinterpret_u64_u8(all_equal), 0) };
 
         if all_equal_scalar != !0u64 {
@@ -275,38 +281,38 @@ mod tests {
     #[test]
     fn test_simd_memcmp_long() {
         // Test with data longer than SIMD registers
-        let a = vec![0xAAu8; 128];
-        let b = vec![0xAAu8; 128];
+        let a = vec![0xaau8; 128];
+        let b = vec![0xaau8; 128];
         assert_eq!(simd_memcmp(&a, &b), Ordering::Equal);
     }
 
     #[test]
     fn test_simd_memcmp_long_diff_at_end() {
         // Test difference at the end
-        let mut a = vec![0xAAu8; 128];
-        let mut b = vec![0xAAu8; 128];
-        a[127] = 0xAB;
-        b[127] = 0xAA;
+        let mut a = vec![0xaau8; 128];
+        let mut b = vec![0xaau8; 128];
+        a[127] = 0xab;
+        b[127] = 0xaa;
         assert_eq!(simd_memcmp(&a, &b), Ordering::Greater);
     }
 
     #[test]
     fn test_simd_memcmp_long_diff_at_start() {
         // Test difference at the start
-        let mut a = vec![0xAAu8; 128];
-        let mut b = vec![0xAAu8; 128];
-        a[0] = 0xA9;
-        b[0] = 0xAA;
+        let mut a = vec![0xaau8; 128];
+        let mut b = vec![0xaau8; 128];
+        a[0] = 0xa9;
+        b[0] = 0xaa;
         assert_eq!(simd_memcmp(&a, &b), Ordering::Less);
     }
 
     #[test]
     fn test_simd_memcmp_long_diff_in_middle() {
         // Test difference in the middle (within SIMD chunk)
-        let mut a = vec![0xAAu8; 128];
-        let mut b = vec![0xAAu8; 128];
-        a[64] = 0xAB;
-        b[64] = 0xAA;
+        let mut a = vec![0xaau8; 128];
+        let mut b = vec![0xaau8; 128];
+        a[64] = 0xab;
+        b[64] = 0xaa;
         assert_eq!(simd_memcmp(&a, &b), Ordering::Greater);
     }
 
@@ -343,8 +349,11 @@ mod tests {
             let simd_result = simd_memcmp(&a, &b);
             let scalar_result = a.cmp(&b);
 
-            assert_eq!(simd_result, scalar_result,
-                "SIMD and scalar gave different results for slices of length {}", len);
+            assert_eq!(
+                simd_result, scalar_result,
+                "SIMD and scalar gave different results for slices of length {}",
+                len
+            );
         }
     }
 }

@@ -7,11 +7,32 @@
 //! - Write amplification
 //! - Available resources
 
-use crate::compaction::job::{CompactionInput, CompactionJob, CompactionJobType, CompactionOutput};
-use crate::levels::{CompactionStrategy, VersionSet};
-use crate::segment::Segment;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+    },
+};
+
+use parking_lot::RwLock;
+
+use crate::{
+    compaction::job::{
+        CompactionInput,
+        CompactionJob,
+        CompactionJobType,
+        CompactionOutput,
+    },
+    levels::{
+        CompactionStrategy,
+        VersionSet,
+    },
+    segment::Segment,
+};
 
 /// Configuration for the compaction scheduler
 #[derive(Clone)]
@@ -55,6 +76,9 @@ pub struct CompactionScheduler {
 
     /// Monotonic job ID counter
     next_job_id: AtomicU64,
+
+    /// Round-robin tracker: maps level_num → last compacted segment_id
+    last_compacted: RwLock<HashMap<u8, u64>>,
 }
 
 impl CompactionScheduler {
@@ -68,6 +92,7 @@ impl CompactionScheduler {
         Self {
             config,
             next_job_id: AtomicU64::new(0),
+            last_compacted: RwLock::new(HashMap::new()),
         }
     }
 
@@ -125,16 +150,17 @@ impl CompactionScheduler {
                     .expect("segment should have key range");
 
                 // Check if this segment overlaps with any segment in next level
-                let has_overlap = next_level.key_ranges.iter().any(|r| r.overlaps(segment_range));
+                let has_overlap = next_level
+                    .key_ranges
+                    .iter()
+                    .any(|r| r.overlaps(segment_range));
 
                 if !has_overlap {
                     // Found a trivial move!
                     let input = CompactionInput::new(level.level_num, vec![segment.clone()]);
 
-                    let output = CompactionOutput::new(
-                        next_level_num,
-                        self.config.target_segment_size,
-                    );
+                    let output =
+                        CompactionOutput::new(next_level_num, self.config.target_segment_size);
 
                     let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
@@ -154,15 +180,21 @@ impl CompactionScheduler {
 
     /// Creates an L0 compaction job
     ///
-    /// Selects multiple L0 segments and their overlapping L1 segments.
+    /// Selects L0 segments oldest-first (by ID, since IDs are monotonically
+    /// increasing). Takes at most `l0_compaction_trigger` segments per
+    /// batch to avoid oversized compactions.
     fn create_l0_compaction(&self, version: &VersionSet) -> Option<CompactionJob> {
         if version.l0.is_empty() {
             return None;
         }
 
-        // For now, compact all L0 files at once
-        // TODO: More sophisticated selection (e.g., size-based, oldest-first)
-        let l0_segments = version.l0.clone();
+        // Sort L0 segments by ID (oldest first, since IDs increase monotonically)
+        let mut l0_segments = version.l0.clone();
+        l0_segments.sort_by_key(|s| s.id());
+
+        // Take at most l0_compaction_trigger segments per batch
+        let batch_size = self.config.l0_compaction_trigger.min(l0_segments.len());
+        l0_segments.truncate(batch_size);
 
         let input = CompactionInput::new(0, l0_segments);
 
@@ -234,7 +266,15 @@ impl CompactionScheduler {
     }
 
     /// Creates a level compaction job
-    fn create_level_compaction(&self, version: &VersionSet, level_num: u8) -> Option<CompactionJob> {
+    ///
+    /// Uses round-robin selection: picks the segment after the last compacted
+    /// one, wrapping around to the beginning when reaching the end. This
+    /// ensures even compaction coverage across the level.
+    fn create_level_compaction(
+        &self,
+        version: &VersionSet,
+        level_num: u8,
+    ) -> Option<CompactionJob> {
         let level_idx = level_num as usize - 1;
         if level_idx >= version.levels.len() {
             return None;
@@ -242,17 +282,38 @@ impl CompactionScheduler {
 
         let level = &version.levels[level_idx];
 
-        // For leveled compaction: pick first segment
-        // TODO: More sophisticated selection (round-robin, largest file, etc.)
         if level.segments.is_empty() {
             return None;
         }
 
-        let segment = level.segments[0].clone();
-        let segment_range = level
-            .key_ranges
-            .iter()
-            .find(|r| r.segment_id == segment.id())?;
+        // Round-robin: find the segment after the last compacted one
+        let segment = {
+            let last_compacted = self.last_compacted.read();
+            let last_id = last_compacted.get(&level_num).copied();
+
+            match last_id {
+                | Some(id) => {
+                    // Find the first segment with ID > last_compacted, or wrap to first
+                    level
+                        .segments
+                        .iter()
+                        .find(|s| s.id() > id)
+                        .unwrap_or(&level.segments[0])
+                        .clone()
+                },
+                | None => level.segments[0].clone(),
+            }
+        };
+
+        // Update round-robin tracker
+        {
+            let mut last_compacted = self.last_compacted.write();
+            last_compacted.insert(level_num, segment.id());
+        }
+        let segment_range = match level.key_ranges.iter().find(|r| r.segment_id == segment.id()) {
+            | Some(r) => r,
+            | None => return None,
+        };
 
         let input = CompactionInput::new(level_num, vec![segment]);
 
@@ -267,7 +328,11 @@ impl CompactionScheduler {
                 .segments
                 .iter()
                 .filter(|seg| {
-                    if let Some(range) = next_level.key_ranges.iter().find(|r| r.segment_id == seg.id()) {
+                    if let Some(range) = next_level
+                        .key_ranges
+                        .iter()
+                        .find(|r| r.segment_id == seg.id())
+                    {
                         segment_range.overlaps(range)
                     } else {
                         false

@@ -90,10 +90,16 @@ impl Drop for HybridLogicalClock {
 #[cfg(all(test, not(miri)))]
 mod tests {
     #[cfg(not(loom))]
-    use std::{sync::Arc, thread};
+    use std::{
+        sync::Arc,
+        thread,
+    };
 
     #[cfg(loom)]
-    use loom::{sync::Arc, thread};
+    use loom::{
+        sync::Arc,
+        thread,
+    };
 
     use crate::hlc::{
         HLC,
@@ -190,7 +196,10 @@ mod tests {
             let time2 = t2.join().unwrap();
 
             // The two timestamps from different threads must be different
-            assert_ne!(time1, time2, "Concurrent time() calls must return unique timestamps");
+            assert_ne!(
+                time1, time2,
+                "Concurrent time() calls must return unique timestamps"
+            );
         });
     }
 
@@ -628,13 +637,9 @@ mod x86_atomic_tests {
             let a1 = atomic.clone();
             let a2 = atomic.clone();
 
-            let t1 = thread::spawn(move || {
-                a1.fetch_add(10, Ordering::SeqCst)
-            });
+            let t1 = thread::spawn(move || a1.fetch_add(10, Ordering::SeqCst));
 
-            let t2 = thread::spawn(move || {
-                a2.fetch_add(20, Ordering::SeqCst)
-            });
+            let t2 = thread::spawn(move || a2.fetch_add(20, Ordering::SeqCst));
 
             let old1 = t1.join().unwrap();
             let old2 = t2.join().unwrap();
@@ -661,9 +666,7 @@ mod x86_atomic_tests {
                 a1.store(200, Ordering::Release);
             });
 
-            let t2 = thread::spawn(move || {
-                a2.load(Ordering::Acquire)
-            });
+            let t2 = thread::spawn(move || a2.load(Ordering::Acquire));
 
             t1.join().unwrap();
             let loaded = t2.join().unwrap();
@@ -719,13 +722,9 @@ mod x86_atomic_tests {
             let a1 = atomic.clone();
             let a2 = atomic.clone();
 
-            let t1 = thread::spawn(move || {
-                a1.fetch_sub(10, Ordering::SeqCst)
-            });
+            let t1 = thread::spawn(move || a1.fetch_sub(10, Ordering::SeqCst));
 
-            let t2 = thread::spawn(move || {
-                a2.fetch_sub(20, Ordering::SeqCst)
-            });
+            let t2 = thread::spawn(move || a2.fetch_sub(20, Ordering::SeqCst));
 
             t1.join().unwrap();
             t2.join().unwrap();
@@ -746,13 +745,9 @@ mod x86_atomic_tests {
             let a1 = atomic.clone();
             let a2 = atomic.clone();
 
-            let t1 = thread::spawn(move || {
-                a1.fetch_add(1, Ordering::SeqCst)
-            });
+            let t1 = thread::spawn(move || a1.fetch_add(1, Ordering::SeqCst));
 
-            let t2 = thread::spawn(move || {
-                a2.load(Ordering::SeqCst)
-            });
+            let t2 = thread::spawn(move || a2.load(Ordering::SeqCst));
 
             let old1 = t1.join().unwrap();
             let loaded = t2.join().unwrap();

@@ -46,7 +46,7 @@ impl SegmentBlockIterator<'_> {
 }
 
 impl<'a> Iterator for SegmentBlockIterator<'a> {
-    type Item = Result<Block, SegmentError>;
+    type Item = Result<crate::block::ReadOnlyBlock, SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_block >= self.reader.num_blocks {
@@ -103,7 +103,7 @@ impl<'a> SeekingBlockIterator<'a> {
 }
 
 impl<'a> Iterator for SeekingBlockIterator<'a> {
-    type Item = Result<Block, SegmentError>;
+    type Item = Result<crate::block::ReadOnlyBlock, SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.end {
@@ -124,7 +124,7 @@ impl<'a> Iterator for SeekingBlockIterator<'a> {
 pub struct SegmentScanIterator<'a> {
     reader: &'a SegmentReader,
     current_block_index: usize,
-    current_key_block: Option<Block>,
+    current_key_block: Option<crate::block::ReadOnlyBlock>,
     current_key_index: usize,
     lower_bound: Bound<Bytes>,
     upper_bound: Bound<Bytes>,
@@ -145,8 +145,18 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
                     self.current_key_block.as_ref().unwrap().num_entries() as usize
             {
                 match self.load_next_block() {
-                    | Ok(false) => return None,      // No more blocks
-                    | Ok(true) => {},                // Successfully loaded next block
+                    | Ok(false) => return None, // No more blocks
+                    | Ok(true) => {
+                        // Fast-skip optimization: Check if we should skip this entire block
+                        // by checking its last entry against our lower bound
+                        if let Some(should_skip) = self.should_skip_current_block() {
+                            if should_skip {
+                                // Mark block as exhausted to load next one
+                                self.current_key_block = None;
+                                continue;
+                            }
+                        }
+                    },
                     | Err(e) => return Some(Err(e)), // Error loading block
                 }
             }
@@ -171,17 +181,24 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
                         | _ => continue, // Skip middle or end entries
                     };
 
-                    // Check if the key is within our range
-                    if !self.is_in_range(&key_bytes) {
+                    // Strip the value location metadata (10 bytes: u64 + u16) FIRST
+                    // Keys are stored as:
+                    // [val_block:8][val_entry:2][ns:8][user_key][inverted_ts:16]
+                    // But bounds/deserialize expect: [ns:8][user_key][inverted_ts:16]
+                    use crate::segment::KEY_DATA_OFFSET;
+                    let key_data = key_bytes.slice(KEY_DATA_OFFSET..);
+
+                    // Check if the key is within our range (using stripped key_data)
+                    if !self.is_in_range(&key_data) {
                         // If we're past the upper bound, we can stop scanning
-                        if self.is_past_upper_bound(&key_bytes) {
+                        if self.is_past_upper_bound(&key_data) {
                             return None;
                         }
-                        continue; // Skip this key
+                        continue; // Skip this key (before lower bound)
                     }
 
-                    // Parse the key
-                    let key = KeyBytes::deserialize(key_bytes.clone());
+                    // Parse the key (without value location metadata)
+                    let key = KeyBytes::deserialize(key_data);
 
                     // Use val_index to find the value block for this key
                     let val_bytes = match self.read_value_for_key(&key_bytes) {
@@ -210,7 +227,13 @@ impl<'a> SegmentScanIterator<'a> {
     /// # Arguments
     /// * `reader` - The segment reader to scan
     /// * `range` - Range of keys to scan
-    pub fn new(reader: &'a SegmentReader, range: (Bound<&[u8]>, Bound<&[u8]>)) -> Self {
+    /// * `start_block` - Block index to start scanning from (from index lookup
+    ///   optimization)
+    pub fn new(
+        reader: &'a SegmentReader,
+        range: (Bound<&[u8]>, Bound<&[u8]>),
+        start_block: usize,
+    ) -> Self {
         let lower_bound = convert_bound_to_bytes(range.0);
         let upper_bound = convert_bound_to_bytes(range.1);
 
@@ -219,7 +242,7 @@ impl<'a> SegmentScanIterator<'a> {
 
         Self {
             reader,
-            current_block_index: 0,
+            current_block_index: start_block,
             current_key_block: None,
             current_key_index: 0,
             lower_bound,
@@ -257,11 +280,69 @@ impl<'a> SegmentScanIterator<'a> {
         }
     }
 
+    /// Fast-skip optimization: Check if we should skip the current block
+    /// entirely by examining its last entry. Returns None if we can't
+    /// determine, Some(true) to skip.
+    fn should_skip_current_block(&self) -> Option<bool> {
+        // Only check if we have a lower bound to skip towards
+        if matches!(self.lower_bound, Bound::Unbounded) {
+            return Some(false);
+        }
+
+        let key_block = match self.current_key_block.as_ref() {
+            | Some(b) => b,
+            | None => return None,
+        };
+        let num_entries = key_block.num_entries() as usize;
+
+        if num_entries == 0 {
+            return Some(true); // Empty block, skip it
+        }
+
+        // Check the last entry in the block
+        // If last entry < lower_bound, we can skip the entire block
+        let last_entry_idx = num_entries - 1;
+
+        // Try to get last complete entry (not middle/end of multi-block)
+        for idx in (0..num_entries).rev() {
+            if let Some((flag, data)) = key_block.get(idx) {
+                match flag {
+                    | EntryFlag::Complete => {
+                        // Parse the last complete key
+                        let key_bytes = Bytes::copy_from_slice(data);
+
+                        // Strip the value location metadata
+                        use crate::segment::KEY_DATA_OFFSET;
+                        if key_bytes.len() < KEY_DATA_OFFSET {
+                            return None; // Invalid entry, can't determine
+                        }
+
+                        let key_data = key_bytes.slice(KEY_DATA_OFFSET..);
+
+                        // If last key in block < lower_bound, skip entire block
+                        let before_lower = match &self.lower_bound {
+                            | Bound::Included(lower) => key_data.as_ref() < lower.as_ref(),
+                            | Bound::Excluded(lower) => key_data.as_ref() <= lower.as_ref(),
+                            | Bound::Unbounded => false,
+                        };
+
+                        return Some(before_lower);
+                    },
+                    | _ => continue, // Skip multi-block entries, check previous
+                }
+            }
+        }
+
+        None // Couldn't determine, don't skip
+    }
+
     /// Reads a multi-block key using the shared reader helper.
     fn read_full_key(&self, flag: EntryFlag, initial_data: &[u8]) -> Result<Bytes, SegmentError> {
         // Delegate to the reader's shared multi-block entry handler
-        // Note: We use current_block_index - 1 because we've already advanced past the initial block
-        self.reader.read_multiblock_entry(flag, initial_data, self.current_block_index - 1)
+        // Note: We use current_block_index - 1 because we've already advanced past the
+        // initial block
+        self.reader
+            .read_multiblock_entry(flag, initial_data, self.current_block_index - 1)
     }
 
     /// Checks if a key is within the scan range.
@@ -293,7 +374,8 @@ impl<'a> SegmentScanIterator<'a> {
     }
 
     /// Reads the value for a key.
-    /// The key format is: [value_block_num:u64][value_entry_index:u16][actual_key_data]
+    /// The key format is:
+    /// [value_block_num:u64][value_entry_index:u16][actual_key_data]
     fn read_value_for_key(&self, key: &Bytes) -> Result<Option<Bytes>, SegmentError> {
         // Extract value location metadata from the first 10 bytes of the key
         if key.len() < 10 {
@@ -305,7 +387,212 @@ impl<'a> SegmentScanIterator<'a> {
         let value_entry_index = u16::from_le_bytes(key[8..10].try_into().unwrap());
 
         // Read the value from the value segment at the specified location
-        match self.reader.read_value(value_block_num as usize, value_entry_index as usize) {
+        match self
+            .reader
+            .read_value(value_block_num as usize, value_entry_index as usize)
+        {
+            | Ok(value) => Ok(Some(value)),
+            | Err(e) => Err(e),
+        }
+    }
+}
+
+/// Iterator for scanning a segment and yielding raw (unserialized) entries.
+///
+/// Unlike `SegmentScanIterator` which deserializes into `(KeyBytes,
+/// ValueBytes)`, this iterator yields `RawEntry` — zero-copy wrappers around
+/// the serialized bytes. Used by the compaction path to eliminate
+/// deserialize/re-serialize overhead.
+pub(crate) struct RawSegmentScanIterator<'a> {
+    reader: &'a SegmentReader,
+    current_block_index: usize,
+    current_key_block: Option<crate::block::ReadOnlyBlock>,
+    current_key_index: usize,
+    lower_bound: Bound<Bytes>,
+    upper_bound: Bound<Bytes>,
+    is_upper_inclusive: bool,
+    is_lower_inclusive: bool,
+}
+
+impl<'a> Iterator for RawSegmentScanIterator<'a> {
+    type Item = Result<crate::raw_entry::RawEntry, SegmentError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current_key_block.is_none() ||
+                self.current_key_index >=
+                    self.current_key_block.as_ref().unwrap().num_entries() as usize
+            {
+                match self.load_next_block() {
+                    | Ok(false) => return None,
+                    | Ok(true) => {
+                        if let Some(should_skip) = self.should_skip_current_block() {
+                            if should_skip {
+                                self.current_key_block = None;
+                                continue;
+                            }
+                        }
+                    },
+                    | Err(e) => return Some(Err(e)),
+                }
+            }
+
+            let key_block = self.current_key_block.as_ref().unwrap();
+            match key_block.get(self.current_key_index) {
+                | Some((flag, data)) => {
+                    self.current_key_index += 1;
+
+                    let key_bytes = match flag {
+                        | EntryFlag::Complete => Bytes::copy_from_slice(data),
+                        | EntryFlag::Start => match self.read_full_key(flag, data) {
+                            | Ok(bytes) => bytes,
+                            | Err(e) => return Some(Err(e)),
+                        },
+                        | _ => continue,
+                    };
+
+                    use crate::segment::KEY_DATA_OFFSET;
+                    let key_data = key_bytes.slice(KEY_DATA_OFFSET..);
+
+                    if !self.is_in_range(&key_data) {
+                        if self.is_past_upper_bound(&key_data) {
+                            return None;
+                        }
+                        continue;
+                    }
+
+                    // Read value — NO deserialization, just get the raw bytes
+                    let val_bytes = match self.read_value_for_key(&key_bytes) {
+                        | Ok(Some(bytes)) => bytes,
+                        | Ok(None) => continue,
+                        | Err(e) => return Some(Err(e)),
+                    };
+
+                    return Some(Ok(crate::raw_entry::RawEntry::new(key_data, val_bytes)));
+                },
+                | None => {
+                    self.current_key_block = None;
+                },
+            }
+        }
+    }
+}
+
+impl<'a> RawSegmentScanIterator<'a> {
+    pub fn new(
+        reader: &'a SegmentReader,
+        range: (Bound<&[u8]>, Bound<&[u8]>),
+        start_block: usize,
+    ) -> Self {
+        let lower_bound = convert_bound_to_bytes(range.0);
+        let upper_bound = convert_bound_to_bytes(range.1);
+
+        let is_lower_inclusive = matches!(lower_bound, Bound::Included(_));
+        let is_upper_inclusive = matches!(upper_bound, Bound::Included(_));
+
+        Self {
+            reader,
+            current_block_index: start_block,
+            current_key_block: None,
+            current_key_index: 0,
+            lower_bound,
+            upper_bound,
+            is_upper_inclusive,
+            is_lower_inclusive,
+        }
+    }
+
+    fn load_next_block(&mut self) -> Result<bool, SegmentError> {
+        if self.current_block_index >= self.reader.visible_key_blocks {
+            return Ok(false);
+        }
+        match self.reader.read_key_block(self.current_block_index) {
+            | Ok(block) => {
+                self.current_key_block = Some(block);
+                self.current_key_index = 0;
+                self.current_block_index += 1;
+                Ok(true)
+            },
+            | Err(e) => {
+                self.current_block_index += 1;
+                Err(e)
+            },
+        }
+    }
+
+    fn should_skip_current_block(&self) -> Option<bool> {
+        if matches!(self.lower_bound, Bound::Unbounded) {
+            return Some(false);
+        }
+        let key_block = match self.current_key_block.as_ref() {
+            | Some(b) => b,
+            | None => return None,
+        };
+        let num_entries = key_block.num_entries() as usize;
+        if num_entries == 0 {
+            return Some(true);
+        }
+        for idx in (0..num_entries).rev() {
+            if let Some((flag, data)) = key_block.get(idx) {
+                match flag {
+                    | EntryFlag::Complete => {
+                        let key_bytes = Bytes::copy_from_slice(data);
+                        use crate::segment::KEY_DATA_OFFSET;
+                        if key_bytes.len() < KEY_DATA_OFFSET {
+                            return None;
+                        }
+                        let key_data = key_bytes.slice(KEY_DATA_OFFSET..);
+                        let before_lower = match &self.lower_bound {
+                            | Bound::Included(lower) => key_data.as_ref() < lower.as_ref(),
+                            | Bound::Excluded(lower) => key_data.as_ref() <= lower.as_ref(),
+                            | Bound::Unbounded => false,
+                        };
+                        return Some(before_lower);
+                    },
+                    | _ => continue,
+                }
+            }
+        }
+        None
+    }
+
+    fn read_full_key(&self, flag: EntryFlag, initial_data: &[u8]) -> Result<Bytes, SegmentError> {
+        self.reader
+            .read_multiblock_entry(flag, initial_data, self.current_block_index - 1)
+    }
+
+    fn is_in_range(&self, key: &Bytes) -> bool {
+        let satisfies_lower = match &self.lower_bound {
+            | Bound::Included(lower) => key.as_ref() >= lower.as_ref(),
+            | Bound::Excluded(lower) => key.as_ref() > lower.as_ref(),
+            | Bound::Unbounded => true,
+        };
+        let satisfies_upper = match &self.upper_bound {
+            | Bound::Included(upper) => key.as_ref() <= upper.as_ref(),
+            | Bound::Excluded(upper) => key.as_ref() < upper.as_ref(),
+            | Bound::Unbounded => true,
+        };
+        satisfies_lower && satisfies_upper
+    }
+
+    fn is_past_upper_bound(&self, key: &Bytes) -> bool {
+        match &self.upper_bound {
+            | Bound::Included(upper) => key.as_ref() > upper.as_ref(),
+            | Bound::Excluded(upper) => key.as_ref() >= upper.as_ref(),
+            | Bound::Unbounded => false,
+        }
+    }
+
+    fn read_value_for_key(&self, key: &Bytes) -> Result<Option<Bytes>, SegmentError> {
+        if key.len() < 10 {
+            return Ok(None);
+        }
+        let value_block_num = u64::from_le_bytes(key[0..8].try_into().unwrap());
+        let value_entry_index = u16::from_le_bytes(key[8..10].try_into().unwrap());
+        match self
+            .reader
+            .read_value(value_block_num as usize, value_entry_index as usize)
+        {
             | Ok(value) => Ok(Some(value)),
             | Err(e) => Err(e),
         }
@@ -414,7 +701,7 @@ mod tests {
         let reader = SegmentReader::new(
             key_map,
             val_map,
-            Arc::new(parking_lot::Mutex::new(key_index)),
+            Arc::new(parking_lot::RwLock::new(key_index)),
         )
         .expect("Failed to create segment reader");
 
@@ -550,7 +837,7 @@ mod tests {
         let reader = SegmentReader::new(
             key_map,
             val_map,
-            Arc::new(parking_lot::Mutex::new(key_index)),
+            Arc::new(parking_lot::RwLock::new(key_index)),
         )
         .expect("Failed to create segment reader");
 
@@ -588,10 +875,11 @@ mod tests {
 
         // Create blocks and write them
         for (i, (ns, key, value)) in test_keys.iter().enumerate() {
-            // Prepare key data with namespace
-            let mut full_key = Vec::with_capacity(ns.len() + key.len());
-            full_key.extend_from_slice(ns);
-            full_key.extend_from_slice(key.as_ref());
+            // Prepare key data with namespace + key + timestamp (serialized format)
+            let mut full_key = Vec::with_capacity(ns.len() + key.len() + 16);
+            full_key.extend_from_slice(ns); // 8 bytes namespace
+            full_key.extend_from_slice(key.as_ref()); // user key
+            full_key.extend_from_slice(&[0u8; 16]); // 16 bytes timestamp
 
             // Prepare value data with namespace
             let mut full_value = Vec::with_capacity(ns.len() + value.len());
@@ -625,18 +913,19 @@ mod tests {
                 })
                 .expect("Failed to write value block");
 
-            // Update indexes
+            // Update indexes - strip timestamp before indexing (last 16 bytes)
+            let key_without_ts = &full_key[..full_key.len() - 16];
             key_index.inc_block_count(1);
-            key_index.insert_item(&full_key);
-            
+            key_index.insert_item(key_without_ts);
+
             val_index.inc_block_count(1);
-            val_index.insert_item(&full_key);
+            val_index.insert_item(key_without_ts);
         }
 
         let reader = SegmentReader::new(
             key_map,
             val_map,
-            Arc::new(parking_lot::Mutex::new(key_index)),
+            Arc::new(parking_lot::RwLock::new(key_index)),
         )
         .expect("Failed to create segment reader");
 
@@ -1092,11 +1381,18 @@ mod tests {
 
         let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
-        // Use a key range where lower > upper, making sure to include namespace prefix
-        let lower = &[0u8, 0, 0, 0, 0, 0, 0, 0, b'k', b'e', b'y', b'_', b'z'][..];
-        let upper = &[0u8, 0, 0, 0, 0, 0, 0, 0, b'k', b'e', b'y', b'_', b'a'][..];
+        // Use a key range where lower > upper
+        // Keys must be serialized format: [ns:8][user_key][timestamp:16], minimum 24
+        // bytes
+        let mut lower = vec![0u8; 8]; // namespace
+        lower.extend_from_slice(b"key_z"); // user key
+        lower.extend_from_slice(&[0u8; 16]); // timestamp (16 bytes)
 
-        let iter = reader.scan(Bound::Included(lower), Bound::Included(upper));
+        let mut upper = vec![0u8; 8]; // namespace
+        upper.extend_from_slice(b"key_a"); // user key
+        upper.extend_from_slice(&[0u8; 16]); // timestamp (16 bytes)
+
+        let iter = reader.scan(Bound::Included(&lower), Bound::Included(&upper));
 
         let results: Vec<_> = iter.collect();
         assert!(results.is_empty(), "Expected no results for empty range");
@@ -1226,13 +1522,17 @@ mod tests {
 
         // Check if it might be in the index (via reader)
         assert!(
-            !reader.key_index.lock().may_contain(non_existent_key),
+            !reader.key_index.write().may_contain(non_existent_key),
             "Bloom filter should not contain non-existent key"
         );
 
         // Try to find the block that would contain this key
         assert!(
-            reader.key_index.lock().get_block(non_existent_key).is_none(),
+            reader
+                .key_index
+                .write()
+                .get_block(non_existent_key)
+                .is_none(),
             "Should not find block for non-existent key"
         );
     }
@@ -1247,8 +1547,12 @@ mod tests {
         let (reader, _dir) = create_scan_test_segment(key_index, val_index);
 
         // Just verify basic properties of our test setup (key index is owned by reader)
-        assert!(reader.key_index.lock().block_count() > 0, "Expected blocks in key index");
-        // Note: We no longer have a val_index since value locations are stored in key metadata
+        assert!(
+            reader.key_index.write().block_count() > 0,
+            "Expected blocks in key index"
+        );
+        // Note: We no longer have a val_index since value locations are stored
+        // in key metadata
     }
 
     #[test]

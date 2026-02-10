@@ -26,6 +26,7 @@ use parking_lot::{
     Mutex,
 };
 use tracing::instrument;
+
 use crate::{
     block::{
         BLOCK_SIZE,
@@ -131,6 +132,43 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Build a block directly in mmap memory using BlockBuilder (zero-copy).
+    ///
+    /// The builder_fn receives a BLOCK_SIZE mutable slice and should use
+    /// BlockBuilder to write entries directly to mmap, avoiding
+    /// intermediate BytesMut copies.
+    pub(crate) fn write_block_direct<F>(&mut self, builder_fn: F) -> Result<(), SegmentError>
+    where
+        F: FnOnce(&mut [u8]), {
+        if self.closing.load(Relaxed) {
+            return Err(Closing);
+        }
+
+        let mut current_offset = self.current_offset.lock();
+        let required_size = *current_offset + BLOCK_SIZE;
+
+        // Grow map if needed
+        if required_size > self.map.len() {
+            let new_size = self.calculate_new_size(required_size);
+            if let Err(e) = self.map.grow(new_size) {
+                return Err(e);
+            }
+        }
+
+        let block_range = *current_offset..(*current_offset + BLOCK_SIZE);
+
+        // Write block directly to mmap using the builder function
+        if let Err(e) = self.map.write_to_range(block_range, builder_fn) {
+            return Err(e);
+        }
+
+        // Update offset and count
+        *current_offset += BLOCK_SIZE;
+        self.block_count.fetch_add(1, Relaxed);
+
+        Ok(())
+    }
+
     /// Write multiple blocks in a batch
     #[instrument(level = "trace")]
     pub(crate) fn write_blocks(&self, blocks: &[Block]) -> Result<(), SegmentError> {
@@ -200,7 +238,7 @@ impl SegmentWriter {
         let index_start = *current_offset;
         let index_end = *current_offset + index.size();
 
-        let index_bytes = Bytes::from(index.clone());
+        let index_bytes = Bytes::from(index);
         let index_size = index_bytes.len();
 
         if index_size == 0 || index_size < 56 {
@@ -352,12 +390,10 @@ mod tests {
 
         // Verify by reading the first few bytes of the map
         // The block structure starts with num_entries (u16)
-        let num_entries_bytes = &map[0..2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes[0], num_entries_bytes[1]]),
-            1,
-            "expected 1 entry in the block"
-        );
+        let num_entries = map
+            .read_range(0..2, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .expect("failed to read num_entries");
+        assert_eq!(num_entries, 1, "expected 1 entry in the block");
     }
 
     #[test]
@@ -398,12 +434,10 @@ mod tests {
         );
 
         // Verify the block was written by checking num_entries
-        let num_entries_bytes = &map[0..2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes[0], num_entries_bytes[1]]),
-            1,
-            "expected 1 entry in the block"
-        );
+        let num_entries = map
+            .read_range(0..2, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .expect("failed to read");
+        assert_eq!(num_entries, 1, "expected 1 entry in the block");
     }
 
     #[test]
@@ -489,9 +523,11 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         // Verify the correct number of entries
-        let num_entries_bytes = &map[0..2];
+        let num_entries = map
+            .read_range(0..2, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .expect("failed to read");
         assert_eq!(
-            u16::from_le_bytes([num_entries_bytes[0], num_entries_bytes[1]]),
+            num_entries,
             entries.len() as u16,
             "expected {} entries in the block",
             entries.len()
@@ -597,28 +633,26 @@ mod tests {
         );
 
         // Verify first block
-        let num_entries_bytes_1 = &map[0..2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_1[0], num_entries_bytes_1[1]]),
-            1,
-            "expected 1 entry in the first block"
-        );
+        let num_entries_1 = map
+            .read_range(0..2, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .expect("failed to read");
+        assert_eq!(num_entries_1, 1, "expected 1 entry in the first block");
 
         // Verify second block
-        let num_entries_bytes_2 = &map[BLOCK_SIZE..BLOCK_SIZE + 2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_2[0], num_entries_bytes_2[1]]),
-            1,
-            "expected 1 entry in the second block"
-        );
+        let num_entries_2 = map
+            .read_range(BLOCK_SIZE..BLOCK_SIZE + 2, |bytes| {
+                u16::from_le_bytes([bytes[0], bytes[1]])
+            })
+            .expect("failed to read");
+        assert_eq!(num_entries_2, 1, "expected 1 entry in the second block");
 
         // Verify third block
-        let num_entries_bytes_3 = &map[BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_3[0], num_entries_bytes_3[1]]),
-            1,
-            "expected 1 entry in the third block"
-        );
+        let num_entries_3 = map
+            .read_range(BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 2, |bytes| {
+                u16::from_le_bytes([bytes[0], bytes[1]])
+            })
+            .expect("failed to read");
+        assert_eq!(num_entries_3, 1, "expected 1 entry in the third block");
     }
 
     #[test]
@@ -707,25 +741,26 @@ mod tests {
             .expect("failed to write blocks");
 
         // Verify first block has 1 entry
-        let num_entries_bytes_1 = &map[0..2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_1[0], num_entries_bytes_1[1]]),
-            1
-        );
+        let num_entries_1 = map
+            .read_range(0..2, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .expect("failed to read");
+        assert_eq!(num_entries_1, 1);
 
         // Verify second block has 2 entries
-        let num_entries_bytes_2 = &map[BLOCK_SIZE..BLOCK_SIZE + 2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_2[0], num_entries_bytes_2[1]]),
-            2
-        );
+        let num_entries_2 = map
+            .read_range(BLOCK_SIZE..BLOCK_SIZE + 2, |bytes| {
+                u16::from_le_bytes([bytes[0], bytes[1]])
+            })
+            .expect("failed to read");
+        assert_eq!(num_entries_2, 2);
 
         // Verify third block has 1 entry
-        let num_entries_bytes_3 = &map[BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 2];
-        assert_eq!(
-            u16::from_le_bytes([num_entries_bytes_3[0], num_entries_bytes_3[1]]),
-            1
-        );
+        let num_entries_3 = map
+            .read_range(BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 2, |bytes| {
+                u16::from_le_bytes([bytes[0], bytes[1]])
+            })
+            .expect("failed to read");
+        assert_eq!(num_entries_3, 1);
     }
 
     #[test]
@@ -766,13 +801,12 @@ mod tests {
         // Verify all blocks were written in sequence
         for i in 0..4 {
             let offset = i * BLOCK_SIZE;
-            let num_entries_bytes = &map[offset..offset + 2];
-            assert_eq!(
-                u16::from_le_bytes([num_entries_bytes[0], num_entries_bytes[1]]),
-                1,
-                "Block {} should have 1 entry",
-                i
-            );
+            let num_entries = map
+                .read_range(offset..offset + 2, |bytes| {
+                    u16::from_le_bytes([bytes[0], bytes[1]])
+                })
+                .expect("failed to read");
+            assert_eq!(num_entries, 1, "Block {} should have 1 entry", i);
         }
     }
 }

@@ -4,13 +4,7 @@ use std::{
         File,
         OpenOptions,
     },
-    ops::{
-        Deref,
-        DerefMut,
-        Index,
-        IndexMut,
-        Range,
-    },
+    ops::Range,
     path::PathBuf,
     ptr,
     sync::{
@@ -28,11 +22,11 @@ use std::{
     },
 };
 
-use memmap2::{
-    Advice::WillNeed,
-    MmapMut,
+use memmap2::MmapMut;
+use parking_lot::{
+    Mutex,
+    RwLock,
 };
-use parking_lot::Mutex;
 
 use crate::errs::{
     SegmentError,
@@ -48,7 +42,8 @@ pub struct Map {
     file: Mutex<File>,
     current_offset: AtomicU64,
     current_size: AtomicU64,
-    resize_lock: Mutex<()>,
+    resize_lock: RwLock<()>,
+    read_only: bool,
 }
 
 impl Map {
@@ -86,7 +81,8 @@ impl Map {
             file: Mutex::new(file),
             current_offset: AtomicU64::new(0),
             current_size: AtomicU64::new(size_metadata),
-            resize_lock: Mutex::new(()),
+            resize_lock: RwLock::new(()),
+            read_only: false,
         })
     }
 
@@ -114,12 +110,52 @@ impl Map {
             file: Mutex::new(file),
             current_offset: AtomicU64::new(0),
             current_size: AtomicU64::new(size_metadata),
-            resize_lock: Mutex::new(()),
+            resize_lock: RwLock::new(()),
+            read_only: false,
+        })
+    }
+
+    pub fn open_read_only(path: PathBuf) -> Result<Self, SegmentError> {
+        // Note: We open with write permissions to allow mmap creation,
+        // but enforce read-only behavior at the API level
+        let file = match OpenOptions::new().read(true).write(true).open(path.clone()) {
+            | Ok(v) => v,
+            | Err(e) => return Err(IoError(e)),
+        };
+
+        let size_metadata = match file.metadata() {
+            | Ok(v) => v.len(),
+            | Err(e) => return Err(IoError(e)),
+        };
+
+        // SAFETY: none, this is an unsafe operation
+        let mmap = unsafe {
+            match MmapMut::map_mut(&file) {
+                | Ok(v) => v,
+                | Err(e) => return Err(IoError(e)),
+            }
+        };
+
+        Ok(Self {
+            inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
+            file: Mutex::new(file),
+            current_offset: AtomicU64::new(0),
+            current_size: AtomicU64::new(size_metadata),
+            resize_lock: RwLock::new(()),
+            read_only: true,
         })
     }
 
     pub fn grow(&self, new_size: u64) -> Result<(), SegmentError> {
-        let _guard = self.resize_lock.lock();
+        // Check if map is read-only
+        if self.read_only {
+            return Err(IoError(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot grow read-only map",
+            )));
+        }
+
+        let _guard = self.resize_lock.write();
 
         {
             let file = self.file.lock();
@@ -159,7 +195,7 @@ impl Map {
     }
 
     pub fn shrink(&self, new_size: u64) -> Result<(), SegmentError> {
-        let _guard = self.resize_lock.lock();
+        let _guard = self.resize_lock.write();
 
         {
             let file = self.file.lock();
@@ -204,15 +240,64 @@ impl Map {
         range: Range<usize>,
         writer: impl FnOnce(&mut [u8]),
     ) -> Result<(), SegmentError> {
+        // Check if map is read-only
+        if self.read_only {
+            return Err(IoError(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot write to read-only map",
+            )));
+        }
+
+        // Hold write lock for entire operation to prevent races with shrink/grow
+        let _guard = self.resize_lock.write();
+
         let len = self.len();
         let end = range.end;
 
-        // Grow the map if needed
+        // Grow the map if needed (inline to avoid lock recursion)
         if end > len {
-            match self.grow(end as u64) {
-                | Ok(_) => {},
-                | Err(e) => return Err(e),
+            tracing::debug!("Growing map from {} to {}", len, end);
+            let new_size = end as u64;
+
+            {
+                let file = self.file.lock();
+                match file.set_len(new_size) {
+                    | Ok(_) => {},
+                    | Err(e) => return Err(IoError(e)),
+                };
+
+                // CRITICAL: Sync metadata to ensure mmap sees the new size
+                match file.sync_all() {
+                    | Ok(_) => {},
+                    | Err(e) => return Err(IoError(e)),
+                };
+
+                let size_metadata = match file.metadata() {
+                    | Ok(v) => v.len(),
+                    | Err(e) => return Err(IoError(e)),
+                };
+
+                self.current_size.store(size_metadata, Release);
+            }
+
+            let new_mmap = {
+                let file = self.file.lock();
+
+                // SAFETY: none, this is an unsafe operation
+                SyncUnsafeCell::new(unsafe {
+                    match MmapMut::map_mut(&*file) {
+                        | Ok(v) => v,
+                        | Err(e) => return Err(IoError(e)),
+                    }
+                })
             };
+
+            // swap the pointers and remove the old one to prevent use after free
+            let old_ptr = self.inner.swap(Box::into_raw(Box::new(new_mmap)), AcqRel);
+            // SAFETY: this is just a swap
+            unsafe {
+                drop(Box::from_raw(old_ptr));
+            }
         }
 
         // now get the reference from the potentially new mapping
@@ -222,7 +307,21 @@ impl Map {
         unsafe {
             let mmap = &*ptr;
             let inner = &mut *mmap.get();
-            let slice = &mut inner[range];
+
+            // Defensive check: ensure the range is valid
+            if range.end > inner.len() {
+                return Err(IoError(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "write_to_range: range.end ({}) > map.len ({}) after potential grow to {}",
+                        range.end,
+                        inner.len(),
+                        end
+                    ),
+                )));
+            }
+
+            let slice = &mut inner[range.clone()];
             writer(slice);
         }
 
@@ -231,17 +330,22 @@ impl Map {
 
     #[inline]
     pub fn warn(&self, range: Range<usize>) {
+        let _guard = self.resize_lock.read(); // Hold read lock during access
         let ptr = self.inner.load(Acquire);
         // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer
         unsafe {
             let mmap = &*ptr;
             let inner = &*mmap.get();
-            inner.advise_range(WillNeed, range.start, range.end - range.start);
+            inner.advise_range(
+                memmap2::Advice::WillNeed,
+                range.start,
+                range.end - range.start,
+            );
         }
     }
 
     pub fn close(&self) -> Result<(), SegmentError> {
-        let _guard = self.resize_lock.lock();
+        let _guard = self.resize_lock.write();
 
         let ptr = self.inner.load(Acquire);
         // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer
@@ -268,73 +372,97 @@ impl Map {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
 
-impl Index<Range<usize>> for Map {
-    type Output = [u8];
-
-    fn index(&self, index: Range<usize>) -> &Self::Output {
+    /// Safely read from a range by holding a read lock and executing a closure
+    ///
+    /// This is the safe replacement for the Index trait - it holds the read
+    /// lock for the duration of the closure, preventing concurrent
+    /// resize/unmap.
+    pub fn read_range<F, R>(&self, range: Range<usize>, f: F) -> Result<R, SegmentError>
+    where
+        F: FnOnce(&[u8]) -> R, {
+        // Hold read lock for entire duration including closure execution
+        // The guard MUST NOT be dropped until after the closure completes
+        let _guard = self.resize_lock.read();
         let ptr = self.inner.load(Acquire);
-        // SAFETY: none, this is an unsafe operation as we are dereferencing a pointer
-        unsafe {
+
+        // Execute everything in one expression to ensure guard lifetime
+        // SAFETY: ptr is valid while guard is held, preventing resize/deallocation
+        let result = unsafe {
             let mmap = &*ptr;
             let inner = &*mmap.get();
-            &inner[index]
-        }
-    }
-}
 
-impl IndexMut<Range<usize>> for Map {
-    fn index_mut(&mut self, index: Range<usize>) -> &mut Self::Output {
-        // First check if we need to grow
-        {
-            let ptr = self.inner.load(Acquire);
-            let len = self.len();
-            if index.end > len {
-                match self.grow(index.end as u64) {
-                    | Ok(_) => {},
-                    // TODO(@siennathesane): handle this error *somehow*
-                    | Err(e) => panic!("failed to grow map: {:?}", e),
-                };
+            // Bounds check
+            if range.end > inner.len() {
+                return Err(IoError(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "read_range: range.end ({}) > map.len ({})",
+                        range.end,
+                        inner.len()
+                    ),
+                )));
+            }
+
+            // Execute closure while holding guard
+            f(&inner[range])
+        };
+
+        // Guard is explicitly kept alive until here
+        drop(_guard);
+        Ok(result)
+    }
+
+    /// Hint to kernel that we'll need this range soon (prefetch)
+    pub fn advise_willneed(&self) -> Result<(), SegmentError> {
+        let _guard = self.resize_lock.read();
+        let ptr = self.inner.load(Acquire);
+
+        // SAFETY: ptr is valid for the lifetime of the guard
+        unsafe {
+            let inner = &*(*ptr).get();
+            if let Err(e) = inner.advise(memmap2::Advice::WillNeed).map_err(IoError) {
+                return Err(e);
             }
         }
+        Ok(())
+    }
 
-        // Now get the reference from the potentially new mapping
+    /// Hint to kernel that we'll read sequentially (aggressive readahead)
+    pub fn advise_sequential(&self) -> Result<(), SegmentError> {
+        let _guard = self.resize_lock.read();
         let ptr = self.inner.load(Acquire);
-        // SAFETY: none, we are mutably dereferencing a pointer
+
+        // SAFETY: ptr is valid for the lifetime of the guard
         unsafe {
-            let mmap = &*ptr;
-            let inner = &mut *mmap.get();
-            &mut inner[index]
+            let inner = &*(*ptr).get();
+            if let Err(e) = inner.advise(memmap2::Advice::Sequential).map_err(IoError) {
+                return Err(e);
+            }
         }
+        Ok(())
+    }
+
+    /// Hint to kernel that access is random (disable readahead)
+    pub fn advise_random(&self) -> Result<(), SegmentError> {
+        let _guard = self.resize_lock.read();
+        let ptr = self.inner.load(Acquire);
+
+        // SAFETY: ptr is valid for the lifetime of the guard
+        unsafe {
+            let inner = &*(*ptr).get();
+            if let Err(e) = inner.advise(memmap2::Advice::Random).map_err(IoError) {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }
 
-impl Deref for Map {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        let ptr = self.inner.load(Acquire);
-        // SAFETY: none, we are dereferencing a pointer
-        unsafe {
-            let mmap = &*ptr;
-            let inner = &*mmap.get();
-            inner
-        }
-    }
-}
-
-impl DerefMut for Map {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        let ptr = self.inner.load(Acquire);
-        // SAFETY: none, we are mutably dereferencing a pointer
-        unsafe {
-            let mmap = &mut *ptr;
-            let inner = &mut *mmap.get();
-            inner
-        }
-    }
-}
+// REMOVED: IndexMut, Deref, DerefMut impls
+// These are fundamentally unsafe for concurrent access because they return
+// references without holding locks. Use read_range() and write_to_range()
+// instead.
 
 impl Drop for Map {
     fn drop(&mut self) {
@@ -393,107 +521,113 @@ mod tests {
     }
 
     #[test]
-    fn test_index_range() {
+    fn test_read_range() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_index.segment");
+        let file_path = dir.path().join("test_read.segment");
 
         let initial_size = 1024;
         let map = Map::new(file_path, initial_size).unwrap();
 
-        // Get a range from the map
-        let range = 0..10;
-        let slice = &map[range.clone()];
+        // Read a range from the map using the new safe API
+        let result = map
+            .read_range(0..10, |slice| {
+                assert_eq!(slice.len(), 10);
+                // New mmap should be zeroed
+                assert_eq!(slice, &[0u8; 10]);
+                slice.to_vec()
+            })
+            .unwrap();
 
-        assert_eq!(slice.len(), 10);
-        // New mmap should be zeroed
-        assert_eq!(slice, &[0u8; 10]);
+        assert_eq!(result.len(), 10);
     }
 
     #[test]
-    fn test_index_mut_range() {
+    fn test_write_to_range() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_index_mut.segment");
+        let file_path = dir.path().join("test_write.segment");
 
         let initial_size = 1024;
-        let mut map = Map::new(file_path, initial_size).unwrap();
+        let map = Map::new(file_path, initial_size).unwrap();
 
-        // Modify a range in the map
-        let range = 0..10;
-        let slice = &mut map[range.clone()];
-
-        for i in 0..10 {
-            slice[i] = i as u8;
-        }
+        // Write to a range in the map using the new safe API
+        let data: Vec<u8> = (0..10).map(|i| i as u8).collect();
+        map.write_to_range(0..10, |slice| {
+            slice.copy_from_slice(&data);
+        })
+        .unwrap();
 
         // Check that the changes persisted
-        let check_slice = &map[range];
+        let result = map.read_range(0..10, |slice| slice.to_vec()).unwrap();
+
         for i in 0..10 {
-            assert_eq!(check_slice[i], i as u8);
+            assert_eq!(result[i], i as u8);
         }
     }
 
     #[test]
-    fn test_index_mut_grow() {
+    fn test_write_grow() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_index_mut_grow.segment");
+        let file_path = dir.path().join("test_write_grow.segment");
 
         let initial_size = 100;
-        let mut map = Map::new(file_path, initial_size).unwrap();
+        let map = Map::new(file_path, initial_size).unwrap();
 
         assert_eq!(map.len(), initial_size as usize);
 
-        // Access beyond the current size to trigger grow
-        let range = 100..200;
-        let slice = &mut map[range.clone()];
-
-        for i in 0..100 {
-            slice[i] = (i + 100) as u8;
-        }
+        // Write beyond the current size to trigger grow
+        let data: Vec<u8> = (100..200).map(|i| i as u8).collect();
+        map.write_to_range(100..200, |slice| {
+            slice.copy_from_slice(&data);
+        })
+        .unwrap();
 
         assert!(map.len() >= 200);
 
         // Check that the changes persisted
-        let check_slice = &map[range];
+        let result = map.read_range(100..200, |slice| slice.to_vec()).unwrap();
+
         for i in 0..100 {
-            assert_eq!(check_slice[i], (i + 100) as u8);
+            assert_eq!(result[i], (i + 100) as u8);
         }
     }
 
     #[test]
-    fn test_deref() {
+    fn test_read_full() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_deref.segment");
+        let file_path = dir.path().join("test_read_full.segment");
 
         let initial_size = 10;
         let map = Map::new(file_path, initial_size).unwrap();
 
-        // Use deref to access the entire map as a slice
-        let slice: &[u8] = &map;
+        // Read the entire map using the new safe API
+        let all_zeros = map
+            .read_range(0..initial_size as usize, |slice| {
+                slice.iter().all(|&b| b == 0)
+            })
+            .unwrap();
 
-        assert_eq!(slice.len(), initial_size as usize);
-        // New mmap should be zeroed
-        assert!(slice.iter().all(|&b| b == 0));
+        assert!(all_zeros);
     }
 
     #[test]
-    fn test_deref_mut() {
+    fn test_write_full() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_deref_mut.segment");
+        let file_path = dir.path().join("test_write_full.segment");
 
         let initial_size = 10;
-        let mut map = Map::new(file_path, initial_size).unwrap();
+        let map = Map::new(file_path, initial_size).unwrap();
 
-        // Use deref_mut to access the entire map as a mutable slice
-        let slice: &mut [u8] = &mut map;
+        // Write pattern to the entire map using the new safe API
+        let data: Vec<u8> = (0..initial_size as usize).map(|i| (i * 2) as u8).collect();
+        map.write_to_range(0..initial_size as usize, |slice| {
+            slice.copy_from_slice(&data);
+        })
+        .unwrap();
 
-        // Fill with a pattern
-        for i in 0..slice.len() {
-            slice[i] = (i * 2) as u8;
-        }
-
-        // Check that the changes persisted via a different access method
+        // Check that the changes persisted
         for i in 0..initial_size as usize {
-            assert_eq!(map[i..i + 1][0], (i * 2) as u8);
+            let byte = map.read_range(i..i + 1, |slice| slice[0]).unwrap();
+            assert_eq!(byte, (i * 2) as u8);
         }
     }
 
@@ -512,14 +646,14 @@ mod tests {
 
         let mut handles = vec![];
 
-        // Spawn multiple threads to read from the map concurrently
+        // Spawn multiple threads to read from the map concurrently using the safe API
         for i in 0..4 {
             let map_clone = Arc::clone(&map);
             let handle = thread::spawn(move || {
                 let offset = i * 10;
                 let range = offset..offset + 10;
-                let slice = &map_clone[range];
-                assert_eq!(slice.len(), 10);
+                let len = map_clone.read_range(range, |slice| slice.len()).unwrap();
+                assert_eq!(len, 10);
             });
             handles.push(handle);
         }
@@ -550,64 +684,66 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_persistence.segment");
 
-        // First, create and modify the map
+        // First, create and modify the map using the safe API
         {
-            let mut map = Map::new(file_path.clone(), 100).unwrap();
-            let slice = &mut map[0..10];
-            for i in 0..10 {
-                slice[i] = (i + 1) as u8;
-            }
+            let map = Map::new(file_path.clone(), 100).unwrap();
+            let data: Vec<u8> = (1..11).map(|i| i as u8).collect();
+            map.write_to_range(0..10, |slice| {
+                slice.copy_from_slice(&data);
+            })
+            .unwrap();
             // map will be dropped here, which should flush changes
         }
 
         // Now open the same file again and verify data persisted
         {
             let map = Map::new(file_path, 100).unwrap();
-            let slice = &map[0..10];
+            let result = map.read_range(0..10, |slice| slice.to_vec()).unwrap();
+
             for i in 0..10 {
-                assert_eq!(slice[i], (i + 1) as u8);
+                assert_eq!(result[i], (i + 1) as u8);
             }
         }
     }
 
     #[test]
-    #[should_panic(expected = "Permission denied")]
-    fn test_index_mut_grow_error() {
+    fn test_read_only_map() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test_grow_error.segment");
+        let file_path = dir.path().join("test_readonly.segment");
 
-        // Create a read-only directory to force a permission error on grow
-        let readonly_dir = dir.path().join("readonly");
-        std::fs::create_dir(&readonly_dir).unwrap();
-
-        #[cfg(unix)]
+        // First, create and write some data to the file
         {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(&readonly_dir).unwrap();
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o555); // read and execute only
-            std::fs::set_permissions(&readonly_dir, perms).unwrap();
+            let map = Map::new(file_path.clone(), 100).unwrap();
+            let data: Vec<u8> = (1..11).map(|i| i as u8).collect();
+            map.write_to_range(0..10, |slice| {
+                slice.copy_from_slice(&data);
+            })
+            .unwrap();
         }
 
-        let ro_file_path = readonly_dir.join("readonly.segment");
+        // Now open it in read-only mode
+        let readonly_map = Map::open_read_only(file_path).unwrap();
 
-        // Create the file first since we can't create it in read-only dir
-        {
-            File::create(&ro_file_path).unwrap();
+        // Reading should work
+        let result = readonly_map
+            .read_range(0..10, |slice| slice.to_vec())
+            .unwrap();
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let metadata = std::fs::metadata(&ro_file_path).unwrap();
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o444); // read only
-                std::fs::set_permissions(&ro_file_path, perms).unwrap();
-            }
+        for i in 0..10 {
+            assert_eq!(result[i], (i + 1) as u8);
         }
 
-        let mut map = Map::new(ro_file_path, 10).unwrap();
+        // Writing should fail
+        let data = vec![99u8; 10];
+        let write_result = readonly_map.write_to_range(0..10, |slice| {
+            slice.copy_from_slice(&data);
+        });
 
-        // This should panic due to permission error when trying to grow
-        let _slice = &mut map[10..20];
+        assert!(write_result.is_err());
+        if let Err(IoError(e)) = write_result {
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        } else {
+            panic!("Expected PermissionDenied error");
+        }
     }
 }

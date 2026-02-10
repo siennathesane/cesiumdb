@@ -3,10 +3,17 @@
 //! This module provides a registry to track which segments are live
 //! and coordinate safe deletion after compaction.
 
-use crate::segment::Segment;
+use std::{
+    collections::{
+        HashMap,
+        HashSet,
+    },
+    sync::Arc,
+};
+
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+
+use crate::segment::Segment;
 
 /// Registry for tracking live segments
 ///
@@ -18,7 +25,7 @@ pub struct SegmentRegistry {
     /// Currently live segment IDs (in the current version)
     live_segments: RwLock<HashSet<u64>>,
 
-    /// Segment ID -> Arc<Segment> mapping
+    /// Segment ID -> `Arc<Segment>` mapping
     ///
     /// Keeps segments alive while they're registered.
     /// When a segment is removed from here and no compaction jobs
@@ -93,29 +100,33 @@ impl SegmentRegistry {
     /// 1. It's marked for deletion
     /// 2. There's only 1 Arc reference (the one in the registry)
     ///
+    /// Safety: Holds `segments` write lock during both the reference count
+    /// check and removal. This prevents `get()` from cloning an Arc between
+    /// the check and the removal (TOCTOU race that previously caused SIGBUS).
+    ///
     /// Returns the number of segments actually deleted.
     pub fn cleanup(&self) -> usize {
         let mut pending = self.pending_deletion.write();
         let mut segments = self.segments.write();
 
-        let mut deleted = Vec::new();
+        // While we hold segments.write(), no get() can clone Arcs
+        let to_delete: Vec<u64> = pending
+            .iter()
+            .filter(|id| {
+                segments
+                    .get(id)
+                    .map(|seg| Arc::strong_count(seg) == 1)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
 
-        for &segment_id in pending.iter() {
-            if let Some(segment) = segments.get(&segment_id) {
-                // Check if we hold the only reference
-                if Arc::strong_count(segment) == 1 {
-                    deleted.push(segment_id);
-                }
-            }
-        }
-
-        // Remove deleted segments
-        for id in &deleted {
+        for id in &to_delete {
             pending.remove(id);
-            segments.remove(id);
+            segments.remove(id); // Arc drops, mmap unmaps safely
         }
 
-        deleted.len()
+        to_delete.len()
     }
 
     /// Forces removal of a segment from the registry
@@ -181,17 +192,18 @@ impl std::fmt::Display for RegistryStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::segment::Segment;
-    use crate::segment_builder::SegmentBuilder;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        segment::Segment,
+        segment_builder::SegmentBuilder,
+    };
 
     fn create_test_segment(id: u64) -> Arc<Segment> {
         let temp_dir = TempDir::new().unwrap();
         let builder = SegmentBuilder::new(temp_dir.path().to_path_buf()).unwrap();
-        builder
-            .new_segment(id, 12345, 64 * 1024 * 1024)
-            .unwrap()
+        builder.new_segment(id, 12345, 64 * 1024 * 1024).unwrap()
     }
 
     #[test]
@@ -342,5 +354,110 @@ mod tests {
         }
 
         assert_eq!(registry.live_count(), 10);
+    }
+
+    #[test]
+    fn test_cleanup_concurrent_readers() {
+        use std::{
+            sync::atomic::{
+                AtomicBool,
+                Ordering,
+            },
+            thread,
+        };
+
+        let registry = Arc::new(SegmentRegistry::new());
+
+        // Register segments and mark them for deletion
+        for i in 0..10 {
+            let segment = create_test_segment(i);
+            registry.register(segment);
+            registry.mark_for_deletion(i);
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Spawn 10 reader threads calling get() concurrently
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let reg = registry.clone();
+            let done = done.clone();
+            handles.push(thread::spawn(move || {
+                let mut reads = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    for id in 0..10 {
+                        // get() clones the Arc — this is the operation that
+                        // previously raced with cleanup
+                        let _ = reg.get(id);
+                        reads += 1;
+                    }
+                }
+                reads
+            }));
+        }
+
+        // Cleanup thread runs concurrently with readers
+        let cleanup_reg = registry.clone();
+        let cleanup_handle = thread::spawn(move || {
+            let mut total_deleted = 0;
+            for _ in 0..1000 {
+                total_deleted += cleanup_reg.cleanup();
+            }
+            total_deleted
+        });
+
+        let total_deleted = cleanup_handle.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+
+        let total_reads: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+        // All 10 segments should eventually be cleaned up
+        assert_eq!(total_deleted, 10);
+        assert_eq!(registry.pending_deletion_count(), 0);
+        assert!(total_reads > 0, "readers should have completed some reads");
+    }
+
+    #[test]
+    fn test_cleanup_idempotent() {
+        let registry = SegmentRegistry::new();
+        let segment = create_test_segment(1);
+
+        registry.register(segment);
+        registry.mark_for_deletion(1);
+
+        let deleted = registry.cleanup();
+        assert_eq!(deleted, 1);
+
+        // Second cleanup should find nothing to delete
+        let deleted = registry.cleanup();
+        assert_eq!(deleted, 0);
+        assert_eq!(registry.pending_deletion_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_with_active_reader() {
+        let registry = SegmentRegistry::new();
+        let segment = create_test_segment(1);
+
+        registry.register(segment);
+
+        // Simulate a reader holding an Arc via get()
+        let reader_ref = registry.get(1).unwrap();
+        assert_eq!(Arc::strong_count(&reader_ref), 2); // registry + reader
+
+        registry.mark_for_deletion(1);
+
+        // Cleanup should skip because reader holds a reference
+        let deleted = registry.cleanup();
+        assert_eq!(deleted, 0);
+        assert_eq!(registry.pending_deletion_count(), 1);
+
+        // Drop the reader reference
+        drop(reader_ref);
+
+        // Now cleanup should succeed
+        let deleted = registry.cleanup();
+        assert_eq!(deleted, 1);
+        assert_eq!(registry.pending_deletion_count(), 0);
     }
 }

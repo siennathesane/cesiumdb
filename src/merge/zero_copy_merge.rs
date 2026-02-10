@@ -3,11 +3,20 @@
 //! This module provides a high-performance merge iterator that combines
 //! multiple sorted iterators without copying data unnecessarily.
 
-use crate::keypair::{KeyBytes, ValueBytes};
-use crate::simd::simd_compare_keys;
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+};
+
 use bytes::Bytes;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+
+use crate::{
+    keypair::{
+        KeyBytes,
+        ValueBytes,
+    },
+    simd::simd_compare_keys,
+};
 
 /// Entry from a merge source
 #[derive(Clone)]
@@ -45,11 +54,10 @@ impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap behavior
         // Use SIMD-optimized comparison for better performance
-        other.entry.key.simd_cmp(&self.entry.key)
-            .then_with(|| {
-                // For equal keys, prefer newer (higher source index = newer level)
-                other.entry.source_index.cmp(&self.entry.source_index)
-            })
+        other.entry.key.simd_cmp(&self.entry.key).then_with(|| {
+            // For equal keys, prefer newer (higher source index = newer level)
+            other.entry.source_index.cmp(&self.entry.source_index)
+        })
     }
 }
 
@@ -72,8 +80,8 @@ pub enum MergeError {
 impl std::fmt::Display for MergeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MergeError::SourceError(msg) => write!(f, "Source error: {}", msg),
-            MergeError::CorruptData(msg) => write!(f, "Corrupt data: {}", msg),
+            | MergeError::SourceError(msg) => write!(f, "Source error: {}", msg),
+            | MergeError::CorruptData(msg) => write!(f, "Corrupt data: {}", msg),
         }
     }
 }
@@ -89,8 +97,7 @@ impl std::error::Error for MergeError {}
 /// - Zero-copy references to underlying data
 pub struct ZeroCopyMergeIterator<I>
 where
-    I: Iterator<Item = Result<(KeyBytes, ValueBytes), MergeError>>,
-{
+    I: Iterator<Item = Result<(KeyBytes, ValueBytes), MergeError>>, {
     /// Min-heap of current entries from each source
     heap: BinaryHeap<HeapEntry>,
 
@@ -135,7 +142,10 @@ where
     fn init(&mut self) -> Result<(), MergeError> {
         for (idx, source) in self.sources.iter_mut().enumerate() {
             if let Some(result) = source.next() {
-                let (key, value) = result?;
+                let (key, value) = match result {
+                    | Ok(v) => v,
+                    | Err(e) => return Err(e),
+                };
                 self.heap.push(HeapEntry {
                     entry: MergeEntry {
                         key,
@@ -174,14 +184,17 @@ where
 
         loop {
             // Pop the smallest key
-            let heap_entry = self.heap.pop()?;
+            let heap_entry = match self.heap.pop() {
+                | Some(e) => e,
+                | None => return None,
+            };
             let entry = heap_entry.entry;
 
             // Advance the source that provided this entry
             let source_idx = entry.source_index;
             if let Some(result) = self.sources[source_idx].next() {
                 match result {
-                    Ok((key, value)) => {
+                    | Ok((key, value)) => {
                         self.heap.push(HeapEntry {
                             entry: MergeEntry {
                                 key,
@@ -189,8 +202,8 @@ where
                                 source_index: source_idx,
                             },
                         });
-                    }
-                    Err(e) => return Some(Err(e)),
+                    },
+                    | Err(e) => return Some(Err(e)),
                 }
             }
 
@@ -198,8 +211,8 @@ where
             // Compare just (ns, key), not the full KeyBytes including timestamp
             let mut duplicates = 0;
             while let Some(next_entry) = self.heap.peek() {
-                let same_logical_key = entry.key.ns() == next_entry.entry.key.ns()
-                    && entry.key.key() == next_entry.entry.key.key();
+                let same_logical_key = entry.key.ns() == next_entry.entry.key.ns() &&
+                    entry.key.key() == next_entry.entry.key.key();
 
                 if same_logical_key {
                     // Same logical key (ignoring timestamp), skip it
@@ -210,7 +223,7 @@ where
                     let dup_source_idx = dup.entry.source_index;
                     if let Some(result) = self.sources[dup_source_idx].next() {
                         match result {
-                            Ok((key, value)) => {
+                            | Ok((key, value)) => {
                                 self.heap.push(HeapEntry {
                                     entry: MergeEntry {
                                         key,
@@ -218,8 +231,8 @@ where
                                         source_index: dup_source_idx,
                                     },
                                 });
-                            }
-                            Err(e) => return Some(Err(e)),
+                            },
+                            | Err(e) => return Some(Err(e)),
                         }
                     }
                 } else {
@@ -266,8 +279,9 @@ impl std::fmt::Display for MergeStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::Bytes;
+
+    use super::*;
 
     fn make_key(ns: u64, key: &[u8], ts: u128) -> KeyBytes {
         KeyBytes::new(ns, Bytes::copy_from_slice(key), ts)
@@ -293,10 +307,7 @@ mod tests {
             Ok((make_key(0, b"d", 100), make_value(0, b"v4"))),
         ];
 
-        let mut merger = ZeroCopyMergeIterator::new(vec![
-            source1.into_iter(),
-            source2.into_iter(),
-        ]);
+        let mut merger = ZeroCopyMergeIterator::new(vec![source1.into_iter(), source2.into_iter()]);
 
         let results: Vec<_> = merger.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
 
@@ -325,10 +336,7 @@ mod tests {
             Ok((make_key(0, b"c", 200), make_value(0, b"new"))),
         ];
 
-        let mut merger = ZeroCopyMergeIterator::new(vec![
-            source1.into_iter(),
-            source2.into_iter(),
-        ]);
+        let mut merger = ZeroCopyMergeIterator::new(vec![source1.into_iter(), source2.into_iter()]);
 
         let results: Vec<_> = merger.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
 
@@ -375,8 +383,7 @@ mod tests {
             Ok((make_key(0, b"c", 100), make_value(0, b"v3"))),
         ];
 
-        let mut merger = ZeroCopyMergeIterator::new(vec![source1.into_iter()])
-            .with_tombstones();
+        let mut merger = ZeroCopyMergeIterator::new(vec![source1.into_iter()]).with_tombstones();
 
         let results: Vec<_> = merger.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
 
@@ -394,10 +401,7 @@ mod tests {
         let source1: Vec<Result<(KeyBytes, ValueBytes), MergeError>> = vec![];
         let source2: Vec<Result<(KeyBytes, ValueBytes), MergeError>> = vec![];
 
-        let merger = ZeroCopyMergeIterator::new(vec![
-            source1.into_iter(),
-            source2.into_iter(),
-        ]);
+        let merger = ZeroCopyMergeIterator::new(vec![source1.into_iter(), source2.into_iter()]);
 
         let results: Vec<_> = merger.collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(results.len(), 0);
@@ -409,8 +413,14 @@ mod tests {
 
         for i in 0..10 {
             let source = vec![
-                Ok((make_key(0, format!("key{:02}", i * 2).as_bytes(), 100), make_value(0, b"value"))),
-                Ok((make_key(0, format!("key{:02}", i * 2 + 1).as_bytes(), 100), make_value(0, b"value"))),
+                Ok((
+                    make_key(0, format!("key{:02}", i * 2).as_bytes(), 100),
+                    make_value(0, b"value"),
+                )),
+                Ok((
+                    make_key(0, format!("key{:02}", i * 2 + 1).as_bytes(), 100),
+                    make_value(0, b"value"),
+                )),
             ];
             sources.push(source.into_iter());
         }

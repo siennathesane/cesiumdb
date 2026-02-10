@@ -5,7 +5,14 @@
 //! - Zero-copy merge iterator (optimized for compaction)
 
 pub mod basic;
+pub(crate) mod raw_merge;
 pub mod zero_copy_merge;
 
 pub use basic::MergeIterator;
-pub use zero_copy_merge::{ZeroCopyMergeIterator, MergeError, MergeStats, MergeSource};
+pub(crate) use raw_merge::RawMergeIterator;
+pub use zero_copy_merge::{
+    MergeError,
+    MergeSource,
+    MergeStats,
+    ZeroCopyMergeIterator,
+};
