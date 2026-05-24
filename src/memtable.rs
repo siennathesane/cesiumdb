@@ -159,13 +159,13 @@ impl Memtable {
     // TODO(@siennathesane): update this with the cuckoo filter and latest cache
     #[instrument(level = "debug")]
     #[inline]
-    pub fn get(&self, key: KeyBytes) -> Option<ValueBytes> {
+    pub fn get(&self, key: &KeyBytes) -> Option<ValueBytes> {
         let _key_ptr = key.serialize_for_latest();
         match self.map.get(&_key_ptr) {
             | None => None,
             | Some(_key) => self
                 .map
-                .get(&_key.value().clone())
+                .get(_key.value())
                 .map(|val| ValueBytes::deserialize(val.value().clone())),
         }
     }
@@ -198,10 +198,12 @@ impl Memtable {
         }
 
         let mut written = 0;
+        let max_entries = self.max_entries.load(Relaxed);
+        let max_size = self.max_size.load(Relaxed);
         for (key, val) in data.iter() {
             // Check entry count FIRST to prevent SkipMap depth degradation
             let current_entries = self.entry_count.load(Relaxed);
-            if current_entries >= self.max_entries.load(Relaxed) {
+            if current_entries >= max_entries {
                 // Memtable is at optimal depth threshold - force swap
                 if written == 0 {
                     return Err(DataExceedsMaximum);
@@ -219,7 +221,7 @@ impl Memtable {
             let payload_size = ((_key.len() * 3) + _val.len() + size_of::<u128>()) as u64;
 
             // Also check size limit (backup safety check)
-            if payload_size + self.size.load(Relaxed) > self.max_size.load(Relaxed) {
+            if payload_size + self.size.load(Relaxed) > max_size {
                 // Return how many we wrote successfully
                 if written == 0 {
                     return Err(DataExceedsMaximum);
@@ -233,15 +235,15 @@ impl Memtable {
             self.total_bytes_written.fetch_add(payload_size, Relaxed);
             self.entry_count.fetch_add(1, Relaxed);
 
-            // Dynamic adjustment: recalculate max_entries every 1000 entries
+            // Dynamic adjustment: recalculate max_entries every 8192 entries
             // based on actual observed average entry size
-            if current_entries > 0 && current_entries % 1000 == 0 {
+            if current_entries > 0 && current_entries % 8192 == 0 {
                 let total_bytes = self.total_bytes_written.load(Relaxed);
                 let avg_entry_size = total_bytes / current_entries;
 
                 // Recalculate: 50% of max_size divided by actual average entry size
                 let new_max_entries =
-                    ((self.max_size.load(Relaxed) as f64 * 0.5) / avg_entry_size as f64) as u64;
+                    ((max_size as f64 * 0.5) / avg_entry_size as f64) as u64;
                 self.max_entries.store(new_max_entries, Relaxed);
             }
 
@@ -285,7 +287,7 @@ impl Memtable {
     }
 
     pub fn contains(&self, key: &KeyBytes) -> bool {
-        self.get(key.clone()).is_some()
+        self.get(&key).is_some()
     }
 }
 
@@ -406,7 +408,7 @@ mod tests {
                 .is_ok()
         );
 
-        let val = memtable.get(original_key.clone());
+        let val = memtable.get(&original_key);
         assert!(val.is_some());
         assert_eq!(original_val, val.unwrap());
     }
@@ -437,7 +439,7 @@ mod tests {
         // let items = iter.collect::<Vec<_>>();
         // assert_eq!(items.len(), VERSIONS);
 
-        let val = memtable.get(KeyBytes::new(ns, key.clone(), 0));
+        let val = memtable.get(&KeyBytes::new(ns, key.clone(), 0));
         assert!(val.is_some());
 
         // the value we found in the memtable
@@ -493,7 +495,7 @@ mod tests {
         let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
         let key = KeyBytes::new(DEFAULT_NS, Bytes::from("nonexistent"), 0);
 
-        let result = memtable.get(key);
+        let result = memtable.get(&key);
         assert!(
             result.is_none(),
             "get on nonexistent key should return None"
@@ -599,7 +601,7 @@ mod tests {
         // retrieve all of them
         for i in 0..100 {
             let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), 0);
-            let result = memtable.get(key);
+            let result = memtable.get(&key);
             assert!(result.is_some(), "all inserted keys should be retrievable");
         }
     }
@@ -631,7 +633,7 @@ mod tests {
         assert!(memtable.put_batch(&batch).is_ok());
 
         // get should return the latest version
-        let result = memtable.get(KeyBytes::new(DEFAULT_NS, key_name, 0));
+        let result = memtable.get(&KeyBytes::new(DEFAULT_NS, key_name, 0));
         assert!(result.is_some(), "versioned key should be retrievable");
     }
 
@@ -666,7 +668,7 @@ mod tests {
         // verify all namespaces are retrievable
         for ns in 0..5 {
             let key = KeyBytes::new(ns, key_name.clone(), 0);
-            let result = memtable.get(key);
+            let result = memtable.get(&key);
             assert!(
                 result.is_some(),
                 "key in namespace {} should be retrievable",
@@ -725,7 +727,7 @@ mod tests {
         }
 
         // get should still work efficiently
-        let result = memtable.get(KeyBytes::new(DEFAULT_NS, key_name, 0));
+        let result = memtable.get(&KeyBytes::new(DEFAULT_NS, key_name, 0));
         assert!(
             result.is_some(),
             "should retrieve latest version efficiently"

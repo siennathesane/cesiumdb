@@ -15,6 +15,11 @@ use std::{
     time::Duration,
 };
 
+use crossbeam_channel::{
+    bounded,
+    Receiver,
+    Sender,
+};
 use parking_lot::{
     Mutex,
     RwLock,
@@ -22,7 +27,11 @@ use parking_lot::{
 
 use crate::{
     compact::flush_memtable,
-    compaction::CompactionManager,
+    compaction::{
+        CompactionManager,
+        SchedulerConfig,
+        SegmentRegistry,
+    },
     levels::KeyRange,
     manifest_reader::ManifestReader,
     manifest_writer::ManifestWriter,
@@ -37,19 +46,23 @@ use crate::{
 };
 
 pub const DEFAULT_BLOCK_SIZE: u64 = 4096;
-pub const DEFAULT_TARGET_SST_SIZE: u64 = 4096;
+pub const DEFAULT_TARGET_SEGMENT_SIZE: u64 = 4096;
 pub const DEFAULT_NUM_MEMTABLES: u64 = 4;
 
 /// The default set of database options.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DbStorageBuilder {
     /// The size of a given disk block. It's recommended to leave the default
     /// for NVMe drives.
     pub block_size: u64,
     /// The target size of the disk files. This is a soft limit.
-    pub target_sst_size: u64,
+    pub target_segment_size: u64,
     /// The amount of tables to hold in-memory before flushing to disk.
     pub num_memtable_limit: u64,
+    /// The maximum size of a memtable in bytes before it is frozen.
+    pub memtable_size: u64,
+    /// Compaction scheduler configuration.
+    pub scheduler_config: SchedulerConfig,
     /// Base path for database storage
     pub base_path: Option<PathBuf>,
 }
@@ -59,8 +72,10 @@ impl DbStorageBuilder {
     pub fn new() -> Self {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
-            target_sst_size: DEFAULT_TARGET_SST_SIZE,
+            target_segment_size: DEFAULT_TARGET_SEGMENT_SIZE,
             num_memtable_limit: DEFAULT_NUM_MEMTABLES,
+            memtable_size: DEFAULT_MEMTABLE_SIZE_IN_BYTES,
+            scheduler_config: SchedulerConfig::default(),
             base_path: None,
         }
     }
@@ -72,14 +87,24 @@ impl DbStorageBuilder {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-    pub fn target_sst_size(mut self, target_sst_size: u64) -> Self {
-        self.target_sst_size = target_sst_size;
+    pub fn target_segment_size(mut self, target_segment_size: u64) -> Self {
+        self.target_segment_size = target_segment_size;
         self
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn num_memtable_limit(mut self, num_memtable_limit: u64) -> Self {
         self.num_memtable_limit = num_memtable_limit;
+        self
+    }
+
+    pub fn memtable_size(mut self, memtable_size: u64) -> Self {
+        self.memtable_size = memtable_size;
+        self
+    }
+
+    pub fn scheduler_config(mut self, config: SchedulerConfig) -> Self {
+        self.scheduler_config = config;
         self
     }
 
@@ -104,7 +129,7 @@ impl Default for DbStorageBuilder {
 /// Default number of LSM-tree levels (L1-L7)
 pub const DEFAULT_NUM_LEVELS: usize = 7;
 
-// TODO(@siennathesane): all universal ids (memtable, sstable, etc.) need to be
+// TODO(@siennathesane): all universal ids (memtable, segment, etc.) need to be
 // monotonically increasing
 pub struct DbStorageState {
     curr_memtable: RwLock<Arc<Memtable>>,
@@ -117,18 +142,23 @@ pub struct DbStorageState {
     manifest: Option<Arc<Mutex<ManifestWriter>>>,
     /// Maximum number of frozen memtables before flushing to disk
     num_memtable_limit: u64,
-    /// Base path for SSTable storage
+    /// Maximum size of a memtable in bytes before it is frozen
+    memtable_size: u64,
+    /// Base path for Segment storage
     base_path: Option<Arc<PathBuf>>,
     /// Shutdown signal for background flusher
     shutdown: Arc<AtomicBool>,
     /// Background flusher thread handle
     flusher_thread: Option<thread::JoinHandle<()>>,
+    /// Notification channel to wake the flusher when new frozen memtables arrive
+    flush_notify_tx: Option<Sender<()>>,
 }
 
 impl DbStorageState {
     fn new(opts: DbStorageBuilder) -> Self {
         let frozen_memtables = Arc::new(Mutex::new(vec![]));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (flush_tx, flush_rx) = bounded::<()>(1);
         let base_path = opts.base_path.map(Arc::new);
 
         // Recover version set from manifest (if exists) or create new
@@ -166,16 +196,25 @@ impl DbStorageState {
             Arc::new(Mutex::new(writer))
         });
 
-        // Initialize compaction manager if base_path is provided
-        let compaction_manager = base_path.as_ref().map(|path| {
-            let mut manager = CompactionManager::new(
+        // Initialize segment registry and compaction manager if base_path is provided
+        let registry = base_path.as_ref().map(|path| {
+            Arc::new(SegmentRegistry::new(path.as_ref().clone()))
+        });
+
+        let compaction_manager = if let Some(ref path) = base_path {
+            let reg = registry.as_ref().unwrap().clone();
+            let mut manager = CompactionManager::new_with_scheduler_config(
                 path.as_ref().clone(),
                 Arc::clone(&version_manager),
                 manifest.clone(),
+                reg,
+                opts.scheduler_config.clone(),
             );
             manager.start(); // Start background compaction thread
-            Arc::new(Mutex::new(manager))
-        });
+            Some(Arc::new(Mutex::new(manager)))
+        } else {
+            None
+        };
 
         // Spawn background flusher thread if we have a base_path
         let flusher_thread = if let Some(ref path) = base_path {
@@ -185,7 +224,8 @@ impl DbStorageState {
             let manifest_clone = manifest.clone();
             let shutdown_clone = Arc::clone(&shutdown);
             let path_clone = Arc::clone(path);
-            let limit = opts.num_memtable_limit;
+            let flush_rx = flush_rx.clone();
+            let registry_clone = registry.clone();
 
             Some(thread::spawn(move || {
                 Self::background_flusher(
@@ -195,7 +235,8 @@ impl DbStorageState {
                     manifest_clone,
                     shutdown_clone,
                     path_clone,
-                    limit,
+                    flush_rx,
+                    registry_clone,
                 );
             }))
         } else {
@@ -203,16 +244,17 @@ impl DbStorageState {
         };
 
         Self {
-            // TODO(@siennathesane): add config hook here
-            curr_memtable: RwLock::new(Arc::new(Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES))),
+            curr_memtable: RwLock::new(Arc::new(Memtable::new(0, opts.memtable_size))),
             frozen_memtables,
             version_manager,
             compaction_manager,
             manifest,
             num_memtable_limit: opts.num_memtable_limit,
-            base_path,
+            memtable_size: opts.memtable_size,
+            base_path: base_path.clone(),
             shutdown,
             flusher_thread,
+            flush_notify_tx: if base_path.is_some() { Some(flush_tx) } else { None },
         }
     }
 
@@ -224,96 +266,114 @@ impl DbStorageState {
         manifest: Option<Arc<Mutex<ManifestWriter>>>,
         shutdown: Arc<AtomicBool>,
         base_path: Arc<PathBuf>,
-        limit: u64,
+        _flush_rx: Receiver<()>,
+        registry: Option<Arc<SegmentRegistry>>,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             // Check if we need to flush
-            let should_flush = frozen_memtables.lock().len() > limit as usize;
+            let frozen_count = frozen_memtables.lock().len();
+            let should_flush = frozen_count > 0;
 
             if should_flush {
-                // Get the oldest frozen memtable (but don't remove it yet!)
-                let memtable_to_flush = {
-                    let frozen = frozen_memtables.lock();
-                    if frozen.is_empty() {
-                        continue;
-                    }
-                    // Clone the Arc without removing - keeps it visible during flush
-                    frozen[0].clone()
-                };
-
-                // Generate unique SSTable ID
-                let sstable_id = version_manager.next_segment_id();
-
-                // Build path: base_path/sstables/<id>/
-                let sstable_path = base_path.join("sstables").join(sstable_id.to_string());
-
-                // Apply write stalling if L0 has too many files
-                if let Some(ref manager) = compaction_manager {
-                    while manager.lock().should_stall_writes() {
-                        if shutdown.load(Ordering::Relaxed) {
+                // Flush all available frozen memtables in this iteration to
+                // drain the queue faster when writers are outpacing the flusher.
+                loop {
+                    let memtable_to_flush = {
+                        let frozen = frozen_memtables.lock();
+                        if frozen.is_empty() {
                             break;
                         }
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                }
+                        frozen[0].clone()
+                    };
 
-                // Flush memtable to disk
-                match flush_memtable(memtable_to_flush.clone(), sstable_path, sstable_id) {
-                    | Ok((segment, min_key, max_key)) => {
-                        // Create KeyRange before moving min/max into manifest edit
-                        let key_range = KeyRange::new(min_key.clone(), max_key.clone(), sstable_id);
+                    // Generate unique Segment ID
+                    let segment_id = version_manager.next_segment_id();
 
-                        // Log to manifest BEFORE updating version (write-ahead)
-                        if let Some(ref manifest_writer) = manifest {
-                            let edit = VersionEdit::AddL0Segment {
-                                segment_id: sstable_id,
-                                key_range: (min_key, max_key),
-                                size: segment.size_in_bytes(),
-                            };
+                    // Build path: base_path/segments/<id>/
+                    let segment_path = base_path.join("segments").join(segment_id.to_string());
 
-                            match manifest_writer.lock().append_edit(&edit) {
-                                | Ok(()) => {
-                                    // Sync manifest every 10 edits for durability
-                                    if manifest_writer.lock().entry_count() % 10 == 0 {
-                                        let _ = manifest_writer.lock().sync();
-                                    }
-                                },
-                                | Err(e) => {
-                                    tracing::error!(error = ?e, "Failed to write to manifest");
-                                },
+                    // NOTE: We intentionally do NOT stall the flusher when L0 is full.
+                    // The flusher must always drain frozen memtables to prevent
+                    // unbounded memory growth. Write backpressure is handled by
+                    // the frozen memtable limit in the write path (DbInner::batch).
+
+                    // Flush memtable to disk
+                    match flush_memtable(memtable_to_flush.clone(), segment_path.clone(), segment_id) {
+                        | Ok((segment, min_key, max_key)) => {
+                            // Create KeyRange before moving min/max into manifest edit
+                            let key_range = KeyRange::new(min_key.clone(), max_key.clone(), segment_id);
+
+                            // Log to manifest BEFORE updating version (write-ahead)
+                            if let Some(ref manifest_writer) = manifest {
+                                let edit = VersionEdit::AddL0Segment {
+                                    segment_id: segment_id,
+                                    key_range: (min_key, max_key),
+                                    size: segment.size_in_bytes(),
+                                };
+
+                                // Acquire lock ONCE and hold it for all operations
+                                let mut manifest_guard = manifest_writer.lock();
+                                match manifest_guard.append_edit(&edit) {
+                                    | Ok(()) => {
+                                        // Sync manifest every 10 edits for durability
+                                        if manifest_guard.entry_count() % 10 == 0 {
+                                            let _ = manifest_guard.sync();
+                                        }
+                                    },
+                                    | Err(e) => {
+                                        tracing::error!(error = ?e, "Failed to write to manifest");
+                                    },
+                                }
+                                // Lock released here when manifest_guard goes out of scope
                             }
-                        }
 
-                        // Register the new L0 SSTable with VersionManager
-                        version_manager.update(|version| {
-                            version.add_to_l0(segment.clone(), key_range);
-                        });
+                            // Register the new L0 Segment with VersionManager
+                            version_manager.update(|version| {
+                                version.add_to_l0(segment.clone(), key_range);
+                            });
 
-                        // NOW remove from frozen queue (after registration)
-                        // Keys are now visible in L0, safe to remove from frozen
-                        frozen_memtables.lock().remove(0);
+                            // Register the segment with the registry for lifecycle tracking
+                            if let Some(ref reg) = registry {
+                                reg.register(segment, segment_path.clone());
+                                let (deleted, bytes_freed) = reg.cleanup();
+                                if deleted > 0 {
+                                    tracing::info!(
+                                        segments_deleted = deleted,
+                                        bytes_freed = bytes_freed,
+                                        "Cleaned up obsolete segments after flush"
+                                    );
+                                }
+                            }
 
-                        tracing::info!(
-                            sstable_id = sstable_id,
-                            memtable_id = memtable_to_flush.id(),
-                            "Flushed memtable to L0 SSTable"
-                        );
+                            // Only remove if this memtable is still at the front
+                            // (another thread may have already removed it)
+                            let mut frozen = frozen_memtables.lock();
+                            if !frozen.is_empty() && Arc::ptr_eq(&frozen[0], &memtable_to_flush) {
+                                frozen.remove(0);
+                            }
 
-                        // Notify compaction manager that a new L0 file was created
-                        if let Some(ref manager) = compaction_manager {
-                            manager.lock().notify_flush();
-                        }
-                    },
-                    | Err(e) => {
-                        // Flush failed - memtable is still in frozen queue, no action needed
-                        tracing::error!(
-                            error = ?e,
-                            sstable_id = sstable_id,
-                            memtable_id = memtable_to_flush.id(),
-                            "Failed to flush memtable to disk - keeping in memory"
-                        );
-                        // Note: No need to re-insert since we never removed it
-                    },
+                            tracing::info!(
+                                segment_id = segment_id,
+                                memtable_id = memtable_to_flush.id(),
+                                "Flushed memtable to L0 Segment"
+                            );
+
+                            // Notify compaction manager that a new L0 file was created
+                            if let Some(ref manager) = compaction_manager {
+                                manager.lock().notify_flush();
+                            }
+                        },
+                        | Err(e) => {
+                            tracing::error!(
+                                error = ?e,
+                                segment_id = segment_id,
+                                memtable_id = memtable_to_flush.id(),
+                                "Failed to flush memtable to disk - keeping in memory"
+                            );
+                            // Stop trying to flush this batch on error
+                            break;
+                        },
+                    }
                 }
             } else {
                 // No flush needed - sleep briefly
@@ -342,13 +402,13 @@ impl DbStorageState {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn get_from_frozen(
         &self,
-        key: crate::keypair::KeyBytes,
+        key: &crate::keypair::KeyBytes,
     ) -> Option<crate::keypair::ValueBytes> {
         let frozen = self.frozen_memtables.lock();
 
         // Search from newest (end) to oldest (front)
         for memtable in frozen.iter().rev() {
-            if let Some(val) = memtable.get(key.clone()) {
+            if let Some(val) = memtable.get(&key) {
                 return Some(val);
             }
         }
@@ -360,6 +420,11 @@ impl DbStorageState {
         self.frozen_memtables.lock().len()
     }
 
+    /// Returns the maximum number of frozen memtables before writes stall
+    pub fn memtable_limit(&self) -> u64 {
+        self.num_memtable_limit
+    }
+
     /// This generates a new memtable and swaps the existing one.
     ///
     /// The old memtable is frozen and added to the queue. The background
@@ -369,7 +434,7 @@ impl DbStorageState {
         let next_id = self.curr_memtable.read().clone().id() + 1;
         let new_table = RwLock::new(Arc::new(Memtable::new(
             next_id,
-            DEFAULT_MEMTABLE_SIZE_IN_BYTES,
+            self.memtable_size,
         )));
 
         // Freeze current memtable and add to frozen queue
@@ -379,7 +444,10 @@ impl DbStorageState {
 
         self.curr_memtable = new_table;
 
-        // Background flusher thread will handle disk writes asynchronously
+        // Wake the background flusher if it's sleeping
+        if let Some(ref tx) = self.flush_notify_tx {
+            let _ = tx.try_send(());
+        }
     }
 
     /// Triggers a manual compaction of the entire database
@@ -393,6 +461,11 @@ impl DbStorageState {
     /// Returns compaction statistics
     pub fn compaction_stats(&self) -> Option<crate::compaction::CompactionStats> {
         self.compaction_manager.as_ref().map(|m| m.lock().stats())
+    }
+
+    /// Returns version statistics (L0 segments, total size, etc.)
+    pub fn version_stats(&self) -> crate::version::VersionStats {
+        self.version_manager.stats()
     }
 
     /// Performs an orderly shutdown of the database storage layer.
@@ -463,18 +536,18 @@ impl DbStorageState {
                 frozen[0].clone()
             };
 
-            let sstable_id = self.version_manager.next_segment_id();
-            let sstable_path = base_path.join("sstables").join(sstable_id.to_string());
+            let segment_id = self.version_manager.next_segment_id();
+            let segment_path = base_path.join("segments").join(segment_id.to_string());
 
-            match flush_memtable(memtable, sstable_path, sstable_id) {
+            match flush_memtable(memtable.clone(), segment_path, segment_id) {
                 | Ok((segment, min_key, max_key)) => {
                     // Create KeyRange before moving min/max into manifest edit
-                    let key_range = KeyRange::new(min_key.clone(), max_key.clone(), sstable_id);
+                    let key_range = KeyRange::new(min_key.clone(), max_key.clone(), segment_id);
 
                     // Log to manifest BEFORE updating version (write-ahead)
                     if let Some(ref manifest_writer) = self.manifest {
                         let edit = VersionEdit::AddL0Segment {
-                            segment_id: sstable_id,
+                            segment_id: segment_id,
                             key_range: (min_key, max_key),
                             size: segment.size_in_bytes(),
                         };
@@ -494,11 +567,17 @@ impl DbStorageState {
                         }
                     }
 
-                    // Register the new L0 SSTable with VersionManager
+                    // Register the new L0 Segment with VersionManager
                     self.version_manager.update(|version| {
                         version.add_to_l0(segment.clone(), key_range);
                     });
-                    self.frozen_memtables.lock().remove(0);
+
+                    // Only remove if this memtable is still at the front
+                    // (another thread may have already removed it)
+                    let mut frozen = self.frozen_memtables.lock();
+                    if !frozen.is_empty() && Arc::ptr_eq(&frozen[0], &memtable) {
+                        frozen.remove(0);
+                    }
                 },
                 | Err(e) => {
                     tracing::error!(error = ?e, "Failed to flush memtable during drain");
@@ -621,7 +700,7 @@ mod tests {
         let frozen = state.lock().frozen_memtables.lock().clone();
         assert_eq!(frozen.len(), 1);
 
-        let retrieved = frozen[0].get(key);
+        let retrieved = frozen[0].get(&key);
         assert!(
             retrieved.is_some(),
             "data should be preserved in frozen memtable"
@@ -632,12 +711,12 @@ mod tests {
     #[test]
     fn test_storage_builder_custom_config() {
         let custom_block_size = 8192;
-        let custom_sst_size = 16384;
+        let custom_segment_size = 16384;
         let custom_memtable_limit = 8;
 
         let state = DbStorageBuilder::new()
             .block_size(custom_block_size)
-            .target_sst_size(custom_sst_size)
+            .target_segment_size(custom_segment_size)
             .num_memtable_limit(custom_memtable_limit)
             .build();
 
@@ -650,7 +729,7 @@ mod tests {
     fn test_storage_builder_chain() {
         let state = DbStorageBuilder::new()
             .block_size(4096)
-            .target_sst_size(8192)
+            .target_segment_size(8192)
             .num_memtable_limit(6)
             .build();
 

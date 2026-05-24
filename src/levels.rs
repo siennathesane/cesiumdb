@@ -193,7 +193,7 @@ impl LevelStats {
 
 /// A single level in the LSM-tree
 ///
-/// Each level contains multiple segments (SSTables) and maintains
+/// Each level contains multiple segments (Segments) and maintains
 /// metadata about key ranges and statistics.
 #[derive(Clone)]
 pub struct Level {
@@ -382,7 +382,7 @@ impl VersionSet {
 
     /// Returns the highest segment ID across all levels
     ///
-    /// Used to initialize next_sstable_id on recovery to avoid overwriting
+    /// Used to initialize next_segment_id on recovery to avoid overwriting
     /// existing segments.
     pub fn max_segment_id(&self) -> u64 {
         let mut max_id = 0u64;

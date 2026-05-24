@@ -462,8 +462,8 @@ impl VersionEdit {
                 key_range,
                 ..
             } => {
-                // L0 segments are stored in base_path/sstables/{id}/
-                let segment_path = base_path.join("sstables").join(segment_id.to_string());
+                // L0 segments are stored in base_path/segments/{id}/
+                let segment_path = base_path.join("segments").join(segment_id.to_string());
                 let builder = match SegmentBuilder::new(segment_path) {
                     | Ok(b) => b,
                     | Err(e) => return Err(e),
@@ -489,10 +489,10 @@ impl VersionEdit {
                 key_range,
                 ..
             } => {
-                // Leveled segments are stored in base_path/L{level}/sstables/{id}/
+                // Leveled segments are stored in base_path/L{level}/segments/{id}/
                 let segment_path = base_path
                     .join(format!("L{}", level))
-                    .join("sstables")
+                    .join("segments")
                     .join(segment_id.to_string());
                 let builder = match SegmentBuilder::new(segment_path) {
                     | Ok(b) => b,
