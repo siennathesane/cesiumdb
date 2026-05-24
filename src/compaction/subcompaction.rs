@@ -66,6 +66,7 @@ pub struct SubcompactionJob {
 }
 
 /// Subcompaction planner
+#[derive(Clone)]
 pub struct SubcompactionPlanner {
     config: SubcompactionConfig,
 }
@@ -129,7 +130,9 @@ impl SubcompactionPlanner {
         // Split the key range
         let subjob_ranges = self.split_key_range(&job.input.key_range, num_subcompactions);
 
-        // Create subjobs
+        // Create subjobs — each subjob gets ALL input segments.
+        // The segment iterators use key-range bounds so each subcompaction
+        // only reads and writes keys within its assigned range.
         let subjobs: Vec<_> = subjob_ranges
             .into_iter()
             .enumerate()
@@ -139,14 +142,14 @@ impl SubcompactionPlanner {
                 key_range: range.clone(),
                 input: CompactionInput {
                     level: job.input.level,
-                    segments: job.input.segments.clone(), // TODO: Filter by range
+                    segments: job.input.segments.clone(),
                     key_range: range.clone(),
                     total_size: total_size / num_subcompactions as u64,
                 },
                 next_level_input: job.next_level_input.as_ref().map(|input| {
                     CompactionInput {
                         level: input.level,
-                        segments: input.segments.clone(), // TODO: Filter by range
+                        segments: input.segments.clone(),
                         key_range: range.clone(),
                         total_size: input.total_size / num_subcompactions as u64,
                     }

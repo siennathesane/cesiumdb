@@ -8,7 +8,10 @@
 //! - Available resources
 
 use std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     sync::{
         Arc,
         atomic::{
@@ -37,7 +40,7 @@ use crate::{
 };
 
 /// Configuration for the compaction scheduler
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     /// Trigger L0 compaction when this many files accumulate
     pub l0_compaction_trigger: usize,
@@ -47,6 +50,12 @@ pub struct SchedulerConfig {
 
     /// Target size for output segments (bytes)
     pub target_segment_size: u64,
+
+    /// Multiplier for target segment size per level.
+    ///
+    /// Level N target size = `target_segment_size * multiplier^(N-1)`.
+    /// Default is 1 (same size for all levels).
+    pub target_file_size_multiplier: u64,
 
     /// Maximum number of concurrent compaction jobs
     pub max_concurrent_jobs: usize,
@@ -60,12 +69,28 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            l0_compaction_trigger: 4,
-            l0_stop_writes_trigger: 8,
+            l0_compaction_trigger: 8,    // Smaller batches for faster, more frequent compactions
+            l0_stop_writes_trigger: 16,  // Stall writes if L0 gets too far ahead
             target_segment_size: 64 * 1024 * 1024, // 64 MB
-            max_concurrent_jobs: 4,
+            target_file_size_multiplier: 1,
+            max_concurrent_jobs: 8,
             score_threshold: 1.0,
         }
+    }
+}
+
+impl SchedulerConfig {
+    /// Computes the target segment size for a given output level.
+    ///
+    /// Level 1 uses `target_segment_size` directly.
+    /// Each subsequent level multiplies by `target_file_size_multiplier`.
+    pub fn target_segment_size_for_level(&self, level: u8) -> u64 {
+        if level <= 1 || self.target_file_size_multiplier <= 1 {
+            return self.target_segment_size;
+        }
+        let exponent = (level - 1) as u32;
+        self.target_segment_size
+            .saturating_mul(self.target_file_size_multiplier.saturating_pow(exponent))
     }
 }
 
@@ -106,25 +131,117 @@ impl CompactionScheduler {
     ///
     /// Returns the highest-priority job, or None if no compaction is needed.
     pub fn pick_compaction(&self, version: &VersionSet) -> Option<CompactionJob> {
-        // Priority order:
-        // 1. Trivial moves (zero cost)
-        // 2. L0 compaction if over trigger
-        // 3. Highest-scoring level compaction
+        self.pick_compactions(version, &HashSet::new(), 1).into_iter().next()
+    }
 
-        // Check for trivial moves first
-        if let Some(job) = self.find_trivial_move(version) {
-            return Some(job);
-        }
+    /// Picks up to `max_jobs` non-conflicting compaction jobs
+    ///
+    /// Filters out jobs whose input or next-level segments are in the
+    /// `in_flight` set.  L0 compactions are limited to at most one.
+    /// Level compactions on different levels (or non-overlapping
+    /// segments within a leveled level) may be returned together.
+    pub fn pick_compactions(
+        &self,
+        version: &VersionSet,
+        in_flight: &HashSet<u64>,
+        max_jobs: usize,
+    ) -> Vec<CompactionJob> {
+        let mut jobs = Vec::new();
 
-        // Check L0 compaction
-        if version.l0.len() >= self.config.l0_compaction_trigger {
-            if let Some(job) = self.create_l0_compaction(version) {
-                return Some(job);
+        // 1. Collect all trivial moves that don't conflict
+        for level in &version.levels {
+            if level.level_num as usize >= version.num_levels() - 1 {
+                continue;
+            }
+            if level.strategy.allows_overlaps() {
+                continue;
+            }
+            let next_level_num = level.level_num + 1;
+            let next_level_idx = next_level_num as usize - 1;
+            if next_level_idx >= version.levels.len() {
+                continue;
+            }
+            let next_level = &version.levels[next_level_idx];
+
+            for segment in &level.segments {
+                if in_flight.contains(&segment.id()) {
+                    continue;
+                }
+                let segment_range = match level.key_ranges.iter().find(|r| r.segment_id == segment.id()) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let has_overlap = next_level
+                    .key_ranges
+                    .iter()
+                    .any(|r| r.overlaps(segment_range));
+                if !has_overlap {
+                    let input = CompactionInput::with_key_range(
+                        level.level_num,
+                        vec![segment.clone()],
+                        &level.key_ranges,
+                    );
+                    let output = CompactionOutput::new(
+                        next_level_num,
+                        self.config.target_segment_size_for_level(next_level_num),
+                    );
+                    let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+                    jobs.push(CompactionJob::new(
+                        job_id,
+                        CompactionJobType::TrivialMove,
+                        input,
+                        None,
+                        output,
+                        vec![],
+                    ));
+                    if jobs.len() >= max_jobs {
+                        return jobs;
+                    }
+                }
             }
         }
 
-        // Check level compactions
-        self.find_level_compaction(version)
+        // 2. At most one L0 compaction
+        if version.l0.len() >= self.config.l0_compaction_trigger {
+            let l0_conflicts = version.l0.iter().any(|s| in_flight.contains(&s.id()));
+            if !l0_conflicts {
+                if let Some(job) = self.create_l0_compaction(version) {
+                    // Verify none of the chosen L0 segments are in-flight
+                    let conflicts = job.input.segments.iter().any(|s| in_flight.contains(&s.id()));
+                    if !conflicts {
+                        jobs.push(job);
+                        if jobs.len() >= max_jobs {
+                            return jobs;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Level compactions — try every level above threshold, sorted by score
+        let mut level_scores: Vec<_> = version.levels
+            .iter()
+            .map(|l| (l.level_num, l.score()))
+            .filter(|(_, s)| *s > self.config.score_threshold)
+            .collect();
+        level_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (level_num, _) in level_scores {
+            if jobs.len() >= max_jobs {
+                break;
+            }
+            if let Some(job) = self.create_level_compaction(version, level_num) {
+                let conflicts = job.input.segments.iter().any(|s| in_flight.contains(&s.id()))
+                    || job.next_level_input.as_ref().map_or(false, |next| {
+                        next.segments.iter().any(|s| in_flight.contains(&s.id()))
+                    });
+                if !conflicts {
+                    jobs.push(job);
+                }
+            }
+        }
+
+        jobs
     }
 
     /// Finds a trivial move opportunity
@@ -169,8 +286,10 @@ impl CompactionScheduler {
                         &level.key_ranges,
                     );
 
-                    let output =
-                        CompactionOutput::new(next_level_num, self.config.target_segment_size);
+                    let output = CompactionOutput::new(
+                        next_level_num,
+                        self.config.target_segment_size_for_level(next_level_num),
+                    );
 
                     let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
@@ -224,35 +343,44 @@ impl CompactionScheduler {
 
         let input = CompactionInput::with_key_range(0, l0_segments, &l0_key_ranges);
 
-        // Find overlapping L1 segments
+        // Find overlapping L1 segments only when L1 uses leveled compaction.
+        // Tiered levels allow overlapping files, so L0 compaction should just
+        // merge L0 segments and place the output in L1 without rewriting L1.
         let next_level_input = if !version.levels.is_empty() {
             let l1 = &version.levels[0];
 
-            // Find all L1 segments that overlap with the L0 range
-            let overlapping = l1
-                .segments
-                .iter()
-                .filter(|seg| {
-                    // Check if segment overlaps with L0 range
-                    if let Some(range) = l1.key_ranges.iter().find(|r| r.segment_id == seg.id()) {
-                        input.key_range.overlaps(range)
-                    } else {
-                        false
-                    }
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            match l1.strategy {
+                | CompactionStrategy::Leveled { .. } => {
+                    // Leveled: include overlapping L1 segments
+                    let overlapping = l1
+                        .segments
+                        .iter()
+                        .filter(|seg| {
+                            if let Some(range) = l1.key_ranges.iter().find(|r| r.segment_id == seg.id()) {
+                                input.key_range.overlaps(range)
+                            } else {
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
 
-            if overlapping.is_empty() {
-                None
-            } else {
-                Some(CompactionInput::with_key_range(1, overlapping, &l1.key_ranges))
+                    if overlapping.is_empty() {
+                        None
+                    } else {
+                        Some(CompactionInput::with_key_range(1, overlapping, &l1.key_ranges))
+                    }
+                },
+                | _ => {
+                    // Tiered / Universal: do not rewrite L1
+                    None
+                },
             }
         } else {
             None
         };
 
-        let output = CompactionOutput::new(1, self.config.target_segment_size);
+        let output = CompactionOutput::new(1, self.config.target_segment_size_for_level(1));
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
@@ -300,9 +428,8 @@ impl CompactionScheduler {
 
     /// Creates a level compaction job
     ///
-    /// Uses round-robin selection: picks the segment after the last compacted
-    /// one, wrapping around to the beginning when reaching the end. This
-    /// ensures even compaction coverage across the level.
+    /// For leveled levels: uses round-robin selection with overlap checking.
+    /// For tiered levels: compacts ALL segments in the level at once.
     fn create_level_compaction(
         &self,
         version: &VersionSet,
@@ -319,96 +446,167 @@ impl CompactionScheduler {
             return None;
         }
 
-        // Round-robin: find the segment after the last compacted one
-        let segment = {
-            let last_compacted = self.last_compacted.read();
-            let last_id = last_compacted.get(&level_num).copied();
+        match level.strategy {
+            | CompactionStrategy::Tiered { .. } | CompactionStrategy::Universal { .. } => {
+                // Tiered/Universal: compact ALL segments in the level
+                let input = CompactionInput::with_key_range(
+                    level_num,
+                    level.segments.clone(),
+                    &level.key_ranges,
+                );
 
-            match last_id {
-                | Some(id) => {
-                    // Find the first segment with ID > last_compacted, or wrap to first
-                    level
+                let next_level_num = level_num + 1;
+                let next_level_idx = next_level_num as usize - 1;
+
+                // For tiered output levels, we don't need to include next-level
+                // segments since overlaps are allowed.
+                let next_level_input = if next_level_idx < version.levels.len() {
+                    let next_level = &version.levels[next_level_idx];
+                    match next_level.strategy {
+                        | CompactionStrategy::Leveled { .. } => {
+                            // If next level is leveled, find overlapping segments
+                            let overlapping = next_level
+                                .segments
+                                .iter()
+                                .filter(|seg| {
+                                    if let Some(range) = next_level
+                                        .key_ranges
+                                        .iter()
+                                        .find(|r| r.segment_id == seg.id())
+                                    {
+                                        input.key_range.overlaps(range)
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+
+                            if overlapping.is_empty() {
+                                None
+                            } else {
+                                Some(CompactionInput::with_key_range(
+                                    next_level_num,
+                                    overlapping,
+                                    &next_level.key_ranges,
+                                ))
+                            }
+                        },
+                        | _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                let output = CompactionOutput::new(
+                    next_level_num,
+                    self.config.target_segment_size_for_level(next_level_num),
+                );
+                let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+                let num_output_segments = 1;
+                let allocated_ids: Vec<u64> = (0..num_output_segments)
+                    .map(|_| self.version_manager.next_segment_id())
+                    .collect();
+
+                Some(CompactionJob::new(
+                    job_id,
+                    CompactionJobType::LevelCompaction,
+                    input,
+                    next_level_input,
+                    output,
+                    allocated_ids,
+                ))
+            },
+            | CompactionStrategy::Leveled { .. } => {
+                // Leveled: round-robin + overlap checking
+                let segment = {
+                    let last_compacted = self.last_compacted.read();
+                    let last_id = last_compacted.get(&level_num).copied();
+
+                    match last_id {
+                        | Some(id) => {
+                            level
+                                .segments
+                                .iter()
+                                .find(|s| s.id() > id)
+                                .unwrap_or(&level.segments[0])
+                                .clone()
+                        },
+                        | None => level.segments[0].clone(),
+                    }
+                };
+
+                {
+                    let mut last_compacted = self.last_compacted.write();
+                    last_compacted.insert(level_num, segment.id());
+                }
+                let segment_range = match level.key_ranges.iter().find(|r| r.segment_id == segment.id()) {
+                    | Some(r) => r,
+                    | None => return None,
+                };
+
+                let input = CompactionInput::with_key_range(
+                    level_num,
+                    vec![segment],
+                    &level.key_ranges,
+                );
+
+                let next_level_num = level_num + 1;
+                let next_level_idx = next_level_num as usize - 1;
+
+                let next_level_input = if next_level_idx < version.levels.len() {
+                    let next_level = &version.levels[next_level_idx];
+
+                    let overlapping = next_level
                         .segments
                         .iter()
-                        .find(|s| s.id() > id)
-                        .unwrap_or(&level.segments[0])
-                        .clone()
-                },
-                | None => level.segments[0].clone(),
-            }
-        };
+                        .filter(|seg| {
+                            if let Some(range) = next_level
+                                .key_ranges
+                                .iter()
+                                .find(|r| r.segment_id == seg.id())
+                            {
+                                segment_range.overlaps(range)
+                            } else {
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
 
-        // Update round-robin tracker
-        {
-            let mut last_compacted = self.last_compacted.write();
-            last_compacted.insert(level_num, segment.id());
-        }
-        let segment_range = match level.key_ranges.iter().find(|r| r.segment_id == segment.id()) {
-            | Some(r) => r,
-            | None => return None,
-        };
-
-        let input = CompactionInput::with_key_range(
-            level_num,
-            vec![segment],
-            &level.key_ranges,
-        );
-
-        // Find overlapping segments in next level
-        let next_level_num = level_num + 1;
-        let next_level_idx = next_level_num as usize - 1;
-
-        let next_level_input = if next_level_idx < version.levels.len() {
-            let next_level = &version.levels[next_level_idx];
-
-            let overlapping = next_level
-                .segments
-                .iter()
-                .filter(|seg| {
-                    if let Some(range) = next_level
-                        .key_ranges
-                        .iter()
-                        .find(|r| r.segment_id == seg.id())
-                    {
-                        segment_range.overlaps(range)
+                    if overlapping.is_empty() {
+                        None
                     } else {
-                        false
+                        Some(CompactionInput::with_key_range(
+                            next_level_num,
+                            overlapping,
+                            &next_level.key_ranges,
+                        ))
                     }
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+                } else {
+                    None
+                };
 
-            if overlapping.is_empty() {
-                None
-            } else {
-                Some(CompactionInput::with_key_range(
+                let output = CompactionOutput::new(
                     next_level_num,
-                    overlapping,
-                    &next_level.key_ranges,
+                    self.config.target_segment_size_for_level(next_level_num),
+                );
+                let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+                let num_output_segments = 1;
+                let allocated_ids: Vec<u64> = (0..num_output_segments)
+                    .map(|_| self.version_manager.next_segment_id())
+                    .collect();
+
+                Some(CompactionJob::new(
+                    job_id,
+                    CompactionJobType::LevelCompaction,
+                    input,
+                    next_level_input,
+                    output,
+                    allocated_ids,
                 ))
-            }
-        } else {
-            None
-        };
-
-        let output = CompactionOutput::new(next_level_num, self.config.target_segment_size);
-
-        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-
-        // Pre-allocate segment IDs for output segments (estimate 1 for now)
-        let num_output_segments = 1;
-        let allocated_ids: Vec<u64> = (0..num_output_segments)
-            .map(|_| self.version_manager.next_segment_id())
-            .collect();
-
-        Some(CompactionJob::new(
-            job_id,
-            CompactionJobType::LevelCompaction,
-            input,
-            next_level_input,
-            output,
-            allocated_ids,
-        ))
+            },
+        }
     }
 
     /// Checks if writes should be stopped due to L0 file count
@@ -431,8 +629,8 @@ mod tests {
     fn test_scheduler_creation() {
         let version_manager = Arc::new(VersionManager::new(7));
         let scheduler = CompactionScheduler::new(version_manager);
-        assert_eq!(scheduler.config.l0_compaction_trigger, 4);
-        assert_eq!(scheduler.config.max_concurrent_jobs, 4);
+        assert_eq!(scheduler.config.l0_compaction_trigger, 8);
+        assert_eq!(scheduler.config.max_concurrent_jobs, 8);
     }
 
     #[test]
@@ -441,6 +639,7 @@ mod tests {
             l0_compaction_trigger: 8,
             l0_stop_writes_trigger: 16,
             target_segment_size: 128 * 1024 * 1024,
+            target_file_size_multiplier: 1,
             max_concurrent_jobs: 8,
             score_threshold: 2.0,
         };
@@ -472,7 +671,7 @@ mod tests {
 
         // We can't easily add segments without full infrastructure,
         // but we can test the threshold logic
-        assert_eq!(scheduler.config.l0_stop_writes_trigger, 8);
+        assert_eq!(scheduler.config.l0_stop_writes_trigger, 16);
     }
 
     #[test]
@@ -485,5 +684,31 @@ mod tests {
         let id2 = scheduler.next_job_id.load(Ordering::SeqCst);
 
         assert_eq!(id2, id1 + 1);
+    }
+
+    #[test]
+    fn test_target_segment_size_for_level() {
+        let config = SchedulerConfig {
+            target_segment_size: 64 * 1024 * 1024,
+            target_file_size_multiplier: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(config.target_segment_size_for_level(1), 64 * 1024 * 1024);
+        assert_eq!(config.target_segment_size_for_level(2), 128 * 1024 * 1024);
+        assert_eq!(config.target_segment_size_for_level(3), 256 * 1024 * 1024);
+        assert_eq!(config.target_segment_size_for_level(4), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_target_segment_size_multiplier_one() {
+        let config = SchedulerConfig {
+            target_segment_size: 64 * 1024 * 1024,
+            target_file_size_multiplier: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(config.target_segment_size_for_level(1), 64 * 1024 * 1024);
+        assert_eq!(config.target_segment_size_for_level(5), 64 * 1024 * 1024);
     }
 }

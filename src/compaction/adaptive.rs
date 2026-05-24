@@ -225,9 +225,9 @@ impl AdaptiveExecutor {
                         },
                     }
 
-                    queue.mark_completed();
+                    queue.mark_completed(job);
                     active_workers.fetch_sub(1, Ordering::Relaxed);
-                } else {
+                } else{
                     // No jobs available, sleep briefly
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -346,6 +346,11 @@ impl AdaptiveExecutor {
         self.queue.stats()
     }
 
+    /// Returns cumulative compaction I/O stats: (bytes_read, bytes_written)
+    pub fn compaction_io(&self) -> (u64, u64) {
+        self.executor.compaction_io()
+    }
+
     /// Shuts down the executor
     pub fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -394,10 +399,12 @@ mod tests {
         let path = temp_dir.path().to_path_buf();
 
         let version_manager = Arc::new(VersionManager::new(7)); // 7 levels
+        let registry = Arc::new(crate::compaction::SegmentRegistry::new(path.clone()));
         let executor = Arc::new(CompactionExecutor::new(
             Arc::clone(&version_manager),
             path,
             None,
+            registry,
         ));
         let queue = Arc::new(CompactionQueue::new());
 
