@@ -1,17 +1,12 @@
-[![builds.sr.ht status](https://builds.sr.ht/~siennathesane/cesiumdb/commits/feat/builds/amd64.yml.svg)](https://builds.sr.ht/~siennathesane/cesiumdb/commits/feat/builds/amd64.yml?)
 [![codecov](https://codecov.io/gh/siennathesane/cesiumdb/graph/badge.svg?token=D7RBD3OX2U)](https://codecov.io/gh/siennathesane/cesiumdb)
 
 # CesiumDB
 
 A key-value store focused on performance.
 
-# Work In Progress
+# Usage Note: Beta Software
 
-This project is an active work-in-progress.
-
-It will likely compile, and most tests will likely pass, but it is not feature complete yet. The current state of work
-is stabilizing the embedded filesystem implementation so the front end memtables can rely on the backend embedded
-filesystem. Once that work is done, then it's just implementing levels (relatively easy) and compaction (easy enough).
+CesiumDB is in beta. The API is stable and the database itself is stable — the core LSM-tree (memtables, levels L0–L7, flushes, and compaction) is fully functional and extensively tested. The on-disk format is stable. The remaining work is tuning out the last performance kinks, particularly around compaction stall behaviour under heavy concurrent write load. It turns out Facebook as right, performance tuning an LSM-tree is hard 😒
 
 ## Inspiration
 
@@ -29,42 +24,51 @@ This project was heavily inspired and influenced by (in no particular order):
 
 It's :sparkles: __FAST__ :sparkles: and has a few interesting features:
 
-* A blazingly fast hybrid logical clock (HLC) for ordering operations instead of MVCC semantics
-* A high-performance, lock-free, thread-safe, portable filesystem that works with block devices
-* An insanely fast bloom filter for fast lookups
+* LSM-tree with tiered L0–L2 and leveled L3–L7 compaction
+* Configurable per-level target segment sizes via `target_file_size_multiplier`
+* Background compaction scheduler with autoconfiguration support
+* Namespaces for logical key grouping within a single LSM-tree
+* Hybrid Logical Clock (HLC) for deterministic versioning
+* Memory-mapped segment files with bloom-filter-accelerated lookups
 
 ### How _Fast_ is Fast?
 
-I'm glad you asked! Here are some benchmarks:
+I'm glad you asked! Here are some benchmarks from the built-in `bench` binary (Apple Silicon M1, release build, 8 threads):
 
-* Internal bloom filter lookups: ~860 _picoseconds_
-* Merge operator: ~115ms for a full table scan of 800,000 keys across 8 memtables
+| Workload | Value Size | Ops/sec | µs/op | MB/s | P99.99 |
+|----------|-----------|---------|-------|------|--------|
+| fillrandom | 400 B | ~646K | 1.55 | 246 | 4.6 ms |
+
+Internal micro-benchmarks:
+
+* Bloom filter lookups: ~860 _picoseconds_
+* Merge operator: ~115 ms for a full table scan of 800,000 keys across 8 memtables
 
 ## Usage
 
 Add this to your `Cargo.toml`:
 
 ```toml
-
 [dependencies]
-cesiumdb = "1.0"
+cesiumdb = "0.1.0"
 ```
 
 And use:
 
 ```rust
-use cesiumdb::CesiumDB;
+use cesiumdb::{Db, DbOptions};
 
-// use a temp file, most useful for testing
-let db = CesiumDB::default ();
+let mut opts = DbOptions::default();
+opts.data_dir(std::path::PathBuf::from("/var/lib/cesiumdb"));
+let db = Db::open(opts);
 
-// no namespace
-db.put(b"key", b"value");
-db.get(b"key");
+// simple put/get
+db.put(b"key", b"value").unwrap();
+let value = db.get(b"key").unwrap();
 
 // with a namespace
-db.put(1, b"key", b"value");
-db.get(1, b"key");
+db.put_ns(1, b"key", b"value").unwrap();
+let value = db.get_ns(1, b"key").unwrap();
 ```
 
 See the [API documentation](https://docs.rs/cesiumdb) for more information.
@@ -80,13 +84,29 @@ argue namespaces are closer to tables than column families.
 
 CesiumDB does let you bring your own hybrid logical clock implementation for key versioning. This is useful if you have
 a specific HLC implementation you want to use, or if you want to use a different clock entirely. This is done by
-implementing the `HLC` trait and passing it to the `CesiumDB` constructor. However, if you can provide a more precise
+implementing the `HLC` trait and passing it to the `DbOptions` clock setter. However, if you can provide a more precise
 clock than the provided one, please submit an issue or PR so we can all benefit from it.
+
+## Benchmarking
+
+A `db_bench`-style benchmark binary is included:
+
+```bash
+cargo build --release --bin bench
+
+# 1M random writes, 400 B values, 8 threads
+./target/release/bench --benchmarks=fillrandom,stats --num=1000000 --threads=8
+
+# Tune segment sizes
+TARGET_SEGMENT_SIZE_MB=64 TARGET_FILE_SIZE_MULTIPLIER=2 ./benchmark.sh fillrandom
+```
+
+See `benchmark.sh` for available environment variables.
 
 ## Unsafety: Or... How To Do Dangerous Things Safely
 
 There is a non-trivial amount of `unsafe` code. Most of it is related to the internal implementation with `mmap` (which
-cannot be made safe) and it's entrypoints (the handlers and such). I also make use of pointer arithmetic on
+cannot be made safe) and its entrypoints (the handlers and such). I also make use of pointer arithmetic on
 memory-mapped file locations. This is one of the areas where safety comes at the cost of performance. However, if you
 can find a way to make it safe, please submit an issue or PR. I would love to see it!
 
@@ -103,6 +123,7 @@ issue first.
 
 An alphabetical list of things I'd like to actually do for the long-term safety and stability of the project.
 
+- [x] Write some kind of auto-configuration for the generalized configs.
 - [ ] Add `loom` integration tests.
 - [ ] Add `miri` integration tests.
 - [ ] Add more granular `madvise` commands to the filesystem to give the kernel some hints.
@@ -119,7 +140,6 @@ An alphabetical list of things I'd like to actually do for the long-term safety 
 - [ ] Revisit the merge iterator. The benchmarks have it at ~115ms for a full scan of 8 memtables with 100,000 keys
   each. I have no idea if this is a mismatch of my expectations or a gross inability of mine to optimize it further.
   Every optimization I've tried is 5-20% slower (including my own cache-optimized min heap) than this.
-- [ ] Write some kind of auto-configuration for the generalized configs.
 
 ## License
 
