@@ -19,7 +19,10 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{
+    Mutex,
+    RwLock,
+};
 
 use crate::{
     compaction::{
@@ -86,7 +89,7 @@ pub struct CompactionManager {
     failed_jobs: Arc<AtomicU64>,
 
     /// Tracks segments currently being compacted
-    /// 
+    ///
     /// Prevents duplicate job scheduling by tracking which segments
     /// are already in-flight. Cleared when jobs complete.
     in_flight_segments: Arc<RwLock<HashSet<u64>>>,
@@ -288,8 +291,8 @@ impl CompactionManager {
 
                 for job in jobs {
                     // RocksDB-style: serialize L0 compactions to one at a time
-                    if job.job_type == CompactionJobType::L0Compaction
-                        && l0_in_progress.load(Ordering::Relaxed) > 0
+                    if job.job_type == CompactionJobType::L0Compaction &&
+                        l0_in_progress.load(Ordering::Relaxed) > 0
                     {
                         tracing::debug!(job_id = job.id, "bg_loop: skipping L0 job, serialization");
                         continue;
@@ -298,8 +301,11 @@ impl CompactionManager {
                     // Double-check no segment is already in-flight
                     let is_dup = {
                         let guard = in_flight.read();
-                        job.input.segments.iter().any(|seg| guard.contains(&seg.id()))
-                            || job.next_level_input.as_ref().map_or(false, |next| {
+                        job.input
+                            .segments
+                            .iter()
+                            .any(|seg| guard.contains(&seg.id())) ||
+                            job.next_level_input.as_ref().map_or(false, |next| {
                                 next.segments.iter().any(|seg| guard.contains(&seg.id()))
                             })
                     };
@@ -364,7 +370,11 @@ impl CompactionManager {
     pub fn notify_flush(&self) {
         let total_jobs = self.queue.queued_count() + self.queue.in_progress_count();
         if total_jobs >= self.scheduler.config().max_concurrent_jobs {
-            tracing::debug!(total_jobs, max = self.scheduler.config().max_concurrent_jobs, "notify_flush: at capacity");
+            tracing::debug!(
+                total_jobs,
+                max = self.scheduler.config().max_concurrent_jobs,
+                "notify_flush: at capacity"
+            );
             return;
         }
 
@@ -375,18 +385,26 @@ impl CompactionManager {
             guard.clone()
         };
 
-        let jobs = self.scheduler.pick_compactions(&version, &in_flight_snapshot, slots);
+        let jobs = self
+            .scheduler
+            .pick_compactions(&version, &in_flight_snapshot, slots);
         if jobs.is_empty() {
-            tracing::debug!(l0_count = version.l0.len(), "notify_flush: no compaction needed");
+            tracing::debug!(
+                l0_count = version.l0.len(),
+                "notify_flush: no compaction needed"
+            );
             return;
         }
 
         for job in jobs {
             // RocksDB-style: serialize L0 compactions
-            if job.job_type == CompactionJobType::L0Compaction
-                && self.l0_compactions_in_progress.load(Ordering::Relaxed) > 0
+            if job.job_type == CompactionJobType::L0Compaction &&
+                self.l0_compactions_in_progress.load(Ordering::Relaxed) > 0
             {
-                tracing::debug!(job_id = job.id, "notify_flush: skipping L0 job, serialization");
+                tracing::debug!(
+                    job_id = job.id,
+                    "notify_flush: skipping L0 job, serialization"
+                );
                 continue;
             }
             if self.is_duplicate_job(&job) {
@@ -395,7 +413,8 @@ impl CompactionManager {
             }
             self.mark_in_flight(&job);
             if job.job_type == CompactionJobType::L0Compaction {
-                self.l0_compactions_in_progress.fetch_add(1, Ordering::Relaxed);
+                self.l0_compactions_in_progress
+                    .fetch_add(1, Ordering::Relaxed);
             }
             self.queue.enqueue(job);
         }
@@ -432,8 +451,10 @@ impl CompactionManager {
 
     /// Records compaction I/O for throughput tracking
     pub fn record_compaction_io(&self, bytes_read: u64, bytes_written: u64) {
-        self.bytes_compacted_read.fetch_add(bytes_read, Ordering::Relaxed);
-        self.bytes_compacted_written.fetch_add(bytes_written, Ordering::Relaxed);
+        self.bytes_compacted_read
+            .fetch_add(bytes_read, Ordering::Relaxed);
+        self.bytes_compacted_written
+            .fetch_add(bytes_written, Ordering::Relaxed);
     }
 
     /// Returns current compaction statistics
@@ -444,7 +465,8 @@ impl CompactionManager {
         let registry_stats = self.registry.stats();
 
         // Read I/O counters from the executor (where they're actually updated)
-        let (bytes_read, bytes_written) = self.executor
+        let (bytes_read, bytes_written) = self
+            .executor
             .as_ref()
             .map(|e| e.compaction_io())
             .unwrap_or((0, 0));
@@ -680,14 +702,18 @@ mod tests {
         manager.notify_flush();
         let after = manager.queue.queued_count();
 
-        // No new job should be queued (no L0 segments exist, but the guard should still work)
+        // No new job should be queued (no L0 segments exist, but the guard should still
+        // work)
         assert_eq!(after, before);
 
         // Decrement and verify it allows future L0 compactions
         manager
             .l0_compactions_in_progress
             .fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(manager.l0_compactions_in_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            manager.l0_compactions_in_progress.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -708,6 +734,9 @@ mod tests {
         manager.compact();
 
         // Just verify the state is consistent
-        assert_eq!(manager.l0_compactions_in_progress.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            manager.l0_compactions_in_progress.load(Ordering::Relaxed),
+            1
+        );
     }
 }

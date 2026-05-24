@@ -123,7 +123,8 @@ impl Key<Bytes> {
 
         bytes.put_u64_le(self.ns);
         bytes.put_slice(self.key.as_ref());
-        // IMPORTANT: Use big-endian so lexicographic byte comparison gives correct ordering
+        // IMPORTANT: Use big-endian so lexicographic byte comparison gives correct
+        // ordering
         bytes.put_u128(u128::MAX); // "latest" marker
 
         bytes.freeze()
@@ -140,7 +141,8 @@ impl Serializer for Key<Bytes> {
         // this is the serialized key
         bytes.put_u64_le(self.ns);
         bytes.put_slice(self.key.as_ref());
-        // IMPORTANT: Use big-endian so lexicographic byte comparison gives correct ordering
+        // IMPORTANT: Use big-endian so lexicographic byte comparison gives correct
+        // ordering
         bytes.put_u128(u128::MAX - self.ts);
 
         bytes.freeze()

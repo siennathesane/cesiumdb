@@ -1,4 +1,7 @@
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use tempfile::TempDir;
 
 #[test]
@@ -23,7 +26,7 @@ fn debug_compaction() {
     assert!(before.is_some(), "key should exist before compaction");
 
     db.compact().unwrap();
-    
+
     for i in 0..30 {
         let stats = db.compaction_stats().unwrap();
         if stats.queued_jobs == 0 && stats.in_progress_jobs == 0 {
@@ -34,7 +37,7 @@ fn debug_compaction() {
 
     let after = db.get(b"key_00_00000").unwrap();
     println!("After compaction: {:?}", after.is_some());
-    
+
     // Check L1 segment file sizes
     let l1 = temp_dir.path().join("L1").join("segments");
     if l1.exists() {
@@ -50,7 +53,7 @@ fn debug_compaction() {
             }
         }
     }
-    
+
     // Also check if we can read ALL keys
     let mut found = 0;
     let mut missing = 0;
@@ -68,7 +71,7 @@ fn debug_compaction() {
         }
     }
     println!("Found: {}, Missing: {}", found, missing);
-    
+
     assert!(after.is_some(), "key should exist after compaction");
     db.close().unwrap();
 }

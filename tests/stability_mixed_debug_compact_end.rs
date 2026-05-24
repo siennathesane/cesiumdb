@@ -1,11 +1,16 @@
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use stability_framework::{
-    run_stability_test,
     ShadowVerifier,
     StabilityConfig,
+    run_stability_test,
 };
 use tempfile::TempDir;
 
@@ -48,20 +53,31 @@ fn stability_mixed_debug_compact_end() {
     println!("Running full compaction...");
     db.compact().unwrap();
     db.sync().unwrap();
-    
+
     let mut v = verifier.lock().unwrap();
-    println!("After compact+sync - errors before final verify: {:?}", v.errors);
+    println!(
+        "After compact+sync - errors before final verify: {:?}",
+        v.errors
+    );
     v.errors.clear();
-    
+
     let sample_count = 500_000usize / 100;
     let sample_ok = v.verify_random_sample(&db, sample_count);
     let deletes_ok = v.verify_deletes(&db);
-    
+
     println!("Final sample verification: {}", sample_ok);
     println!("Final delete verification: {}", deletes_ok);
     println!("Final errors: {:?}", v.errors);
-    
-    assert!(sample_ok, "Final sample verification failed: {:?}", v.errors);
-    assert!(deletes_ok, "Final delete verification failed: {:?}", v.errors);
+
+    assert!(
+        sample_ok,
+        "Final sample verification failed: {:?}",
+        v.errors
+    );
+    assert!(
+        deletes_ok,
+        "Final delete verification failed: {:?}",
+        v.errors
+    );
     assert!(v.is_clean(), "Shadow verifier has errors: {:?}", v.errors);
 }

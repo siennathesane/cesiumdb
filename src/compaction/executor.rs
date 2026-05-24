@@ -26,13 +26,13 @@ use thiserror::Error;
 use crate::{
     compact::compact_raw,
     compaction::{
+        SegmentRegistry,
+        SubcompactionJob,
+        SubcompactionPlanner,
         job::{
             CompactionJob,
             CompactionJobType,
         },
-        SegmentRegistry,
-        SubcompactionJob,
-        SubcompactionPlanner,
     },
     errs::SegmentError,
     levels::{
@@ -191,8 +191,11 @@ impl CompactionExecutor {
                     let next_ok = job.next_level_input.as_ref().map_or(true, |next| {
                         let next_idx = next.level as usize - 1;
                         if next_idx < version.levels.len() {
-                            let next_ids: std::collections::HashSet<u64> =
-                                version.levels[next_idx].segments.iter().map(|s| s.id()).collect();
+                            let next_ids: std::collections::HashSet<u64> = version.levels[next_idx]
+                                .segments
+                                .iter()
+                                .map(|s| s.id())
+                                .collect();
                             next.segments.iter().all(|s| next_ids.contains(&s.id()))
                         } else {
                             false
@@ -204,14 +207,24 @@ impl CompactionExecutor {
                     if level_idx >= version.levels.len() {
                         return false;
                     }
-                    let level_ids: std::collections::HashSet<u64> =
-                        version.levels[level_idx].segments.iter().map(|s| s.id()).collect();
-                    let inputs_ok = job.input.segments.iter().all(|s| level_ids.contains(&s.id()));
+                    let level_ids: std::collections::HashSet<u64> = version.levels[level_idx]
+                        .segments
+                        .iter()
+                        .map(|s| s.id())
+                        .collect();
+                    let inputs_ok = job
+                        .input
+                        .segments
+                        .iter()
+                        .all(|s| level_ids.contains(&s.id()));
                     let next_ok = job.next_level_input.as_ref().map_or(true, |next| {
                         let next_idx = next.level as usize - 1;
                         if next_idx < version.levels.len() {
-                            let next_ids: std::collections::HashSet<u64> =
-                                version.levels[next_idx].segments.iter().map(|s| s.id()).collect();
+                            let next_ids: std::collections::HashSet<u64> = version.levels[next_idx]
+                                .segments
+                                .iter()
+                                .map(|s| s.id())
+                                .collect();
                             next.segments.iter().all(|s| next_ids.contains(&s.id()))
                         } else {
                             false
@@ -262,7 +275,9 @@ impl CompactionExecutor {
                 // L0 jobs are serialized — inputs are guaranteed to still
                 // be present because no other compaction can remove them.
             },
-            | CompactionJobType::LevelCompaction | CompactionJobType::Manual | CompactionJobType::TrivialMove => {
+            | CompactionJobType::LevelCompaction |
+            CompactionJobType::Manual |
+            CompactionJobType::TrivialMove => {
                 if !self.inputs_still_valid(job) {
                     return Err(ExecutorError::VersionChanged);
                 }
@@ -277,9 +292,13 @@ impl CompactionExecutor {
 
         // Record compaction I/O for throughput metrics
         match job.job_type {
-            | CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction | CompactionJobType::Manual => {
-                self.bytes_read.fetch_add(result.bytes_read, Ordering::Relaxed);
-                self.bytes_written.fetch_add(result.bytes_written, Ordering::Relaxed);
+            | CompactionJobType::L0Compaction |
+            CompactionJobType::LevelCompaction |
+            CompactionJobType::Manual => {
+                self.bytes_read
+                    .fetch_add(result.bytes_read, Ordering::Relaxed);
+                self.bytes_written
+                    .fetch_add(result.bytes_written, Ordering::Relaxed);
             },
             | _ => {},
         }
@@ -341,10 +360,7 @@ impl CompactionExecutor {
     }
 
     /// Executes a single merge compaction without splitting.
-    fn execute_single_merge(
-        &self,
-        job: &CompactionJob,
-    ) -> Result<CompactionResult, ExecutorError> {
+    fn execute_single_merge(&self, job: &CompactionJob) -> Result<CompactionResult, ExecutorError> {
         // Collect all input segments
         let mut all_inputs = job.input.segments.clone();
         if let Some(ref next_level) = job.next_level_input {
@@ -352,9 +368,13 @@ impl CompactionExecutor {
         }
 
         // Create readers and raw iterators for all input segments
-        let readers: Vec<_> = match all_inputs.iter().map(|seg| seg.reader()).collect::<Result<Vec<_>, _>>() {
-            Ok(v) => v,
-            Err(e) => return Err(ExecutorError::SegmentError(e)),
+        let readers: Vec<_> = match all_inputs
+            .iter()
+            .map(|seg| seg.reader())
+            .collect::<Result<Vec<_>, _>>()
+        {
+            | Ok(v) => v,
+            | Err(e) => return Err(ExecutorError::SegmentError(e)),
         };
 
         let iterators: Vec<_> = readers
@@ -370,8 +390,8 @@ impl CompactionExecutor {
             .join(segment_id.to_string());
 
         let compact_output = match compact_raw(iterators, output_dir, segment_id) {
-            Ok(v) => v,
-            Err(e) => return Err(ExecutorError::SegmentError(e)),
+            | Ok(v) => v,
+            | Err(e) => return Err(ExecutorError::SegmentError(e)),
         };
 
         let bytes_read = job.total_input_size();
@@ -406,27 +426,27 @@ impl CompactionExecutor {
         );
 
         // Allocate segment IDs for each subcompaction output.
-        // Sub-0 uses the pre-allocated ID; additional IDs come from the version manager.
+        // Sub-0 uses the pre-allocated ID; additional IDs come from the version
+        // manager.
         let mut segment_ids = vec![job.allocated_segment_ids[0]];
         for _ in 1..num_subs {
             segment_ids.push(self.version_manager.next_segment_id());
         }
 
         // Run subcompactions in parallel using scoped threads.
-        let results: Vec<Result<SubcompactionResult, ExecutorError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = subjobs
-                .into_iter()
-                .enumerate()
-                .map(|(idx, subjob)| {
-                    let segment_id = segment_ids[idx];
-                    scope.spawn(move || {
-                        self.execute_single_subcompaction(&subjob, segment_id)
+        let results: Vec<Result<SubcompactionResult, ExecutorError>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = subjobs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, subjob)| {
+                        let segment_id = segment_ids[idx];
+                        scope.spawn(move || self.execute_single_subcompaction(&subjob, segment_id))
                     })
-                })
-                .collect();
+                    .collect();
 
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
         // Aggregate outputs
         let mut output_segments = Vec::with_capacity(num_subs);
@@ -461,7 +481,8 @@ impl CompactionExecutor {
         })
     }
 
-    /// Executes a single subcompaction — one key-range partition of a larger job.
+    /// Executes a single subcompaction — one key-range partition of a larger
+    /// job.
     fn execute_single_subcompaction(
         &self,
         subjob: &SubcompactionJob,
@@ -474,9 +495,13 @@ impl CompactionExecutor {
         }
 
         // Create bounded readers — each subcompaction only reads keys in its range
-        let readers: Vec<_> = match all_inputs.iter().map(|seg| seg.reader()).collect::<Result<Vec<_>, _>>() {
-            Ok(v) => v,
-            Err(e) => return Err(ExecutorError::SegmentError(e)),
+        let readers: Vec<_> = match all_inputs
+            .iter()
+            .map(|seg| seg.reader())
+            .collect::<Result<Vec<_>, _>>()
+        {
+            | Ok(v) => v,
+            | Err(e) => return Err(ExecutorError::SegmentError(e)),
         };
 
         let start_bound = Bound::Included(subjob.key_range.start.as_slice());
@@ -494,16 +519,19 @@ impl CompactionExecutor {
             .join(segment_id.to_string());
 
         let compact_output = match compact_raw(iterators, output_dir, segment_id) {
-            Ok(v) => v,
-            Err(e) => return Err(ExecutorError::SegmentError(e)),
+            | Ok(v) => v,
+            | Err(e) => return Err(ExecutorError::SegmentError(e)),
         };
 
-        let bytes_read = subjob.input.total_size
-            + subjob.next_level_input.as_ref().map(|i| i.total_size).unwrap_or(0);
+        let bytes_read = subjob.input.total_size +
+            subjob
+                .next_level_input
+                .as_ref()
+                .map(|i| i.total_size)
+                .unwrap_or(0);
         let bytes_written = compact_output.segment.size_in_bytes();
 
-        let key_range =
-            KeyRange::new(compact_output.min_key, compact_output.max_key, segment_id);
+        let key_range = KeyRange::new(compact_output.min_key, compact_output.max_key, segment_id);
 
         Ok(SubcompactionResult {
             segment: compact_output.segment,
@@ -659,7 +687,11 @@ impl CompactionExecutor {
             // Add output segments to target level
             if job.output.level == 0 {
                 // Add to L0 with key ranges
-                for (segment, range) in result.output_segments.iter().zip(result.output_ranges.iter()) {
+                for (segment, range) in result
+                    .output_segments
+                    .iter()
+                    .zip(result.output_ranges.iter())
+                {
                     version.add_to_l0(segment.clone(), range.clone());
                 }
             } else {
@@ -682,7 +714,9 @@ impl CompactionExecutor {
         // Trivial moves reuse the same segments in a different level,
         // so they must NOT be marked for deletion.
         match job.job_type {
-            | CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction | CompactionJobType::Manual => {
+            | CompactionJobType::L0Compaction |
+            CompactionJobType::LevelCompaction |
+            CompactionJobType::Manual => {
                 for id in &result.inputs_to_delete {
                     self.registry.mark_for_deletion(*id);
                 }
@@ -693,10 +727,14 @@ impl CompactionExecutor {
         // Register new output segments with the registry (merge compactions only)
         // Trivial moves reuse existing segments that are already registered.
         match job.job_type {
-            | CompactionJobType::L0Compaction | CompactionJobType::LevelCompaction | CompactionJobType::Manual => {
+            | CompactionJobType::L0Compaction |
+            CompactionJobType::LevelCompaction |
+            CompactionJobType::Manual => {
                 for segment in &result.output_segments {
                     let path = if job.output.level == 0 {
-                        self.base_path.join("segments").join(segment.id().to_string())
+                        self.base_path
+                            .join("segments")
+                            .join(segment.id().to_string())
                     } else {
                         self.base_path
                             .join(format!("L{}", job.output.level))
@@ -720,6 +758,7 @@ impl CompactionExecutor {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use tempfile::TempDir;
 
     use super::*;
@@ -742,7 +781,6 @@ mod tests {
         memtable::Memtable,
         version::VersionManager,
     };
-    use bytes::Bytes;
 
     #[test]
     fn test_executor_creation() {
@@ -775,7 +813,14 @@ mod tests {
 
         let output = CompactionOutput::new(2, 64 * 1024 * 1024);
 
-        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output, vec![]);
+        let job = CompactionJob::new(
+            1,
+            CompactionJobType::TrivialMove,
+            input,
+            None,
+            output,
+            vec![],
+        );
 
         let result = executor.execute_trivial_move(&job);
         assert!(result.is_err());
@@ -796,24 +841,34 @@ mod tests {
         // Segment 1: keys "a" through "j"
         let memtable1 = Arc::new(Memtable::new(1, 1024 * 1024));
         for i in 0..10 {
-            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key_{:02}", i)), clock.time());
+            let key = KeyBytes::new(
+                DEFAULT_NS,
+                Bytes::from(format!("key_{:02}", i)),
+                clock.time(),
+            );
             let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value_{:02}", i)));
             memtable1.put(key, val).unwrap();
         }
         memtable1.freeze();
         let seg1_path = l0_path.join("1");
-        let (segment1, min_key1, max_key1) = flush_memtable(memtable1, seg1_path.clone(), 1).unwrap();
+        let (segment1, min_key1, max_key1) =
+            flush_memtable(memtable1, seg1_path.clone(), 1).unwrap();
 
         // Segment 2: keys "k" through "t"
         let memtable2 = Arc::new(Memtable::new(2, 1024 * 1024));
         for i in 10..20 {
-            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key_{:02}", i)), clock.time());
+            let key = KeyBytes::new(
+                DEFAULT_NS,
+                Bytes::from(format!("key_{:02}", i)),
+                clock.time(),
+            );
             let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value_{:02}", i)));
             memtable2.put(key, val).unwrap();
         }
         memtable2.freeze();
         let seg2_path = l0_path.join("3");
-        let (segment2, min_key2, max_key2) = flush_memtable(memtable2, seg2_path.clone(), 3).unwrap();
+        let (segment2, min_key2, max_key2) =
+            flush_memtable(memtable2, seg2_path.clone(), 3).unwrap();
 
         // Set up version manager with the L0 segments
         let version_manager = Arc::new(VersionManager::new(7));
@@ -838,11 +893,7 @@ mod tests {
         let input = CompactionInput {
             level: 0,
             segments: vec![segment1, segment2],
-            key_range: KeyRange::new(
-                key_range1.start.clone(),
-                key_range2.end.clone(),
-                seg1_id,
-            ),
+            key_range: KeyRange::new(key_range1.start.clone(), key_range2.end.clone(), seg1_id),
             total_size,
         };
 
@@ -879,7 +930,10 @@ mod tests {
 
         // Verify output directory exists
         let output_path = base_path.join("L1").join("segments").join("5");
-        assert!(output_path.exists(), "output segment directory should exist");
+        assert!(
+            output_path.exists(),
+            "output segment directory should exist"
+        );
 
         // Drop the job (which holds input segment Arcs) so registry can clean up
         drop(job);
@@ -889,8 +943,14 @@ mod tests {
         assert_eq!(deleted, 2, "both input segments should be deleted");
 
         // Verify input directories were deleted
-        assert!(!seg1_path.exists(), "input segment 1 directory should be deleted");
-        assert!(!seg2_path.exists(), "input segment 2 directory should be deleted");
+        assert!(
+            !seg1_path.exists(),
+            "input segment 1 directory should be deleted"
+        );
+        assert!(
+            !seg2_path.exists(),
+            "input segment 2 directory should be deleted"
+        );
 
         // Verify registry state
         assert_eq!(registry.live_count(), 1); // Only output segment

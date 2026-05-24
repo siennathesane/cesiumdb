@@ -7,11 +7,14 @@ use std::sync::{
     Mutex,
 };
 
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use stability_framework::{
-    run_stability_test,
     ShadowVerifier,
     StabilityConfig,
+    run_stability_test,
 };
 use tempfile::TempDir;
 

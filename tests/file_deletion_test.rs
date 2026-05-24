@@ -1,8 +1,12 @@
-use cesiumdb::{Db, DbOptions};
 use std::{
     fs,
     path::Path,
     time::Duration,
+};
+
+use cesiumdb::{
+    Db,
+    DbOptions,
 };
 use tempfile::TempDir;
 
@@ -98,11 +102,7 @@ fn test_compaction_data_integrity() {
         for i in 0..500 {
             let key = format!("key_{:02}_{:05}", batch, i);
             let result = db.get(key.as_bytes()).unwrap();
-            assert!(
-                result.is_some(),
-                "Key {} missing after compaction",
-                key
-            );
+            assert!(result.is_some(), "Key {} missing after compaction", key);
         }
     }
 

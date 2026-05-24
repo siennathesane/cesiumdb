@@ -44,11 +44,7 @@ impl Default for ParameterSpace {
                 128 * 1024 * 1024,
             ],
             max_memtables: vec![2, 4, 8, 16],
-            target_segment_sizes: vec![
-                32 * 1024 * 1024,
-                64 * 1024 * 1024,
-                128 * 1024 * 1024,
-            ],
+            target_segment_sizes: vec![32 * 1024 * 1024, 64 * 1024 * 1024, 128 * 1024 * 1024],
             target_file_size_multipliers: vec![1, 2, 4],
             l0_triggers: vec![4, 8, 16, 32],
             l0_stop_triggers: vec![8, 16, 32, 64],

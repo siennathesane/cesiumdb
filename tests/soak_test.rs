@@ -1,10 +1,12 @@
 //! Comprehensive soak test framework for CesiumDB
 //!
-//! This module provides stress testing capabilities similar to RocksDB's db_bench,
-//! validating stability, performance, and correctness under sustained heavy load.
+//! This module provides stress testing capabilities similar to RocksDB's
+//! db_bench, validating stability, performance, and correctness under sustained
+//! heavy load.
 //!
 //! Features:
-//! - Configurable workloads (mixed, write-heavy, read-heavy, scan-heavy, delete-heavy)
+//! - Configurable workloads (mixed, write-heavy, read-heavy, scan-heavy,
+//!   delete-heavy)
 //! - Adjustable test parameters via environment variables
 //! - Real-time metrics collection and reporting
 //! - Probabilistic correctness verification (shadow verifier)
@@ -15,10 +17,11 @@
 //!   SOAK_DURATION=300 cargo test --test soak_test -- --ignored --nocapture
 //!
 //! With OpenTelemetry/Jaeger (for performance analysis):
-//!   1. Start Jaeger: docker run -d -p4317:4317 -p16686:16686 jaegertracing/all-in-one:latest
-//!   2. Run test: OTEL_ENABLED=1 cargo test --test soak_test soak_smoke_mixed -- --ignored --nocapture
+//!   1. Start Jaeger: docker run -d -p4317:4317 -p16686:16686
+//!      jaegertracing/all-in-one:latest
+//!   2. Run test: OTEL_ENABLED=1 cargo test --test soak_test soak_smoke_mixed
+//!      -- --ignored --nocapture
 //!   3. View traces: http://localhost:16686
-
 
 use std::{
     collections::HashMap,
@@ -26,13 +29,13 @@ use std::{
     ops::Bound,
     path::PathBuf,
     sync::{
+        Arc,
+        Mutex,
         atomic::{
             AtomicBool,
             AtomicU64,
             Ordering,
         },
-        Arc,
-        Mutex,
     },
     thread::{
         self,
@@ -136,7 +139,8 @@ struct MetricsCollector {
     scan_count: AtomicU64,
     error_count: AtomicU64,
 
-    // Simple latency histogram (7 buckets: <1µs, 1-10µs, 10-100µs, 100µs-1ms, 1-10ms, 10-100ms, >100ms)
+    // Simple latency histogram (7 buckets: <1µs, 1-10µs, 10-100µs, 100µs-1ms, 1-10ms, 10-100ms,
+    // >100ms)
     latency_buckets: [AtomicU64; 7],
     min_micros: AtomicU64,
     max_micros: AtomicU64,
@@ -1002,7 +1006,11 @@ fn spawn_reporter(
             println!(
                 "[{:>6.1}s] {:>8} ops | {:>7.0} ops/sec (inst) | {:>7.0} ops/sec (avg) | \
                  errors: {}",
-                current.elapsed_secs, current.total_ops, instant_rate, current.ops_per_sec, current.error_count
+                current.elapsed_secs,
+                current.total_ops,
+                instant_rate,
+                current.ops_per_sec,
+                current.error_count
             );
 
             last_snapshot = current;
@@ -1077,10 +1085,7 @@ async fn run_soak_test(
         "test had {} errors",
         final_snapshot.error_count
     );
-    assert!(
-        final_snapshot.total_ops > 0,
-        "test completed no operations"
-    );
+    assert!(final_snapshot.total_ops > 0, "test completed no operations");
 
     println!("\nTest PASSED ✓");
     Ok(())
@@ -1257,14 +1262,16 @@ async fn soak_extended_mixed() {
 // write throughput will degrade.
 //
 // Usage:
-//   cargo test --test soak_test soak_20gib_write_sustained -- --ignored --nocapture
+//   cargo test --test soak_test soak_20gib_write_sustained -- --ignored
+// --nocapture
 //
 // Environment variables:
 //   SOAK_20GIB_TARGET_GB    Target data size in GiB (default: 20)
 //   SOAK_20GIB_VALUE_SIZE   Value size in bytes (default: 1024)
 //   SOAK_20GIB_BATCH_SIZE   Batch size per write (default: 100)
-//   SOAK_20GIB_WORKERS      Number of writer threads (default: available_parallelism)
-//   SOAK_20GIB_MAX_DURATION_SECS  Max test duration (default: 600)
+//   SOAK_20GIB_WORKERS      Number of writer threads (default:
+// available_parallelism)   SOAK_20GIB_MAX_DURATION_SECS  Max test duration
+// (default: 600)
 
 #[derive(Debug, Clone)]
 struct SustainedWriteConfig {
@@ -1321,7 +1328,8 @@ impl SustainedWriteMetrics {
 
     fn record_batch(&self, entries: usize, value_size: usize) {
         self.batches_written.fetch_add(1, Ordering::Relaxed);
-        self.ops_written.fetch_add(entries as u64, Ordering::Relaxed);
+        self.ops_written
+            .fetch_add(entries as u64, Ordering::Relaxed);
         // Approximate bytes: key (~32) + value + overhead (~48)
         let bytes_per_entry = 32 + value_size + 48;
         self.bytes_written
@@ -1338,8 +1346,16 @@ impl SustainedWriteMetrics {
             ops_written: ops,
             batches_written: batches,
             elapsed_secs: elapsed,
-            ops_per_sec: if elapsed > 0.0 { ops as f64 / elapsed } else { 0.0 },
-            bytes_per_sec: if elapsed > 0.0 { bytes as f64 / elapsed } else { 0.0 },
+            ops_per_sec: if elapsed > 0.0 {
+                ops as f64 / elapsed
+            } else {
+                0.0
+            },
+            bytes_per_sec: if elapsed > 0.0 {
+                bytes as f64 / elapsed
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -1379,13 +1395,13 @@ fn spawn_sustained_writer(
             }
 
             match db.batch(&batch) {
-                Ok(()) => {
+                | Ok(()) => {
                     metrics.record_batch(batch.len(), config.value_size);
-                }
-                Err(e) => {
+                },
+                | Err(e) => {
                     eprintln!("Worker {} batch error: {:?}", worker_id, e);
                     thread::sleep(Duration::from_millis(10));
-                }
+                },
             }
         }
     })
@@ -1408,7 +1424,19 @@ fn spawn_sustained_reporter(
 
         println!(
             "\n{:>8} | {:>10} | {:>10} | {:>10} | {:>8} | {:>6} | {:>6} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} | {:>10}",
-            "Time", "Value GB", "Disk GB", "Target GB", "Ops/s", "L0", "Frozen", "Queued", "Active", "CmpJob/s", "CmpRdMB/s", "CmpWrMB/s", "Pattern"
+            "Time",
+            "Value GB",
+            "Disk GB",
+            "Target GB",
+            "Ops/s",
+            "L0",
+            "Frozen",
+            "Queued",
+            "Active",
+            "CmpJob/s",
+            "CmpRdMB/s",
+            "CmpWrMB/s",
+            "Pattern"
         );
         println!("{}", "-".repeat(155));
 
@@ -1417,7 +1445,9 @@ fn spawn_sustained_reporter(
 
             let current = metrics.snapshot();
             let delta_time = current.elapsed_secs - last_snapshot.elapsed_secs;
-            let delta_ops = current.ops_written.saturating_sub(last_snapshot.ops_written);
+            let delta_ops = current
+                .ops_written
+                .saturating_sub(last_snapshot.ops_written);
             let instant_ops = if delta_time > 0.0 {
                 delta_ops as f64 / delta_time
             } else {
@@ -1437,22 +1467,42 @@ fn spawn_sustained_reporter(
             let l0_count = vstats.l0_segments;
             let disk_gb = vstats.total_size as f64 / (1024.0 * 1024.0 * 1024.0);
             let frozen_count = db.frozen_memtable_count();
-            let (queued, active, pattern, compaction_jobs, compaction_read, compaction_written) = match db.compaction_stats() {
-                Ok(stats) => {
-                    let jobs = stats.completed_jobs;
-                    let read = stats.bytes_compacted_read;
-                    let written = stats.bytes_compacted_written;
-                    (stats.queued_jobs, stats.in_progress_jobs, stats.workload_pattern, jobs, read, written)
-                },
-                Err(_) => (0, 0, "N/A".to_string(), 0, 0, 0),
-            };
+            let (queued, active, pattern, compaction_jobs, compaction_read, compaction_written) =
+                match db.compaction_stats() {
+                    | Ok(stats) => {
+                        let jobs = stats.completed_jobs;
+                        let read = stats.bytes_compacted_read;
+                        let written = stats.bytes_compacted_written;
+                        (
+                            stats.queued_jobs,
+                            stats.in_progress_jobs,
+                            stats.workload_pattern,
+                            jobs,
+                            read,
+                            written,
+                        )
+                    },
+                    | Err(_) => (0, 0, "N/A".to_string(), 0, 0, 0),
+                };
 
             let delta_jobs = compaction_jobs.saturating_sub(last_compaction_jobs);
             let delta_read = compaction_read.saturating_sub(last_compaction_read);
             let delta_written = compaction_written.saturating_sub(last_compaction_written);
-            let jobs_per_sec = if delta_time > 0.0 { delta_jobs as f64 / delta_time } else { 0.0 };
-            let read_mb_per_sec = if delta_time > 0.0 { delta_read as f64 / (1024.0 * 1024.0) / delta_time } else { 0.0 };
-            let write_mb_per_sec = if delta_time > 0.0 { delta_written as f64 / (1024.0 * 1024.0) / delta_time } else { 0.0 };
+            let jobs_per_sec = if delta_time > 0.0 {
+                delta_jobs as f64 / delta_time
+            } else {
+                0.0
+            };
+            let read_mb_per_sec = if delta_time > 0.0 {
+                delta_read as f64 / (1024.0 * 1024.0) / delta_time
+            } else {
+                0.0
+            };
+            let write_mb_per_sec = if delta_time > 0.0 {
+                delta_written as f64 / (1024.0 * 1024.0) / delta_time
+            } else {
+                0.0
+            };
 
             println!(
                 "{:>8.1}s | {:>10.2} | {:>10.2} | {:>10.2} | {:>8.0} | {:>6} | {:>6} | {:>8} | {:>8} | {:>10.2} | {:>10.2} | {:>10.2} | {:>10}",
@@ -1588,7 +1638,10 @@ async fn soak_20gib_write_sustained() {
         let elapsed = start.elapsed().as_secs();
 
         if bytes >= config.target_bytes {
-            println!("\n🎯 Target reached: {:.2} GB written", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+            println!(
+                "\n🎯 Target reached: {:.2} GB written",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
             break;
         }
 
@@ -1609,10 +1662,7 @@ async fn soak_20gib_write_sustained() {
     let final_bytes = metrics.bytes_written.load(Ordering::Relaxed);
     let final_ops = metrics.ops_written.load(Ordering::Relaxed);
 
-    assert!(
-        final_ops > 0,
-        "No operations were written"
-    );
+    assert!(final_ops > 0, "No operations were written");
 
     // We should reach at least 90% of target within max duration
     let completion_ratio = final_bytes as f64 / config.target_bytes as f64;
@@ -1723,7 +1773,6 @@ impl ChurnMetrics {
             start_time: Instant::now(),
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1784,15 +1833,15 @@ fn spawn_prepop_worker(
             }
 
             match db.batch(&batch) {
-                Ok(()) => {
+                | Ok(()) => {
                     metrics
                         .bytes_written
                         .fetch_add((value_size * batch.len()) as u64, Ordering::Relaxed);
-                }
-                Err(e) => {
+                },
+                | Err(e) => {
                     eprintln!("Pre-pop batch error: {:?}", e);
                     thread::sleep(Duration::from_millis(10));
-                }
+                },
             }
         }
     })
@@ -1821,7 +1870,7 @@ fn spawn_churn_worker(
                     let key = churn_key(idx);
                     let _ = db.get(&key);
                     metrics.gets.fetch_add(1, Ordering::Relaxed);
-                }
+                },
                 | 40..75 => {
                     // 35% Put (overwrite existing key)
                     let idx = rng.random_range(0..total_keys);
@@ -1833,7 +1882,7 @@ fn spawn_churn_worker(
                             .bytes_written
                             .fetch_add(value_size as u64, Ordering::Relaxed);
                     }
-                }
+                },
                 | 75..90 => {
                     // 15% Scan
                     let idx = rng.random_range(0..total_keys);
@@ -1843,14 +1892,14 @@ fn spawn_churn_worker(
                         .take(100)
                         .count();
                     metrics.scans.fetch_add(1, Ordering::Relaxed);
-                }
+                },
                 | _ => {
                     // 10% Delete
                     let idx = rng.random_range(0..total_keys);
                     let key = churn_key(idx);
                     let _ = db.delete(&key);
                     metrics.deletes.fetch_add(1, Ordering::Relaxed);
-                }
+                },
             }
         }
     })
@@ -1872,8 +1921,20 @@ fn spawn_churn_reporter(
 
         println!(
             "\n{:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} | {:>10} | {:>6} | {:>6}",
-            "Time", "Ops/s", "Get/s", "Put/s", "Del/s", "Scan/s", "DiskGB", "L0", "Qd", "Act",
-            "CmpJob/s", "CmpRdMB/s", "CmpWrMB/s", "Frz"
+            "Time",
+            "Ops/s",
+            "Get/s",
+            "Put/s",
+            "Del/s",
+            "Scan/s",
+            "DiskGB",
+            "L0",
+            "Qd",
+            "Act",
+            "CmpJob/s",
+            "CmpRdMB/s",
+            "CmpWrMB/s",
+            "Frz"
         );
         println!("{}", "-".repeat(175));
 
@@ -1900,14 +1961,14 @@ fn spawn_churn_reporter(
 
             let (queued, active, compaction_jobs, compaction_read, compaction_written) =
                 match db.compaction_stats() {
-                    Ok(stats) => (
+                    | Ok(stats) => (
                         stats.queued_jobs,
                         stats.in_progress_jobs,
                         stats.completed_jobs,
                         stats.bytes_compacted_read,
                         stats.bytes_compacted_written,
                     ),
-                    Err(_) => (0, 0, 0, 0, 0),
+                    | Err(_) => (0, 0, 0, 0, 0),
                 };
 
             let delta_jobs = compaction_jobs.saturating_sub(last_compaction_jobs);
@@ -2060,13 +2121,18 @@ async fn soak_20gib_churn() {
     // ========================================================================
     // Phase 2: Mixed churn on bounded key space
     // ========================================================================
-    let remaining_secs = config.duration_secs.saturating_sub(prepop_start.elapsed().as_secs());
+    let remaining_secs = config
+        .duration_secs
+        .saturating_sub(prepop_start.elapsed().as_secs());
     if remaining_secs == 0 {
         println!("No time remaining for churn phase. Test complete.");
         return;
     }
 
-    println!("\n--- Phase 2: Mixed churn for {}s on {} keys ---", remaining_secs, total_keys);
+    println!(
+        "\n--- Phase 2: Mixed churn for {}s on {} keys ---",
+        remaining_secs, total_keys
+    );
 
     let churn_metrics = Arc::new(ChurnMetrics::new());
     let churn_shutdown = Arc::new(AtomicBool::new(false));
@@ -2135,7 +2201,10 @@ async fn soak_20gib_churn() {
     let space_amplification = disk_bytes as f64 / logical_bytes.max(1) as f64;
 
     println!("\nDisk usage: {:.2} GB", disk_gb);
-    println!("Logical data: {:.2} GB", logical_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    println!(
+        "Logical data: {:.2} GB",
+        logical_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     println!("Space amplification: {:.2}x", space_amplification);
 
     // Write amplification from compaction stats
@@ -2149,7 +2218,10 @@ async fn soak_20gib_churn() {
         println!("Compaction jobs: {}", stats.completed_jobs);
         println!("Compaction read: {:.2} GB", cmp_read_gb);
         println!("Compaction written: {:.2} GB", cmp_write_gb);
-        println!("User bytes written: {:.2} GB", user_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+        println!(
+            "User bytes written: {:.2} GB",
+            user_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
         println!("Write amplification: {:.2}x", write_amplification);
 
         assert!(

@@ -1,4 +1,7 @@
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use tempfile::TempDir;
 
 /// Tests that manual compaction doesn't create duplicate jobs

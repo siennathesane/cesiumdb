@@ -69,8 +69,8 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            l0_compaction_trigger: 8,    // Smaller batches for faster, more frequent compactions
-            l0_stop_writes_trigger: 16,  // Stall writes if L0 gets too far ahead
+            l0_compaction_trigger: 8, // Smaller batches for faster, more frequent compactions
+            l0_stop_writes_trigger: 16, // Stall writes if L0 gets too far ahead
             target_segment_size: 64 * 1024 * 1024, // 64 MB
             target_file_size_multiplier: 1,
             max_concurrent_jobs: 8,
@@ -131,7 +131,9 @@ impl CompactionScheduler {
     ///
     /// Returns the highest-priority job, or None if no compaction is needed.
     pub fn pick_compaction(&self, version: &VersionSet) -> Option<CompactionJob> {
-        self.pick_compactions(version, &HashSet::new(), 1).into_iter().next()
+        self.pick_compactions(version, &HashSet::new(), 1)
+            .into_iter()
+            .next()
     }
 
     /// Picks up to `max_jobs` non-conflicting compaction jobs
@@ -167,9 +169,13 @@ impl CompactionScheduler {
                 if in_flight.contains(&segment.id()) {
                     continue;
                 }
-                let segment_range = match level.key_ranges.iter().find(|r| r.segment_id == segment.id()) {
-                    Some(r) => r,
-                    None => continue,
+                let segment_range = match level
+                    .key_ranges
+                    .iter()
+                    .find(|r| r.segment_id == segment.id())
+                {
+                    | Some(r) => r,
+                    | None => continue,
                 };
                 let has_overlap = next_level
                     .key_ranges
@@ -207,7 +213,11 @@ impl CompactionScheduler {
             if !l0_conflicts {
                 if let Some(job) = self.create_l0_compaction(version) {
                     // Verify none of the chosen L0 segments are in-flight
-                    let conflicts = job.input.segments.iter().any(|s| in_flight.contains(&s.id()));
+                    let conflicts = job
+                        .input
+                        .segments
+                        .iter()
+                        .any(|s| in_flight.contains(&s.id()));
                     if !conflicts {
                         jobs.push(job);
                         if jobs.len() >= max_jobs {
@@ -219,7 +229,8 @@ impl CompactionScheduler {
         }
 
         // 3. Level compactions — try every level above threshold, sorted by score
-        let mut level_scores: Vec<_> = version.levels
+        let mut level_scores: Vec<_> = version
+            .levels
             .iter()
             .map(|l| (l.level_num, l.score()))
             .filter(|(_, s)| *s > self.config.score_threshold)
@@ -231,8 +242,12 @@ impl CompactionScheduler {
                 break;
             }
             if let Some(job) = self.create_level_compaction(version, level_num) {
-                let conflicts = job.input.segments.iter().any(|s| in_flight.contains(&s.id()))
-                    || job.next_level_input.as_ref().map_or(false, |next| {
+                let conflicts = job
+                    .input
+                    .segments
+                    .iter()
+                    .any(|s| in_flight.contains(&s.id())) ||
+                    job.next_level_input.as_ref().map_or(false, |next| {
                         next.segments.iter().any(|s| in_flight.contains(&s.id()))
                     });
                 if !conflicts {
@@ -356,7 +371,9 @@ impl CompactionScheduler {
                         .segments
                         .iter()
                         .filter(|seg| {
-                            if let Some(range) = l1.key_ranges.iter().find(|r| r.segment_id == seg.id()) {
+                            if let Some(range) =
+                                l1.key_ranges.iter().find(|r| r.segment_id == seg.id())
+                            {
                                 input.key_range.overlaps(range)
                             } else {
                                 false
@@ -368,7 +385,11 @@ impl CompactionScheduler {
                     if overlapping.is_empty() {
                         None
                     } else {
-                        Some(CompactionInput::with_key_range(1, overlapping, &l1.key_ranges))
+                        Some(CompactionInput::with_key_range(
+                            1,
+                            overlapping,
+                            &l1.key_ranges,
+                        ))
                     }
                 },
                 | _ => {
@@ -524,14 +545,12 @@ impl CompactionScheduler {
                     let last_id = last_compacted.get(&level_num).copied();
 
                     match last_id {
-                        | Some(id) => {
-                            level
-                                .segments
-                                .iter()
-                                .find(|s| s.id() > id)
-                                .unwrap_or(&level.segments[0])
-                                .clone()
-                        },
+                        | Some(id) => level
+                            .segments
+                            .iter()
+                            .find(|s| s.id() > id)
+                            .unwrap_or(&level.segments[0])
+                            .clone(),
                         | None => level.segments[0].clone(),
                     }
                 };
@@ -540,16 +559,17 @@ impl CompactionScheduler {
                     let mut last_compacted = self.last_compacted.write();
                     last_compacted.insert(level_num, segment.id());
                 }
-                let segment_range = match level.key_ranges.iter().find(|r| r.segment_id == segment.id()) {
+                let segment_range = match level
+                    .key_ranges
+                    .iter()
+                    .find(|r| r.segment_id == segment.id())
+                {
                     | Some(r) => r,
                     | None => return None,
                 };
 
-                let input = CompactionInput::with_key_range(
-                    level_num,
-                    vec![segment],
-                    &level.key_ranges,
-                );
+                let input =
+                    CompactionInput::with_key_range(level_num, vec![segment], &level.key_ranges);
 
                 let next_level_num = level_num + 1;
                 let next_level_idx = next_level_num as usize - 1;

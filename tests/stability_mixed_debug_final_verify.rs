@@ -1,11 +1,16 @@
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use stability_framework::{
-    run_stability_test_final_verify_only,
     ShadowVerifier,
     StabilityConfig,
+    run_stability_test_final_verify_only,
 };
 use tempfile::TempDir;
 
@@ -39,24 +44,35 @@ fn stability_mixed_debug_final_verify() {
     println!("  Reads: {}", metrics.total_reads);
     println!("  Deletes: {}", metrics.total_deletes);
     println!("  Verification passes: {}", metrics.verification_passes);
-    println!("  Verification failures during run: {}", metrics.verification_failures);
+    println!(
+        "  Verification failures during run: {}",
+        metrics.verification_failures
+    );
     if let Some(space_amp) = metrics.space_amp {
         println!("  Space amp: {:.2}x", space_amp);
     }
 
     let mut v = verifier.lock().unwrap();
     println!("Final expected count: {}", v.expected_key_count());
-    
+
     // Final verification after all workers stopped
     let sample_count = (500_000 / 100).max(100);
     let sample_ok = v.verify_random_sample(&db, sample_count);
     let deletes_ok = v.verify_deletes(&db);
-    
+
     println!("Final sample verification: {}", sample_ok);
     println!("Final delete verification: {}", deletes_ok);
     println!("Final errors: {:?}", v.errors);
-    
-    assert!(sample_ok, "Final sample verification failed: {:?}", v.errors);
-    assert!(deletes_ok, "Final delete verification failed: {:?}", v.errors);
+
+    assert!(
+        sample_ok,
+        "Final sample verification failed: {:?}",
+        v.errors
+    );
+    assert!(
+        deletes_ok,
+        "Final delete verification failed: {:?}",
+        v.errors
+    );
     assert!(v.is_clean(), "Shadow verifier has errors: {:?}", v.errors);
 }

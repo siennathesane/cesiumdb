@@ -435,7 +435,8 @@ impl VersionSet {
 
     /// Removes a segment from L0 by ID
     ///
-    /// Returns the removed segment if found, keeping the parallel key_ranges array in sync.
+    /// Returns the removed segment if found, keeping the parallel key_ranges
+    /// array in sync.
     pub fn remove_from_l0(&mut self, segment_id: u64) -> Option<Arc<Segment>> {
         if let Some(idx) = self.l0.iter().position(|s| s.id() == segment_id) {
             let segment = self.l0.remove(idx);

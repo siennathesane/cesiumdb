@@ -472,14 +472,10 @@ impl VersionEdit {
                     | Ok(s) => s,
                     | Err(e) => return Err(e),
                 };
-                
+
                 // Use key_range from manifest
-                let range = KeyRange::new(
-                    key_range.0.clone(),
-                    key_range.1.clone(),
-                    *segment_id
-                );
-                
+                let range = KeyRange::new(key_range.0.clone(), key_range.1.clone(), *segment_id);
+
                 version.add_to_l0(segment, range);
                 Ok(())
             },

@@ -242,8 +242,7 @@ impl Memtable {
                 let avg_entry_size = total_bytes / current_entries;
 
                 // Recalculate: 50% of max_size divided by actual average entry size
-                let new_max_entries =
-                    ((max_size as f64 * 0.5) / avg_entry_size as f64) as u64;
+                let new_max_entries = ((max_size as f64 * 0.5) / avg_entry_size as f64) as u64;
                 self.max_entries.store(new_max_entries, Relaxed);
             }
 

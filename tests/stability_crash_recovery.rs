@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use stability_framework::ShadowVerifier;
 use tempfile::TempDir;
 
@@ -53,7 +56,7 @@ fn stability_crash_recovery() {
     let mut errors = 0;
     for (key, expected_value) in verifier.iter_expected() {
         match db2.get(key) {
-            Ok(Some(actual)) => {
+            | Ok(Some(actual)) => {
                 if actual.as_ref() != expected_value.as_slice() {
                     errors += 1;
                     if errors <= 5 {
@@ -66,16 +69,20 @@ fn stability_crash_recovery() {
                     }
                 }
             },
-            Ok(None) => {
+            | Ok(None) => {
                 errors += 1;
                 if errors <= 5 {
                     println!("MISSING: key={:?}", String::from_utf8_lossy(key));
                 }
             },
-            Err(e) => {
+            | Err(e) => {
                 errors += 1;
                 if errors <= 5 {
-                    println!("READ_ERROR: key={:?} error={:?}", String::from_utf8_lossy(key), e);
+                    println!(
+                        "READ_ERROR: key={:?} error={:?}",
+                        String::from_utf8_lossy(key),
+                        e
+                    );
                 }
             },
         }

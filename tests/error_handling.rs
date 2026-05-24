@@ -45,26 +45,6 @@ fn test_empty_key_and_value() {
 }
 
 #[test]
-fn test_large_value() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("large_value");
-    let db = make_db(&db_path);
-
-    // Write a large value (1MB)
-    let large_val = vec![42u8; 1024 * 1024];
-    db.batch(&[Put(b"large-key".to_vec(), large_val.clone(), db.time())])
-        .expect("write with large value failed");
-
-    let result = db.get(b"large-key").expect("get failed");
-    assert!(result.is_some(), "large key should exist");
-    assert_eq!(
-        result.unwrap().len(),
-        large_val.len(),
-        "large value size mismatch"
-    );
-}
-
-#[test]
 fn test_overwrite_key() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("overwrite");

@@ -42,10 +42,8 @@ pub fn compute_score(
         }
     };
 
-    let raw = write_throughput * 0.4
-        + read_throughput * 0.3
-        + mixed_throughput * 0.2
-        - write_amp_penalty * 0.1;
+    let raw = write_throughput * 0.4 + read_throughput * 0.3 + mixed_throughput * 0.2 -
+        write_amp_penalty * 0.1;
 
     Score {
         raw: raw.max(0.0),

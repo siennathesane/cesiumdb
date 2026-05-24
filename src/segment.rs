@@ -859,10 +859,10 @@ impl Segment {
             let block_offset = block_idx * BLOCK_SIZE;
 
             // Read block using Map::read_range
-            let block_bytes = match key_map.read_range(
-                block_offset..block_offset + BLOCK_SIZE,
-                |slice| bytes::Bytes::copy_from_slice(slice),
-            ) {
+            let block_bytes = match key_map
+                .read_range(block_offset..block_offset + BLOCK_SIZE, |slice| {
+                    bytes::Bytes::copy_from_slice(slice)
+                }) {
                 | Ok(b) => b,
                 | Err(e) => return Err(e),
             };

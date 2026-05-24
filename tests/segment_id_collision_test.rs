@@ -1,5 +1,9 @@
-use cesiumdb::{Db, DbOptions};
 use std::sync::Arc;
+
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use tempfile::TempDir;
 
 /// Tests that flush and compaction use the same global segment ID counter
@@ -108,7 +112,8 @@ fn test_segment_id_persists_across_restart() {
 /// even when running in parallel.
 ///
 /// This stress test verifies that:
-/// 1. Multiple threads triggering flushes simultaneously don't get duplicate IDs
+/// 1. Multiple threads triggering flushes simultaneously don't get duplicate
+///    IDs
 /// 2. Manual compactions running concurrently with flushes don't reuse IDs
 /// 3. All data remains accessible and consistent
 #[test]

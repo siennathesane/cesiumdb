@@ -1,4 +1,7 @@
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use tempfile::TempDir;
 
 /// Tests that L0 key ranges are properly tracked during flush.
@@ -34,7 +37,8 @@ fn test_l0_key_ranges_persist_across_flush() {
     db.close().unwrap();
 }
 
-/// Tests that L0 key ranges are correctly recovered from manifest after restart.
+/// Tests that L0 key ranges are correctly recovered from manifest after
+/// restart.
 ///
 /// This test verifies that:
 /// 1. Key ranges written to manifest during flush
@@ -51,7 +55,8 @@ fn test_l0_key_ranges_recovered_from_manifest() {
     // First session: write and flush data
     {
         let mut opts1 = DbOptions::new();
-        opts1.data_dir(temp_dir.path().to_path_buf())
+        opts1
+            .data_dir(temp_dir.path().to_path_buf())
             .memtable_size(512 * 1024)
             .max_memtables(2);
         let db = Db::open(opts1);
@@ -65,29 +70,40 @@ fn test_l0_key_ranges_recovered_from_manifest() {
     // Second session: reopen and verify data
     {
         let mut opts2 = DbOptions::new();
-        opts2.data_dir(temp_dir.path().to_path_buf())
+        opts2
+            .data_dir(temp_dir.path().to_path_buf())
             .memtable_size(512 * 1024)
             .max_memtables(2);
         let db = Db::open(opts2);
 
         // Verify all keys are readable after recovery
         let result_m = db.get(b"m").unwrap();
-        assert!(result_m.is_some(), "Key 'm' should be present after recovery");
+        assert!(
+            result_m.is_some(),
+            "Key 'm' should be present after recovery"
+        );
         assert_eq!(&result_m.unwrap()[..], b"value_m");
 
         let result_p = db.get(b"p").unwrap();
-        assert!(result_p.is_some(), "Key 'p' should be present after recovery");
+        assert!(
+            result_p.is_some(),
+            "Key 'p' should be present after recovery"
+        );
         assert_eq!(&result_p.unwrap()[..], b"value_p");
 
         let result_x = db.get(b"x").unwrap();
-        assert!(result_x.is_some(), "Key 'x' should be present after recovery");
+        assert!(
+            result_x.is_some(),
+            "Key 'x' should be present after recovery"
+        );
         assert_eq!(&result_x.unwrap()[..], b"value_x");
 
         db.close().unwrap();
     }
 }
 
-/// Tests that multiple L0 segments have correct key ranges after multiple flushes.
+/// Tests that multiple L0 segments have correct key ranges after multiple
+/// flushes.
 #[test]
 fn test_multiple_l0_segments_have_key_ranges() {
     let temp_dir = TempDir::new().unwrap();
@@ -143,8 +159,9 @@ fn test_multiple_l0_segments_have_key_ranges() {
 /// This test verifies that compaction can find overlapping L1 segments
 /// using the L0 key ranges.
 ///
-/// NOTE: This test is temporarily disabled until Bug 1 (empty key ranges in CompactionInput)
-/// is fixed by Agent A. Once Bug 1 is complete, this test should pass.
+/// NOTE: This test is temporarily disabled until Bug 1 (empty key ranges in
+/// CompactionInput) is fixed by Agent A. Once Bug 1 is complete, this test
+/// should pass.
 #[test]
 #[ignore]
 fn test_l0_compaction_uses_key_ranges() {

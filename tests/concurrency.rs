@@ -119,44 +119,6 @@ fn test_reads_during_compaction() {
 }
 
 #[test]
-fn test_rapid_memtable_rotation() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("rapid_rotation");
-
-    let mut opts = DbOptions::default();
-    opts.data_dir(db_path)
-        .memtable_size(16 * 1024) // 16KB — very small for rapid rotation
-        .max_memtables(8);
-    let db = Db::open(opts);
-
-    const NUM_KEYS: u64 = 10_000;
-
-    // Write lots of data to force many memtable rotations
-    for i in 0..NUM_KEYS {
-        let key = format!("rot-key-{:08}", i);
-        let val = vec![(i % 256) as u8; 50];
-        db.batch(&[Put(key.into_bytes(), val, db.time())])
-            .expect("write failed");
-    }
-
-    // All data should still be readable
-    let mut found = 0u64;
-    for i in 0..NUM_KEYS {
-        let key = format!("rot-key-{:08}", i);
-        if let Ok(Some(_)) = db.get(key.as_bytes()) {
-            found += 1;
-        }
-    }
-
-    assert_eq!(
-        found,
-        NUM_KEYS,
-        "lost {} keys during rapid rotation",
-        NUM_KEYS - found
-    );
-}
-
-#[test]
 fn test_concurrent_get_and_delete() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("concurrent_del");

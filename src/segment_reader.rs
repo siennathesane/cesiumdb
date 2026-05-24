@@ -537,9 +537,11 @@ impl SegmentReader {
                     return Err(ReadOutOfBounds);
                 }
 
-                match self.key_handle.read_range(offset..offset + BLOCK_SIZE, |slice| {
-                    Bytes::copy_from_slice(slice)
-                }) {
+                match self
+                    .key_handle
+                    .read_range(offset..offset + BLOCK_SIZE, |slice| {
+                        Bytes::copy_from_slice(slice)
+                    }) {
                     | Ok(b) => b,
                     | Err(e) => return Err(e),
                 }
@@ -549,9 +551,11 @@ impl SegmentReader {
                     return Err(ReadOutOfBounds);
                 }
 
-                match self.val_handle.read_range(offset..offset + BLOCK_SIZE, |slice| {
-                    Bytes::copy_from_slice(slice)
-                }) {
+                match self
+                    .val_handle
+                    .read_range(offset..offset + BLOCK_SIZE, |slice| {
+                        Bytes::copy_from_slice(slice)
+                    }) {
                     | Ok(b) => b,
                     | Err(e) => return Err(e),
                 }
@@ -581,11 +585,7 @@ impl SegmentReader {
     /// * `upper_bound` - The upper bound of the key range (inclusive if
     ///   Included, exclusive if Excluded)
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-    pub fn scan(
-        self,
-        lower_bound: Bound<&[u8]>,
-        upper_bound: Bound<&[u8]>,
-    ) -> SegmentScanIterator {
+    pub fn scan(self, lower_bound: Bound<&[u8]>, upper_bound: Bound<&[u8]>) -> SegmentScanIterator {
         // Determine starting block based on lower bound
         let start_block = match lower_bound {
             | Bound::Included(key) | Bound::Excluded(key) => {
@@ -782,7 +782,10 @@ mod tests {
             val_map.clone(),
             Arc::new(parking_lot::RwLock::new(key_index)),
         );
-        assert!(result.is_ok(), "SegmentReader should accept non-aligned sizes");
+        assert!(
+            result.is_ok(),
+            "SegmentReader should accept non-aligned sizes"
+        );
         let reader = result.unwrap();
         // num_blocks should round up: (8192+100)/4096 = 3
         assert_eq!(reader.num_blocks, 3);

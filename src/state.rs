@@ -16,9 +16,9 @@ use std::{
 };
 
 use crossbeam_channel::{
-    bounded,
     Receiver,
     Sender,
+    bounded,
 };
 use parking_lot::{
     Mutex,
@@ -150,7 +150,8 @@ pub struct DbStorageState {
     shutdown: Arc<AtomicBool>,
     /// Background flusher thread handle
     flusher_thread: Option<thread::JoinHandle<()>>,
-    /// Notification channel to wake the flusher when new frozen memtables arrive
+    /// Notification channel to wake the flusher when new frozen memtables
+    /// arrive
     flush_notify_tx: Option<Sender<()>>,
 }
 
@@ -197,9 +198,9 @@ impl DbStorageState {
         });
 
         // Initialize segment registry and compaction manager if base_path is provided
-        let registry = base_path.as_ref().map(|path| {
-            Arc::new(SegmentRegistry::new(path.as_ref().clone()))
-        });
+        let registry = base_path
+            .as_ref()
+            .map(|path| Arc::new(SegmentRegistry::new(path.as_ref().clone())));
 
         let compaction_manager = if let Some(ref path) = base_path {
             let reg = registry.as_ref().unwrap().clone();
@@ -254,7 +255,11 @@ impl DbStorageState {
             base_path: base_path.clone(),
             shutdown,
             flusher_thread,
-            flush_notify_tx: if base_path.is_some() { Some(flush_tx) } else { None },
+            flush_notify_tx: if base_path.is_some() {
+                Some(flush_tx)
+            } else {
+                None
+            },
         }
     }
 
@@ -298,10 +303,15 @@ impl DbStorageState {
                     // the frozen memtable limit in the write path (DbInner::batch).
 
                     // Flush memtable to disk
-                    match flush_memtable(memtable_to_flush.clone(), segment_path.clone(), segment_id) {
+                    match flush_memtable(
+                        memtable_to_flush.clone(),
+                        segment_path.clone(),
+                        segment_id,
+                    ) {
                         | Ok((segment, min_key, max_key)) => {
                             // Create KeyRange before moving min/max into manifest edit
-                            let key_range = KeyRange::new(min_key.clone(), max_key.clone(), segment_id);
+                            let key_range =
+                                KeyRange::new(min_key.clone(), max_key.clone(), segment_id);
 
                             // Log to manifest BEFORE updating version (write-ahead)
                             if let Some(ref manifest_writer) = manifest {
@@ -324,7 +334,8 @@ impl DbStorageState {
                                         tracing::error!(error = ?e, "Failed to write to manifest");
                                     },
                                 }
-                                // Lock released here when manifest_guard goes out of scope
+                                // Lock released here when manifest_guard goes
+                                // out of scope
                             }
 
                             // Register the new L0 Segment with VersionManager
@@ -432,10 +443,7 @@ impl DbStorageState {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new_memtable(&mut self) {
         let next_id = self.curr_memtable.read().clone().id() + 1;
-        let new_table = RwLock::new(Arc::new(Memtable::new(
-            next_id,
-            self.memtable_size,
-        )));
+        let new_table = RwLock::new(Arc::new(Memtable::new(next_id, self.memtable_size)));
 
         // Freeze current memtable and add to frozen queue
         let frozen_memtable = self.curr_memtable.read().clone();

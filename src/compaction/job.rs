@@ -104,15 +104,12 @@ impl CompactionInput {
     /// # Arguments
     /// * `level` - Source level (0 for L0, 1 for L1, etc.)
     /// * `segments` - Segments to compact
-    /// * `key_ranges` - Parallel array of key ranges (from Level's key_ranges field)
+    /// * `key_ranges` - Parallel array of key ranges (from Level's key_ranges
+    ///   field)
     ///
     /// # Panics
     /// Panics if segments is empty or if any segment is missing a key range
-    pub fn with_key_range(
-        level: u8,
-        segments: Vec<Arc<Segment>>,
-        key_ranges: &[KeyRange],
-    ) -> Self {
+    pub fn with_key_range(level: u8, segments: Vec<Arc<Segment>>, key_ranges: &[KeyRange]) -> Self {
         if segments.is_empty() {
             panic!("Cannot create CompactionInput with empty segments");
         }
@@ -126,21 +123,21 @@ impl CompactionInput {
         for seg in &segments {
             if let Some(range) = key_ranges.iter().find(|r| r.segment_id == seg.id()) {
                 match &min_key {
-                    None => min_key = Some(range.start.clone()),
-                    Some(current_min) => {
+                    | None => min_key = Some(range.start.clone()),
+                    | Some(current_min) => {
                         if range.start < *current_min {
                             min_key = Some(range.start.clone());
                         }
-                    }
+                    },
                 }
 
                 match &max_key {
-                    None => max_key = Some(range.end.clone()),
-                    Some(current_max) => {
+                    | None => max_key = Some(range.end.clone()),
+                    | Some(current_max) => {
                         if range.end > *current_max {
                             max_key = Some(range.end.clone());
                         }
-                    }
+                    },
                 }
             }
         }
@@ -515,7 +512,14 @@ mod tests {
 
         let output = CompactionOutput::new(2, 64 * 1024 * 1024);
 
-        let job = CompactionJob::new(1, CompactionJobType::TrivialMove, input, None, output, vec![]);
+        let job = CompactionJob::new(
+            1,
+            CompactionJobType::TrivialMove,
+            input,
+            None,
+            output,
+            vec![],
+        );
 
         assert_eq!(job.write_amplification(), 0.0);
     }

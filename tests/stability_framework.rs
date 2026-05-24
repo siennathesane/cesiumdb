@@ -72,9 +72,9 @@ impl ShadowVerifier {
     pub fn verify_point_read(&mut self, key: &[u8], actual: Option<&[u8]>) -> bool {
         let expected = self.expected.get(key);
         match (expected, actual) {
-            (Some(exp), Some(act)) if exp.as_slice() == act => true,
-            (None, None) => true,
-            (Some(exp), Some(act)) => {
+            | (Some(exp), Some(act)) if exp.as_slice() == act => true,
+            | (None, None) => true,
+            | (Some(exp), Some(act)) => {
                 self.errors.push(format!(
                     "MISMATCH: key={:?} expected_len={} actual_len={}",
                     String::from_utf8_lossy(key),
@@ -83,14 +83,12 @@ impl ShadowVerifier {
                 ));
                 false
             },
-            (Some(_), None) => {
-                self.errors.push(format!(
-                    "MISSING: key={:?}",
-                    String::from_utf8_lossy(key)
-                ));
+            | (Some(_), None) => {
+                self.errors
+                    .push(format!("MISSING: key={:?}", String::from_utf8_lossy(key)));
                 false
             },
-            (None, Some(_)) => {
+            | (None, Some(_)) => {
                 self.errors.push(format!(
                     "UNEXPECTED: key={:?}",
                     String::from_utf8_lossy(key)
@@ -160,15 +158,15 @@ impl ShadowVerifier {
         let mut ok = true;
         for key in self.deleted.keys() {
             match db.get(key) {
-                Ok(None) => {},
-                Ok(Some(_)) => {
+                | Ok(None) => {},
+                | Ok(Some(_)) => {
                     self.errors.push(format!(
                         "TOMBSTONE_LEAK: key={:?} still has value",
                         String::from_utf8_lossy(key)
                     ));
                     ok = false;
                 },
-                Err(e) => {
+                | Err(e) => {
                     self.errors.push(format!(
                         "READ_ERROR: key={:?} error={:?}",
                         String::from_utf8_lossy(key),
@@ -258,7 +256,8 @@ pub struct StabilityMetrics {
     pub space_amp: Option<f64>,
 }
 
-/// Runs a stability test with concurrent writers, readers, and optional scanners.
+/// Runs a stability test with concurrent writers, readers, and optional
+/// scanners.
 ///
 /// Workers update the shared shadow verifier atomically with each DB operation
 /// to ensure the verifier always reflects the intended state.
@@ -294,29 +293,39 @@ pub fn run_stability_test(
                     if rng.random::<f64>() < config.delete_probability {
                         let mut v = verifier.lock().unwrap();
                         match db.delete(&key) {
-                            Ok(_) => {
+                            | Ok(_) => {
                                 v.record_delete(key.clone());
                                 deletes.fetch_add(1, Ordering::Relaxed);
                             },
-                            Err(e) => {
-                                eprintln!("DELETE_ERROR: key={:?} error={:?}", String::from_utf8_lossy(&key), e);
+                            | Err(e) => {
+                                eprintln!(
+                                    "DELETE_ERROR: key={:?} error={:?}",
+                                    String::from_utf8_lossy(&key),
+                                    e
+                                );
                             },
                         }
                     } else {
                         let value = format!("value_{:016}", rng.random::<u64>()).into_bytes();
                         let mut v = verifier.lock().unwrap();
                         match db.put(&key, &value) {
-                            Ok(_) => {
+                            | Ok(_) => {
                                 v.record_write(key.clone(), value.clone());
                                 writes.fetch_add(1, Ordering::Relaxed);
                             },
-                            Err(e) => {
-                                eprintln!("PUT_ERROR: key={:?} error={:?}", String::from_utf8_lossy(&key), e);
+                            | Err(e) => {
+                                eprintln!(
+                                    "PUT_ERROR: key={:?} error={:?}",
+                                    String::from_utf8_lossy(&key),
+                                    e
+                                );
                             },
                         }
                     }
 
-                    thread::sleep(Duration::from_micros(1_000_000 / config.write_rate_hz.max(1)));
+                    thread::sleep(Duration::from_micros(
+                        1_000_000 / config.write_rate_hz.max(1),
+                    ));
                 }
             })
         })
@@ -349,12 +358,20 @@ pub fn run_stability_test(
             thread::spawn(move || {
                 let mut rng = ThreadRng::default();
                 while !shutdown.load(Ordering::Relaxed) {
-                    let start_key = format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
-                    let end_key = format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
+                    let start_key =
+                        format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
+                    let end_key =
+                        format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
                     let (lower, upper) = if start_key <= end_key {
-                        (Bound::Included(start_key.as_slice()), Bound::Included(end_key.as_slice()))
+                        (
+                            Bound::Included(start_key.as_slice()),
+                            Bound::Included(end_key.as_slice()),
+                        )
                     } else {
-                        (Bound::Included(end_key.as_slice()), Bound::Included(start_key.as_slice()))
+                        (
+                            Bound::Included(end_key.as_slice()),
+                            Bound::Included(start_key.as_slice()),
+                        )
                     };
                     let _ = db.scan(lower, upper);
                     scans.fetch_add(1, Ordering::Relaxed);
@@ -386,9 +403,15 @@ pub fn run_stability_test(
     }
 
     shutdown.store(true, Ordering::Relaxed);
-    for w in writers { let _ = w.join(); }
-    for r in readers { let _ = r.join(); }
-    for s in scanners { let _ = s.join(); }
+    for w in writers {
+        let _ = w.join();
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    for s in scanners {
+        let _ = s.join();
+    }
 
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -415,8 +438,8 @@ pub fn run_stability_test(
     }
 }
 
-/// Same as run_stability_test but only does point-read verification during the run.
-/// Delete verification is deferred until after all workers have stopped.
+/// Same as run_stability_test but only does point-read verification during the
+/// run. Delete verification is deferred until after all workers have stopped.
 pub fn run_stability_test_final_verify_only(
     db: Arc<Db>,
     verifier: Arc<Mutex<ShadowVerifier>>,
@@ -448,29 +471,39 @@ pub fn run_stability_test_final_verify_only(
                     if rng.random::<f64>() < config.delete_probability {
                         let mut v = verifier.lock().unwrap();
                         match db.delete(&key) {
-                            Ok(_) => {
+                            | Ok(_) => {
                                 v.record_delete(key.clone());
                                 deletes.fetch_add(1, Ordering::Relaxed);
                             },
-                            Err(e) => {
-                                eprintln!("DELETE_ERROR: key={:?} error={:?}", String::from_utf8_lossy(&key), e);
+                            | Err(e) => {
+                                eprintln!(
+                                    "DELETE_ERROR: key={:?} error={:?}",
+                                    String::from_utf8_lossy(&key),
+                                    e
+                                );
                             },
                         }
                     } else {
                         let value = format!("value_{:016}", rng.random::<u64>()).into_bytes();
                         let mut v = verifier.lock().unwrap();
                         match db.put(&key, &value) {
-                            Ok(_) => {
+                            | Ok(_) => {
                                 v.record_write(key.clone(), value.clone());
                                 writes.fetch_add(1, Ordering::Relaxed);
                             },
-                            Err(e) => {
-                                eprintln!("PUT_ERROR: key={:?} error={:?}", String::from_utf8_lossy(&key), e);
+                            | Err(e) => {
+                                eprintln!(
+                                    "PUT_ERROR: key={:?} error={:?}",
+                                    String::from_utf8_lossy(&key),
+                                    e
+                                );
                             },
                         }
                     }
 
-                    thread::sleep(Duration::from_micros(1_000_000 / config.write_rate_hz.max(1)));
+                    thread::sleep(Duration::from_micros(
+                        1_000_000 / config.write_rate_hz.max(1),
+                    ));
                 }
             })
         })
@@ -501,12 +534,20 @@ pub fn run_stability_test_final_verify_only(
             thread::spawn(move || {
                 let mut rng = ThreadRng::default();
                 while !shutdown.load(Ordering::Relaxed) {
-                    let start_key = format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
-                    let end_key = format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
+                    let start_key =
+                        format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
+                    let end_key =
+                        format!("key_{:010}", rng.random_range(0..config.key_space)).into_bytes();
                     let (lower, upper) = if start_key <= end_key {
-                        (Bound::Included(start_key.as_slice()), Bound::Included(end_key.as_slice()))
+                        (
+                            Bound::Included(start_key.as_slice()),
+                            Bound::Included(end_key.as_slice()),
+                        )
                     } else {
-                        (Bound::Included(end_key.as_slice()), Bound::Included(start_key.as_slice()))
+                        (
+                            Bound::Included(end_key.as_slice()),
+                            Bound::Included(start_key.as_slice()),
+                        )
                     };
                     let _ = db.scan(lower, upper);
                     scans.fetch_add(1, Ordering::Relaxed);
@@ -533,9 +574,15 @@ pub fn run_stability_test_final_verify_only(
     }
 
     shutdown.store(true, Ordering::Relaxed);
-    for w in writers { let _ = w.join(); }
-    for r in readers { let _ = r.join(); }
-    for s in scanners { let _ = s.join(); }
+    for w in writers {
+        let _ = w.join();
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    for s in scanners {
+        let _ = s.join();
+    }
 
     let elapsed = start.elapsed().as_secs_f64();
 

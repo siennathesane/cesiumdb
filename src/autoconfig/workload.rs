@@ -142,7 +142,8 @@ pub fn run_read_benchmark(
                         ops.fetch_add(1, Ordering::Relaxed);
                     }
                     // Occasional write
-                    let key = format!("key_{:010}", worker_key_offset + rng.random_range(0..1000)).into_bytes();
+                    let key = format!("key_{:010}", worker_key_offset + rng.random_range(0..1000))
+                        .into_bytes();
                     let _ = db.put(&key, &value);
                     ops.fetch_add(1, Ordering::Relaxed);
                     bytes_w.fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);

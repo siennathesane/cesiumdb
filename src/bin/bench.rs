@@ -1,8 +1,10 @@
 //! CesiumDB benchmark binary — db_bench equivalent
 //!
 //! Usage:
-//!   cargo run --release --bin bench -- --benchmarks=fillrandom,stats --db=/tmp/cesiumdb_bench
-//!   cargo run --release --bin bench -- --benchmarks=readwhilewriting --db=/tmp/cesiumdb_bench --duration=60 --threads=8
+//!   cargo run --release --bin bench -- --benchmarks=fillrandom,stats
+//! --db=/tmp/cesiumdb_bench   cargo run --release --bin bench --
+//! --benchmarks=readwhilewriting --db=/tmp/cesiumdb_bench --duration=60
+//! --threads=8
 
 use std::{
     env,
@@ -11,15 +13,31 @@ use std::{
     ops::Bound,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
+        Mutex,
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            Ordering,
+        },
     },
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{
+        Duration,
+        Instant,
+        SystemTime,
+    },
 };
 
-use cesiumdb::{Db, DbOptions};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
+use rand::{
+    Rng,
+    SeedableRng,
+    rngs::StdRng,
+};
 
 // ============================================================================
 // CLI Arguments
@@ -105,7 +123,7 @@ fn parse_args() -> Args {
             | "--benchmarks" => {
                 let v = get_val(&mut value, &mut i);
                 args.benchmarks = v.split(',').map(|s| s.to_string()).collect();
-            }
+            },
             | "--db" => args.db = get_val(&mut value, &mut i),
             | "--num" => args.num = get_val(&mut value, &mut i).parse().unwrap(),
             | "--key_size" => args.key_size = get_val(&mut value, &mut i).parse().unwrap(),
@@ -115,35 +133,35 @@ fn parse_args() -> Args {
             | "--writes" => args.writes = get_val(&mut value, &mut i).parse().unwrap(),
             | "--use_existing_db" => {
                 args.use_existing_db = get_val(&mut value, &mut i) == "1";
-            }
+            },
             | "--sync" => args.sync = get_val(&mut value, &mut i) == "1",
             | "--seed" => args.seed = get_val(&mut value, &mut i).parse().unwrap(),
             | "--report_file" => args.report_file = Some(get_val(&mut value, &mut i)),
             | "--memtable_size" => {
                 args.memtable_size = get_val(&mut value, &mut i).parse().unwrap();
-            }
+            },
             | "--max_memtables" => {
                 args.max_memtables = get_val(&mut value, &mut i).parse().unwrap();
-            }
+            },
             | "--block_size" => args.block_size = get_val(&mut value, &mut i).parse().unwrap(),
             | "--target_segment_size" => {
                 args.target_segment_size = get_val(&mut value, &mut i).parse().unwrap();
-            }
+            },
             | "--target_file_size_multiplier" => {
                 args.target_file_size_multiplier = get_val(&mut value, &mut i).parse().unwrap();
-            }
+            },
             | "--l0_trigger" => args.l0_trigger = get_val(&mut value, &mut i).parse().unwrap(),
             | "--l0_stop" => args.l0_stop = get_val(&mut value, &mut i).parse().unwrap(),
             | "--max_background_jobs" => {
                 args.max_background_jobs = get_val(&mut value, &mut i).parse().unwrap();
-            }
+            },
             | "--max_db_size_gb" => {
                 args.max_db_size_gb = get_val(&mut value, &mut i).parse().unwrap();
-            }
+            },
             | _ => {
                 eprintln!("Unknown argument: {}", raw);
                 std::process::exit(1);
-            }
+            },
         }
         i += 1;
     }
@@ -285,7 +303,11 @@ fn open_db(args: &Args) -> Arc<Db> {
 }
 
 fn run_fillseq(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
-    let num = if args.writes > 0 { args.writes } else { args.num };
+    let num = if args.writes > 0 {
+        args.writes
+    } else {
+        args.num
+    };
     let latencies = Arc::new(Mutex::new(Vec::with_capacity(1_000_000)));
     let start = Instant::now();
 
@@ -311,7 +333,11 @@ fn run_fillseq(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
 }
 
 fn run_fillrandom(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
-    let num = if args.writes > 0 { args.writes } else { args.num };
+    let num = if args.writes > 0 {
+        args.writes
+    } else {
+        args.num
+    };
     let threads = args.threads.max(1);
     let ops_per_thread = num / threads as u64;
     let latencies = Arc::new(Mutex::new(Vec::with_capacity(1_000_000)));
@@ -468,11 +494,7 @@ fn run_readwhilewriting(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
     let threads = args.threads.max(2);
     let read_threads = threads / 2;
     let write_threads = threads - read_threads;
-    let duration = if args.duration > 0 {
-        args.duration
-    } else {
-        30
-    };
+    let duration = if args.duration > 0 { args.duration } else { 30 };
 
     let read_ops = Arc::new(AtomicU64::new(0));
     let write_ops = Arc::new(AtomicU64::new(0));
@@ -625,7 +647,11 @@ fn run_stats(db: &Arc<Db>) {
     let vstats = db.version_stats();
     println!("Version sequence: {}", vstats.sequence);
     println!("Total segments: {}", vstats.total_segments);
-    println!("Total size: {} bytes ({:.2} GB)", vstats.total_size, vstats.total_size as f64 / (1024.0 * 1024.0 * 1024.0));
+    println!(
+        "Total size: {} bytes ({:.2} GB)",
+        vstats.total_size,
+        vstats.total_size as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     println!("L0 segments: {}", vstats.l0_segments);
     println!("Num levels: {}", vstats.num_levels);
 
@@ -670,7 +696,10 @@ fn run_waitforcompaction(db: &Arc<Db>, args: &Args) {
     loop {
         if let Ok(stats) = db.compaction_stats() {
             if stats.queued_jobs == 0 && stats.in_progress_jobs == 0 {
-                println!("Compactions finished in {:.1}s", start.elapsed().as_secs_f64());
+                println!(
+                    "Compactions finished in {:.1}s",
+                    start.elapsed().as_secs_f64()
+                );
                 return;
             }
         }
@@ -693,19 +722,19 @@ fn run_benchmark(bench_name: &str, db: &Arc<Db>, args: &Args) -> Option<Benchmar
         | "stats" => {
             run_stats(db);
             None
-        }
+        },
         | "flush" => {
             run_flush(db);
             None
-        }
+        },
         | "waitforcompaction" => {
             run_waitforcompaction(db, args);
             None
-        }
+        },
         | _ => {
             eprintln!("Unknown benchmark: {}", bench_name);
             None
-        }
+        },
     }
 }
 
@@ -719,15 +748,18 @@ fn write_report(report_file: &str, results: &[BenchmarkResult], args: &Args) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    writeln!(file, "# CesiumDB benchmark report — epoch={}", now).unwrap();
     writeln!(
         file,
-        "# CesiumDB benchmark report — epoch={}",
-        now
+        "# db={} num={} key_size={} value_size={} threads={}",
+        args.db, args.num, args.key_size, args.value_size, args.threads
     )
     .unwrap();
-    writeln!(file, "# db={} num={} key_size={} value_size={} threads={}",
-        args.db, args.num, args.key_size, args.value_size, args.threads).unwrap();
-    writeln!(file, "# ops_sec\tmb_sec\tmicros_op\tp50\tp99\tp99.9\tp99.99\ttest").unwrap();
+    writeln!(
+        file,
+        "# ops_sec\tmb_sec\tmicros_op\tp50\tp99\tp99.9\tp99.99\ttest"
+    )
+    .unwrap();
 
     for r in results {
         writeln!(
@@ -760,16 +792,24 @@ fn main() {
         let max_bytes = args.max_db_size_gb * 1024 * 1024 * 1024;
         let bytes_per_key = (args.key_size + args.value_size) as u64;
         args.num = (max_bytes / bytes_per_key) * 90 / 100; // 10% safety margin for LSM overhead
-        println!("MAX_DB_SIZE_GB={} -> NUM_KEYS={} (value_size={} + key_size={})",
-            args.max_db_size_gb, args.num, args.value_size, args.key_size);
+        println!(
+            "MAX_DB_SIZE_GB={} -> NUM_KEYS={} (value_size={} + key_size={})",
+            args.max_db_size_gb, args.num, args.value_size, args.key_size
+        );
     }
 
     let db = open_db(&args);
 
     println!("CesiumDB Benchmark");
     println!("DB: {}", args.db);
-    println!("Keys: {}  Key size: {}  Value size: {}", args.num, args.key_size, args.value_size);
-    println!("Threads: {}  Duration: {}s  Writes: {}", args.threads, args.duration, args.writes);
+    println!(
+        "Keys: {}  Key size: {}  Value size: {}",
+        args.num, args.key_size, args.value_size
+    );
+    println!(
+        "Threads: {}  Duration: {}s  Writes: {}",
+        args.threads, args.duration, args.writes
+    );
     println!();
 
     let mut results = Vec::new();

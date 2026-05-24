@@ -1,11 +1,16 @@
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use stability_framework::{
-    run_stability_test,
     ShadowVerifier,
     StabilityConfig,
+    run_stability_test,
 };
 use tempfile::TempDir;
 
@@ -25,7 +30,7 @@ fn stability_mixed_debug_small_keys() {
         num_writers: 4,
         num_readers: 4,
         num_scanners: 0,
-        key_space: 10_000,  // Small key space like delete_heavy
+        key_space: 10_000, // Small key space like delete_heavy
         value_size: 1024,
         write_rate_hz: 1500,
         verification_interval_ms: 1000,

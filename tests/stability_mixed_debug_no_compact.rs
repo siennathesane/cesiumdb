@@ -1,12 +1,17 @@
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
-use cesiumdb::{Db, DbOptions};
-use cesiumdb::compaction::SchedulerConfig;
+use cesiumdb::{
+    Db,
+    DbOptions,
+    compaction::SchedulerConfig,
+};
 use stability_framework::{
-    run_stability_test,
     ShadowVerifier,
     StabilityConfig,
+    run_stability_test,
 };
 use tempfile::TempDir;
 
@@ -17,7 +22,7 @@ fn stability_mixed_debug_no_compact() {
     let temp_dir = TempDir::new().unwrap();
     let mut opts = DbOptions::default();
     opts.data_dir(temp_dir.path().to_path_buf());
-    
+
     // Disable compactions by setting trigger very high
     let mut scheduler_config = SchedulerConfig::default();
     scheduler_config.l0_compaction_trigger = 10000;
@@ -47,10 +52,20 @@ fn stability_mixed_debug_no_compact() {
     println!("  Verification passes: {}", metrics.verification_passes);
     println!("  Verification failures: {}", metrics.verification_failures);
     if let Some(amp) = metrics.read_amp_stats {
-        let avg_l0 = if amp.total_gets > 0 { amp.l0_segments_checked as f64 / amp.total_gets as f64 } else { 0.0 };
-        let avg_ln = if amp.total_gets > 0 { amp.ln_segments_checked as f64 / amp.total_gets as f64 } else { 0.0 };
-        println!("  Read amp: total_gets={}, avg L0 segments={:.2}, avg L1-L7 segments={:.2}",
-            amp.total_gets, avg_l0, avg_ln);
+        let avg_l0 = if amp.total_gets > 0 {
+            amp.l0_segments_checked as f64 / amp.total_gets as f64
+        } else {
+            0.0
+        };
+        let avg_ln = if amp.total_gets > 0 {
+            amp.ln_segments_checked as f64 / amp.total_gets as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  Read amp: total_gets={}, avg L0 segments={:.2}, avg L1-L7 segments={:.2}",
+            amp.total_gets, avg_l0, avg_ln
+        );
     }
     if let Some(space_amp) = metrics.space_amp {
         println!("  Space amp: {:.2}x", space_amp);
@@ -64,16 +79,16 @@ fn stability_mixed_debug_no_compact() {
     }
 
     db.sync().unwrap();
-    
+
     let mut v = verifier.lock().unwrap();
     v.errors.clear();
     let sample_ok = v.verify_random_sample(&db, 5000);
     let deletes_ok = v.verify_deletes(&db);
-    
+
     println!("Final sample: {}", sample_ok);
     println!("Final deletes: {}", deletes_ok);
     println!("Final errors: {:?}", v.errors);
-    
+
     assert!(sample_ok, "Sample verification failed: {:?}", v.errors);
     assert!(deletes_ok, "Delete verification failed: {:?}", v.errors);
     assert!(v.is_clean(), "Verifier has errors: {:?}", v.errors);

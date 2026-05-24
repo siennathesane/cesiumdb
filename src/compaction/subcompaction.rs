@@ -146,13 +146,11 @@ impl SubcompactionPlanner {
                     key_range: range.clone(),
                     total_size: total_size / num_subcompactions as u64,
                 },
-                next_level_input: job.next_level_input.as_ref().map(|input| {
-                    CompactionInput {
-                        level: input.level,
-                        segments: input.segments.clone(),
-                        key_range: range.clone(),
-                        total_size: input.total_size / num_subcompactions as u64,
-                    }
+                next_level_input: job.next_level_input.as_ref().map(|input| CompactionInput {
+                    level: input.level,
+                    segments: input.segments.clone(),
+                    key_range: range.clone(),
+                    total_size: input.total_size / num_subcompactions as u64,
                 }),
                 output: CompactionOutput::new(
                     job.output.level,

@@ -1,4 +1,7 @@
-use cesiumdb::{Db, DbOptions};
+use cesiumdb::{
+    Db,
+    DbOptions,
+};
 use tempfile::TempDir;
 
 /// Tests that compaction jobs have valid key ranges (not empty placeholders)

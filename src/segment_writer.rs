@@ -319,7 +319,8 @@ impl SegmentWriter {
     }
 
     /// Close the segment writer. This will flush any remaining data to the map,
-    /// truncate the file to the actual written size, and it is now safe to `drop`.
+    /// truncate the file to the actual written size, and it is now safe to
+    /// `drop`.
     #[instrument(level = "trace")]
     pub(crate) fn close(&self) -> Result<(), SegmentError> {
         if self.closed.load(Relaxed) {
@@ -842,6 +843,10 @@ mod tests {
         // Close should truncate the file to the written size
         writer.close().expect("close failed");
 
-        assert_eq!(map.len(), written, "map should be truncated to actual written size");
+        assert_eq!(
+            map.len(),
+            written,
+            "map should be truncated to actual written size"
+        );
     }
 }

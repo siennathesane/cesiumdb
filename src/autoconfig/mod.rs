@@ -11,10 +11,10 @@ use std::{
 };
 
 use crate::{
-    compaction::SchedulerConfig,
-    state::DbStorageBuilder,
     Db,
     DbOptions,
+    compaction::SchedulerConfig,
+    state::DbStorageBuilder,
 };
 
 mod scoring;
@@ -105,7 +105,10 @@ impl Autoconfigurator {
         };
 
         println!("🧪 CesiumDB Autoconfigurator");
-        println!("   Mode: {}", if self.quick_mode { "quick" } else { "full" });
+        println!(
+            "   Mode: {}",
+            if self.quick_mode { "quick" } else { "full" }
+        );
         println!("   Benchmarking baseline configuration...");
 
         let baseline_score = self.benchmark_config(&baseline)?;
@@ -227,7 +230,8 @@ score_threshold = {score_threshold}
 
     /// Benchmarks a single configuration point.
     fn benchmark_config(&self, point: &ConfigPoint) -> Result<Score, AutoconfigError> {
-        let db_path = std::env::temp_dir().join(format!("cesiumdb_autoconfig_{}", std::process::id()));
+        let db_path =
+            std::env::temp_dir().join(format!("cesiumdb_autoconfig_{}", std::process::id()));
         fs::create_dir_all(&db_path)?;
 
         let mut opts = DbOptions::default();
@@ -275,6 +279,10 @@ score_threshold = {score_threshold}
             self.mixed_duration_secs,
         );
 
-        Ok(scoring::compute_score(&write_metrics, &read_metrics, &mixed_metrics))
+        Ok(scoring::compute_score(
+            &write_metrics,
+            &read_metrics,
+            &mixed_metrics,
+        ))
     }
 }

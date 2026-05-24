@@ -1,10 +1,11 @@
 // Debug test to reproduce the key lookup failure
+use std::ops::Bound;
+
 use cesiumdb::{
     Batch::*,
     Db,
     DbOptions,
 };
-use std::ops::Bound;
 use tempfile::TempDir;
 
 #[test]
@@ -45,7 +46,7 @@ fn test_simple_write_and_read() {
     // Try scanning a few keys
     let scan_results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
     println!("Total keys in DB scan: {}", scan_results.len());
-    
+
     // Try reading the first filler key
     let filler_key = format!("filler-key-{:05}", 0).into_bytes();
     let filler_result = db.get(&filler_key).expect("failed to get filler");

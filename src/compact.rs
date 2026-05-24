@@ -64,12 +64,12 @@ fn reopen_segment_for_reading(
     let val_path = output_path.join(val_id.to_string());
 
     let key_map = Arc::new(match Map::open(key_path) {
-        Ok(v) => v,
-        Err(e) => return Err(e),
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
     });
     let val_map = Arc::new(match Map::open(val_path) {
-        Ok(v) => v,
-        Err(e) => return Err(e),
+        | Ok(v) => v,
+        | Err(e) => return Err(e),
     });
 
     let key_metadata = {
@@ -80,8 +80,8 @@ fn reopen_segment_for_reading(
         match key_map.read_range(len - 32..len, |slice| {
             Metadata::from(Bytes::copy_from_slice(slice))
         }) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
         }
     };
 
@@ -93,8 +93,8 @@ fn reopen_segment_for_reading(
         match val_map.read_range(len - 32..len, |slice| {
             Metadata::from(Bytes::copy_from_slice(slice))
         }) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
         }
     };
 
@@ -107,8 +107,8 @@ fn reopen_segment_for_reading(
         }
 
         match key_map.read_range(start..start + size, |slice| Bytes::copy_from_slice(slice)) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
         }
     };
 
@@ -168,7 +168,7 @@ where
             return Err(SegmentError::CantCreateWriter(
                 crate::segment::BlockType::Key,
                 segment_id,
-            ))
+            ));
         },
     };
 
@@ -250,8 +250,8 @@ where
 
     // Reopen the segment for reading so handles are populated
     let reopened = match reopen_segment_for_reading(&output_path, segment_id) {
-        Ok(s) => s,
-        Err(e) => return Err(e),
+        | Ok(s) => s,
+        | Err(e) => return Err(e),
     };
 
     let total_time = start_time.elapsed();
@@ -325,15 +325,11 @@ where
     let mut last_key_bytes: Option<Bytes> = None;
 
     let segment_mut = match Arc::try_unwrap(segment)
-        .map_err(|_| SegmentError::CantCreateWriter(crate::segment::BlockType::Key, segment_id)) {
-
-
+        .map_err(|_| SegmentError::CantCreateWriter(crate::segment::BlockType::Key, segment_id))
+    {
         | Ok(v) => v,
 
-
         | Err(e) => return Err(e),
-
-
     };
 
     let seg = segment_mut;
@@ -410,8 +406,8 @@ where
 
     // Reopen the segment for reading so handles are populated
     let reopened = match reopen_segment_for_reading(&output_path, segment_id) {
-        Ok(s) => s,
-        Err(e) => return Err(e),
+        | Ok(s) => s,
+        | Err(e) => return Err(e),
     };
 
     let total_time = start_time.elapsed();
@@ -473,14 +469,9 @@ pub fn flush_memtable(
     }
 
     let builder = match SegmentBuilder::new(output_path.clone()) {
-
-
         | Ok(v) => v,
 
-
         | Err(e) => return Err(e),
-
-
     };
     let seed = random();
     let segment = match builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE) {
@@ -497,7 +488,7 @@ pub fn flush_memtable(
             return Err(SegmentError::CantCreateWriter(
                 crate::segment::BlockType::Key,
                 segment_id,
-            ))
+            ));
         },
     };
 
@@ -521,8 +512,8 @@ pub fn flush_memtable(
 
     for (key, value) in iter {
         let same_logical_key = match &last_key {
-            Some(prev) => prev.ns() == key.ns() && prev.as_bytes() == key.as_bytes(),
-            None => false,
+            | Some(prev) => prev.ns() == key.ns() && prev.as_bytes() == key.as_bytes(),
+            | None => false,
         };
 
         if same_logical_key {
@@ -567,9 +558,7 @@ pub fn flush_memtable(
 
     // Close the segment (writes index and metadata)
     if let Err(e) = seg.close() {
-
         return Err(e);
-
     }
 
     tracing::info!(
@@ -655,7 +644,8 @@ pub fn flush_memtable(
     let val_block_count = val_metadata.block_count() as u64;
 
     // Create a read-only segment that can be queried
-    let segment = match Segment::open(key_map, key_index, key_id, val_map, val_id, val_block_count) {
+    let segment = match Segment::open(key_map, key_index, key_id, val_map, val_id, val_block_count)
+    {
         | Ok(s) => s,
         | Err(e) => return Err(e),
     };

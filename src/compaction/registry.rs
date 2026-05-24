@@ -86,7 +86,10 @@ impl SegmentRegistry {
 
     /// Gets a segment by ID if it exists
     pub fn get(&self, segment_id: u64) -> Option<Arc<Segment>> {
-        self.segments.read().get(&segment_id).map(|(seg, _)| Arc::clone(seg))
+        self.segments
+            .read()
+            .get(&segment_id)
+            .map(|(seg, _)| Arc::clone(seg))
     }
 
     /// Checks if a segment is currently live
@@ -528,7 +531,10 @@ mod tests {
 
         let (deleted, _) = registry.cleanup();
         assert_eq!(deleted, 0);
-        assert!(path.exists(), "live segment directory should NOT be deleted");
+        assert!(
+            path.exists(),
+            "live segment directory should NOT be deleted"
+        );
     }
 
     #[test]

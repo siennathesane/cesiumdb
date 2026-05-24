@@ -24,9 +24,14 @@ compile_warn!("cesiumdb is not tested on 32-bit systems");
 
 #[allow(unused)]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::{
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
+    thread,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use parking_lot::{
@@ -114,8 +119,8 @@ pub mod version;
 
 /// Wrapper that owns a SegmentReader and its iterator together.
 ///
-/// This solves the lifetime issue where SegmentScanIterator borrows from SegmentReader
-/// by having the iterator own the reader.
+/// This solves the lifetime issue where SegmentScanIterator borrows from
+/// SegmentReader by having the iterator own the reader.
 struct OwnedSegmentIterator {
     // reader is None after the iterator is created (taken by scan)
     reader: Option<segment_reader::SegmentReader>,
@@ -323,7 +328,11 @@ impl Db {
     ///
     /// ```no_run
     /// use std::ops::Bound;
-    /// use cesiumdb::{Db, DbOptions};
+    ///
+    /// use cesiumdb::{
+    ///     Db,
+    ///     DbOptions,
+    /// };
     ///
     /// let db = Db::open(DbOptions::default());
     /// let start = b"key-00000".to_vec();
@@ -777,12 +786,14 @@ impl DbInner {
         use std::ops::Bound;
 
         // Convert bounds to KeyBytes format (with namespace and timestamp)
-        // For namespace isolation, we need to ensure we only scan within the given namespace
+        // For namespace isolation, we need to ensure we only scan within the given
+        // namespace
         //
         // IMPORTANT: KeyBytes serializes timestamps as `u128::MAX - ts`, so:
         // - ts=0 (newest) serializes to MAX (sorts LAST in byte order)
         // - ts=MAX (oldest) serializes to 0 (sorts FIRST in byte order)
-        // Therefore, to scan forward seeing newest versions first, we need ts=MAX in lower bound.
+        // Therefore, to scan forward seeing newest versions first, we need ts=MAX in
+        // lower bound.
         let lower_key = match lower {
             | Bound::Included(k) => {
                 // Start with oldest version (ts=MAX serializes to 0, sorts first)
@@ -804,7 +815,8 @@ impl DbInner {
                 Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), 0))
             },
             | Bound::Excluded(k) => {
-                // Exclude all versions (ts=MAX serializes to 0, sorts first, so excluded bound excludes all)
+                // Exclude all versions (ts=MAX serializes to 0, sorts first, so excluded bound
+                // excludes all)
                 Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
             },
             | Bound::Unbounded => {
@@ -820,7 +832,9 @@ impl DbInner {
         {
             let mtable = self.curr_memtable.read().clone();
             let memtable_iter = mtable.scan(lower_key.clone(), upper_key.clone());
-            iters.push(Box::new(memtable_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+            iters
+                .push(Box::new(memtable_iter)
+                    as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
         }
 
         // 2. Add frozen memtables and segment iterators under a single state lock
@@ -834,11 +848,13 @@ impl DbInner {
 
             let version = guard.version_manager.current();
 
-    // Add L0 segments (can overlap, so all must be scanned)
+            // Add L0 segments (can overlap, so all must be scanned)
             for segment in &version.l0 {
                 if let Ok(reader) = segment.reader() {
-                    let owned_iter = OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
-                    iters.push(Box::new(owned_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+                    let owned_iter =
+                        OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
+                    iters.push(Box::new(owned_iter)
+                        as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
                 }
             }
 
@@ -846,8 +862,10 @@ impl DbInner {
             for level in &version.levels {
                 for segment in &level.segments {
                     if let Ok(reader) = segment.reader() {
-                        let owned_iter = OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
-                        iters.push(Box::new(owned_iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
+                        let owned_iter =
+                            OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
+                        iters.push(Box::new(owned_iter)
+                            as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
                     }
                 }
             }
@@ -855,10 +873,10 @@ impl DbInner {
 
         // Create merge iterator
         let merge_iter = merge::MergeIterator::new(iters);
-        
+
         // Debug: check if merge iterator has any items
         // NOTE: This will consume the first item, so we need to handle that
-        
+
         DbScanIterator {
             inner: merge_iter,
             last_key: None,
@@ -939,7 +957,8 @@ impl DbInner {
                         },
                         | Err(e) => {
                             use crate::errs::MemtableError as MtError;
-                            if matches!(e, MtError::MemtableIsFrozen | MtError::DataExceedsMaximum) {
+                            if matches!(e, MtError::MemtableIsFrozen | MtError::DataExceedsMaximum)
+                            {
                                 last_attempted = new_mtable;
                                 continue; // Retry loop with current memtable
                             }
@@ -977,14 +996,17 @@ impl DbInner {
                                         return Ok(());
                                     }
                                     last_attempted = new_mtable;
-                                }
+                                },
                                 | Err(e) => {
-                                    if matches!(e, MtError::MemtableIsFrozen | MtError::DataExceedsMaximum) {
+                                    if matches!(
+                                        e,
+                                        MtError::MemtableIsFrozen | MtError::DataExceedsMaximum
+                                    ) {
                                         last_attempted = new_mtable;
                                         continue;
                                     }
                                     return Err(MemtableError(e));
-                                }
+                                },
                             }
                         }
                         Ok(())
@@ -1482,10 +1504,9 @@ mod tests {
         db.put(b"e", b"5").unwrap();
 
         // Scan [b, d) should return b and c
-        let results: Vec<_> = db.scan(
-            Bound::Included(b"b"),
-            Bound::Excluded(b"d")
-        ).collect();
+        let results: Vec<_> = db
+            .scan(Bound::Included(b"b"), Bound::Excluded(b"d"))
+            .collect();
 
         assert_eq!(results.len(), 2);
         assert_eq!(&results[0].0[..], b"b");
@@ -1528,7 +1549,11 @@ mod tests {
         db.put(b"d", b"4").unwrap();
 
         let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 4, "Should scan across both frozen and current memtable");
+        assert_eq!(
+            results.len(),
+            4,
+            "Should scan across both frozen and current memtable"
+        );
         assert_eq!(&results[0].0[..], b"a");
         assert_eq!(&results[1].0[..], b"b");
         assert_eq!(&results[2].0[..], b"c");
@@ -1544,17 +1569,21 @@ mod tests {
         // Write in explicit order to track timestamps
         std::thread::sleep(std::time::Duration::from_millis(1));
         db.put(b"key1", b"FIRST").unwrap();
-        
+
         std::thread::sleep(std::time::Duration::from_millis(1));
         db.put(b"key1", b"SECOND").unwrap();
-        
+
         std::thread::sleep(std::time::Duration::from_millis(1));
         db.put(b"key1", b"THIRD_NEWEST").unwrap();
 
         // Scan should return only the newest version
         let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
         assert_eq!(results.len(), 1, "Should have 1 unique key");
-        assert_eq!(&results[0].1[..], b"THIRD_NEWEST", "Should return the newest version");
+        assert_eq!(
+            &results[0].1[..],
+            b"THIRD_NEWEST",
+            "Should return the newest version"
+        );
     }
 
     #[test]

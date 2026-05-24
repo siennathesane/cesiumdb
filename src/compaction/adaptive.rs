@@ -227,7 +227,7 @@ impl AdaptiveExecutor {
 
                     queue.mark_completed(job);
                     active_workers.fetch_sub(1, Ordering::Relaxed);
-                } else{
+                } else {
                     // No jobs available, sleep briefly
                     thread::sleep(Duration::from_millis(10));
                 }
