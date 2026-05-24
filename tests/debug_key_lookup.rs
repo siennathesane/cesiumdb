@@ -4,6 +4,7 @@ use cesiumdb::{
     Db,
     DbOptions,
 };
+use std::ops::Bound;
 use tempfile::TempDir;
 
 #[test]
@@ -36,6 +37,19 @@ fn test_simple_write_and_read() {
 
     // Wait a bit for background flush
     std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Debug: check DB state
+    println!("Version stats: {}", db.version_stats());
+    println!("Frozen memtables: {}", db.frozen_memtable_count());
+
+    // Try scanning a few keys
+    let scan_results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+    println!("Total keys in DB scan: {}", scan_results.len());
+    
+    // Try reading the first filler key
+    let filler_key = format!("filler-key-{:05}", 0).into_bytes();
+    let filler_result = db.get(&filler_key).expect("failed to get filler");
+    println!("Filler key 0 found: {}", filler_result.is_some());
 
     // Try to read the original key
     println!("Reading key: {:?}", String::from_utf8_lossy(key));

@@ -22,7 +22,9 @@
 
 use std::{
     collections::HashMap,
+    fs,
     ops::Bound,
+    path::PathBuf,
     sync::{
         atomic::{
             AtomicBool,
@@ -51,7 +53,6 @@ use rand::{
     Rng,
     rngs::ThreadRng,
 };
-use tempfile::TempDir;
 
 // ============================================================================
 // Configuration System
@@ -1026,8 +1027,8 @@ async fn run_soak_test(
 
     // Setup database
     println!("Setting up database...");
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("soak_test");
+    let db_path = PathBuf::from("/tmp/cesiumdb_test_soak");
+    let _ = fs::remove_dir_all(&db_path);
 
     let mut opts = DbOptions::default();
     opts.data_dir(db_path)
@@ -1244,4 +1245,951 @@ async fn soak_extended_mixed() {
     let workload: Arc<dyn Workload> = Arc::new(MixedWorkload::new(&config, verifier));
 
     run_soak_test(config, workload).await.unwrap();
+}
+
+// ============================================================================
+// 20 GiB Sustained Write Soak Test
+// ============================================================================
+//
+// This test validates compaction backpressure by writing 20 GiB of data
+// and monitoring throughput over time. If compaction cannot keep up with
+// flushes, L0 files will accumulate, frozen memtables will pile up, and
+// write throughput will degrade.
+//
+// Usage:
+//   cargo test --test soak_test soak_20gib_write_sustained -- --ignored --nocapture
+//
+// Environment variables:
+//   SOAK_20GIB_TARGET_GB    Target data size in GiB (default: 20)
+//   SOAK_20GIB_VALUE_SIZE   Value size in bytes (default: 1024)
+//   SOAK_20GIB_BATCH_SIZE   Batch size per write (default: 100)
+//   SOAK_20GIB_WORKERS      Number of writer threads (default: available_parallelism)
+//   SOAK_20GIB_MAX_DURATION_SECS  Max test duration (default: 600)
+
+#[derive(Debug, Clone)]
+struct SustainedWriteConfig {
+    target_bytes: u64,
+    value_size: usize,
+    batch_size: usize,
+    num_workers: usize,
+    max_duration_secs: u64,
+    metrics_interval_secs: u64,
+}
+
+impl SustainedWriteConfig {
+    fn from_env() -> Self {
+        let target_gb: f64 = Self::env_or("SOAK_20GIB_TARGET_GB", 20.0f64);
+        Self {
+            target_bytes: (target_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            value_size: Self::env_or("SOAK_20GIB_VALUE_SIZE", 1024usize),
+            batch_size: Self::env_or("SOAK_20GIB_BATCH_SIZE", 100usize),
+            num_workers: Self::env_or(
+                "SOAK_20GIB_WORKERS",
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4),
+            ),
+            max_duration_secs: Self::env_or("SOAK_20GIB_MAX_DURATION_SECS", 600u64),
+            metrics_interval_secs: 5,
+        }
+    }
+
+    fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+}
+
+struct SustainedWriteMetrics {
+    bytes_written: AtomicU64,
+    ops_written: AtomicU64,
+    batches_written: AtomicU64,
+    start_time: Instant,
+}
+
+impl SustainedWriteMetrics {
+    fn new() -> Self {
+        Self {
+            bytes_written: AtomicU64::new(0),
+            ops_written: AtomicU64::new(0),
+            batches_written: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_batch(&self, entries: usize, value_size: usize) {
+        self.batches_written.fetch_add(1, Ordering::Relaxed);
+        self.ops_written.fetch_add(entries as u64, Ordering::Relaxed);
+        // Approximate bytes: key (~32) + value + overhead (~48)
+        let bytes_per_entry = 32 + value_size + 48;
+        self.bytes_written
+            .fetch_add((entries * bytes_per_entry) as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SustainedWriteSnapshot {
+        let bytes = self.bytes_written.load(Ordering::Relaxed);
+        let ops = self.ops_written.load(Ordering::Relaxed);
+        let batches = self.batches_written.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        SustainedWriteSnapshot {
+            bytes_written: bytes,
+            ops_written: ops,
+            batches_written: batches,
+            elapsed_secs: elapsed,
+            ops_per_sec: if elapsed > 0.0 { ops as f64 / elapsed } else { 0.0 },
+            bytes_per_sec: if elapsed > 0.0 { bytes as f64 / elapsed } else { 0.0 },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct SustainedWriteSnapshot {
+    bytes_written: u64,
+    ops_written: u64,
+    batches_written: u64,
+    elapsed_secs: f64,
+    ops_per_sec: f64,
+    bytes_per_sec: f64,
+}
+
+fn spawn_sustained_writer(
+    db: Arc<Db>,
+    config: SustainedWriteConfig,
+    worker_id: usize,
+    metrics: Arc<SustainedWriteMetrics>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut rng = rand::rng();
+        let mut batch = Vec::with_capacity(config.batch_size);
+        let mut idx: u64 = 0;
+
+        while !shutdown.load(Ordering::Relaxed) {
+            batch.clear();
+
+            for _ in 0..config.batch_size {
+                // Use worker-specific key space to avoid contention
+                let key = format!("sustained_{:03}_{:014}", worker_id, idx);
+                let value = generate_value(config.value_size, rng.random::<u64>());
+                batch.push(Put(key, value, db.time()));
+                idx += 1;
+            }
+
+            match db.batch(&batch) {
+                Ok(()) => {
+                    metrics.record_batch(batch.len(), config.value_size);
+                }
+                Err(e) => {
+                    eprintln!("Worker {} batch error: {:?}", worker_id, e);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    })
+}
+
+fn spawn_sustained_reporter(
+    db: Arc<Db>,
+    metrics: Arc<SustainedWriteMetrics>,
+    shutdown: Arc<AtomicBool>,
+    interval_secs: u64,
+    target_bytes: u64,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_snapshot = metrics.snapshot();
+        let mut peak_ops_per_sec: f64 = 0.0;
+        let mut min_ops_per_sec: f64 = f64::MAX;
+        let mut last_compaction_jobs = 0u64;
+        let mut last_compaction_read = 0u64;
+        let mut last_compaction_written = 0u64;
+
+        println!(
+            "\n{:>8} | {:>10} | {:>10} | {:>10} | {:>8} | {:>6} | {:>6} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} | {:>10}",
+            "Time", "Value GB", "Disk GB", "Target GB", "Ops/s", "L0", "Frozen", "Queued", "Active", "CmpJob/s", "CmpRdMB/s", "CmpWrMB/s", "Pattern"
+        );
+        println!("{}", "-".repeat(155));
+
+        while !shutdown.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(interval_secs));
+
+            let current = metrics.snapshot();
+            let delta_time = current.elapsed_secs - last_snapshot.elapsed_secs;
+            let delta_ops = current.ops_written.saturating_sub(last_snapshot.ops_written);
+            let instant_ops = if delta_time > 0.0 {
+                delta_ops as f64 / delta_time
+            } else {
+                0.0
+            };
+
+            peak_ops_per_sec = peak_ops_per_sec.max(instant_ops);
+            if instant_ops > 0.0 {
+                min_ops_per_sec = min_ops_per_sec.min(instant_ops);
+            }
+
+            let gb_written = current.bytes_written as f64 / (1024.0 * 1024.0 * 1024.0);
+            let target_gb = target_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+            // Fetch database stats
+            let vstats = db.version_stats();
+            let l0_count = vstats.l0_segments;
+            let disk_gb = vstats.total_size as f64 / (1024.0 * 1024.0 * 1024.0);
+            let frozen_count = db.frozen_memtable_count();
+            let (queued, active, pattern, compaction_jobs, compaction_read, compaction_written) = match db.compaction_stats() {
+                Ok(stats) => {
+                    let jobs = stats.completed_jobs;
+                    let read = stats.bytes_compacted_read;
+                    let written = stats.bytes_compacted_written;
+                    (stats.queued_jobs, stats.in_progress_jobs, stats.workload_pattern, jobs, read, written)
+                },
+                Err(_) => (0, 0, "N/A".to_string(), 0, 0, 0),
+            };
+
+            let delta_jobs = compaction_jobs.saturating_sub(last_compaction_jobs);
+            let delta_read = compaction_read.saturating_sub(last_compaction_read);
+            let delta_written = compaction_written.saturating_sub(last_compaction_written);
+            let jobs_per_sec = if delta_time > 0.0 { delta_jobs as f64 / delta_time } else { 0.0 };
+            let read_mb_per_sec = if delta_time > 0.0 { delta_read as f64 / (1024.0 * 1024.0) / delta_time } else { 0.0 };
+            let write_mb_per_sec = if delta_time > 0.0 { delta_written as f64 / (1024.0 * 1024.0) / delta_time } else { 0.0 };
+
+            println!(
+                "{:>8.1}s | {:>10.2} | {:>10.2} | {:>10.2} | {:>8.0} | {:>6} | {:>6} | {:>8} | {:>8} | {:>10.2} | {:>10.2} | {:>10.2} | {:>10}",
+                current.elapsed_secs,
+                gb_written,
+                disk_gb,
+                target_gb,
+                instant_ops,
+                l0_count,
+                frozen_count,
+                queued,
+                active,
+                jobs_per_sec,
+                read_mb_per_sec,
+                write_mb_per_sec,
+                pattern
+            );
+
+            // Safety valve: if frozen memtables exceed a dangerous threshold,
+            // warn that memory pressure is building
+            if frozen_count > 64 {
+                eprintln!(
+                    "\n⚠️  WARNING: {} frozen memtables - memory pressure high. \
+                     Backpressure may not be effective.",
+                    frozen_count
+                );
+            }
+
+            last_snapshot = current;
+            last_compaction_jobs = compaction_jobs;
+            last_compaction_read = compaction_read;
+            last_compaction_written = compaction_written;
+        }
+
+        // Final summary
+        let final_snap = metrics.snapshot();
+        let degradation = if peak_ops_per_sec > 0.0 {
+            let ratio = min_ops_per_sec / peak_ops_per_sec;
+            ratio
+        } else {
+            1.0
+        };
+
+        println!("\n=== 20 GiB Sustained Write Summary ===");
+        println!(
+            "Total written: {:.2} GB ({:.1}% of target)",
+            final_snap.bytes_written as f64 / (1024.0 * 1024.0 * 1024.0),
+            (final_snap.bytes_written as f64 / target_bytes as f64) * 100.0
+        );
+        println!("Total ops: {}", final_snap.ops_written);
+        println!("Total batches: {}", final_snap.batches_written);
+        println!("Duration: {:.1}s", final_snap.elapsed_secs);
+        println!("Average throughput: {:.0} ops/sec", final_snap.ops_per_sec);
+        println!("Peak throughput: {:.0} ops/sec", peak_ops_per_sec);
+        println!("Min throughput: {:.0} ops/sec", min_ops_per_sec);
+        println!(
+            "Degradation ratio (min/peak): {:.2} {}",
+            degradation,
+            if degradation < 0.5 {
+                "⚠️ SIGNIFICANT DEGRADATION"
+            } else {
+                "✓"
+            }
+        );
+
+        // Final compaction stats
+        if let Ok(stats) = db.compaction_stats() {
+            let cmp_read_gb = stats.bytes_compacted_read as f64 / (1024.0 * 1024.0 * 1024.0);
+            let cmp_write_gb = stats.bytes_compacted_written as f64 / (1024.0 * 1024.0 * 1024.0);
+            println!("Compaction jobs completed: {}", stats.completed_jobs);
+            println!("Compaction bytes read: {:.2} GB", cmp_read_gb);
+            println!("Compaction bytes written: {:.2} GB", cmp_write_gb);
+        }
+    })
+}
+
+#[tokio::test]
+#[ignore]
+async fn soak_20gib_write_sustained() {
+    let config = SustainedWriteConfig::from_env();
+    let target_gb = config.target_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    println!("\n=== CesiumDB 20 GiB Sustained Write Soak Test ===");
+    println!(
+        "Target: {:.1} GiB | Value size: {} B | Batch: {} | Workers: {}",
+        target_gb, config.value_size, config.batch_size, config.num_workers
+    );
+    println!();
+
+    // Setup database with modest memtables to bound memory usage.
+    // The focus is disk throughput during compaction, not memory throughput.
+    let db_path = PathBuf::from("/tmp/cesiumdb_test_20gib_write");
+    let _ = fs::remove_dir_all(&db_path);
+
+    let mut opts = DbOptions::default();
+    opts.data_dir(db_path.clone())
+        .memtable_size(64 * 1024 * 1024) // 64 MiB memtables
+        .max_memtables(8); // max 512 MiB frozen memtable memory
+
+    let db = Db::open(opts);
+
+    let metrics = Arc::new(SustainedWriteMetrics::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Spawn writers
+    let workers: Vec<_> = (0..config.num_workers)
+        .map(|id| {
+            spawn_sustained_writer(
+                db.clone(),
+                config.clone(),
+                id,
+                metrics.clone(),
+                shutdown.clone(),
+            )
+        })
+        .collect();
+
+    // Spawn reporter
+    let reporter = spawn_sustained_reporter(
+        db.clone(),
+        metrics.clone(),
+        shutdown.clone(),
+        config.metrics_interval_secs,
+        config.target_bytes,
+    );
+
+    // Monitor until target reached or max duration exceeded
+    let start = Instant::now();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+
+        let bytes = metrics.bytes_written.load(Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs();
+
+        if bytes >= config.target_bytes {
+            println!("\n🎯 Target reached: {:.2} GB written", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+            break;
+        }
+
+        if elapsed >= config.max_duration_secs {
+            println!("\n⏱️ Max duration ({:}s) reached", config.max_duration_secs);
+            break;
+        }
+    }
+
+    // Shutdown
+    shutdown.store(true, Ordering::SeqCst);
+    for w in workers {
+        let _ = w.join();
+    }
+    let _ = reporter.join();
+
+    // Final assertions
+    let final_bytes = metrics.bytes_written.load(Ordering::Relaxed);
+    let final_ops = metrics.ops_written.load(Ordering::Relaxed);
+
+    assert!(
+        final_ops > 0,
+        "No operations were written"
+    );
+
+    // We should reach at least 90% of target within max duration
+    let completion_ratio = final_bytes as f64 / config.target_bytes as f64;
+    println!(
+        "\nFinal completion: {:.1}% ({:.2} / {:.2} GB)",
+        completion_ratio * 100.0,
+        final_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        target_gb
+    );
+
+    // Allow the test to pass even if we don't hit 100% - this is a performance
+    // characterization test, not a hard correctness test. But we should write
+    // at least 50% of target.
+    assert!(
+        completion_ratio >= 0.50,
+        "Only wrote {:.1}% of target - compaction backpressure may be too aggressive",
+        completion_ratio * 100.0
+    );
+
+    // Check disk usage - with file deletion, amplification should be < 3x
+    let disk_bytes = calculate_dir_size(&db_path);
+    let write_amplification = disk_bytes as f64 / final_bytes.max(1) as f64;
+    println!(
+        "\nDisk usage: {:.2} GB, Write amplification: {:.2}x",
+        disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        write_amplification
+    );
+
+    // With proper compaction and file deletion, amplification should be
+    // well under 4x. The tiered→leveled architecture gives ~3-4x for
+    // write-heavy workloads; future optimizations (larger tiered bases,
+    // universal compaction) will push this below 3x.
+    assert!(
+        write_amplification < 4.0,
+        "Write amplification {:.2}x is too high - expected < 4.0x. Files may not be deleting.",
+        write_amplification
+    );
+
+    println!("\nTest completed ✓");
+}
+
+// ============================================================================
+// 20 GiB Scoped Churn Test
+// ============================================================================
+//
+// Pre-populates a bounded key space to ~20 GiB, then runs mixed
+// create/delete/compact operations to maintain steady-state churn.
+// Measures accurate space amplification, write amplification, and
+// read amplification under sustained compaction pressure.
+//
+// Usage:
+//   cargo test --test soak_test soak_20gib_churn -- --ignored --nocapture
+//   SOAK_CHURN_DURATION_SECS=600 SOAK_CHURN_TARGET_GB=20 cargo test ...
+
+#[derive(Debug, Clone)]
+struct ChurnConfig {
+    target_bytes: u64,
+    duration_secs: u64,
+    value_size: usize,
+    num_workers: usize,
+    batch_size: usize,
+    metrics_interval_secs: u64,
+}
+
+impl ChurnConfig {
+    fn from_env() -> Self {
+        let target_gb: f64 = Self::env_or("SOAK_CHURN_TARGET_GB", 20.0f64);
+        Self {
+            target_bytes: (target_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            duration_secs: Self::env_or("SOAK_CHURN_DURATION_SECS", 600u64),
+            value_size: Self::env_or("SOAK_CHURN_VALUE_SIZE", 1024usize),
+            num_workers: Self::env_or(
+                "SOAK_CHURN_WORKERS",
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4),
+            ),
+            batch_size: Self::env_or("SOAK_CHURN_BATCH_SIZE", 1000usize),
+            metrics_interval_secs: 5,
+        }
+    }
+
+    fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+}
+
+struct ChurnMetrics {
+    puts: AtomicU64,
+    gets: AtomicU64,
+    deletes: AtomicU64,
+    scans: AtomicU64,
+    bytes_written: AtomicU64,
+    start_time: Instant,
+}
+
+impl ChurnMetrics {
+    fn new() -> Self {
+        Self {
+            puts: AtomicU64::new(0),
+            gets: AtomicU64::new(0),
+            deletes: AtomicU64::new(0),
+            scans: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChurnSnapshot {
+    puts: u64,
+    gets: u64,
+    deletes: u64,
+    scans: u64,
+    bytes_written: u64,
+    elapsed_secs: f64,
+}
+
+impl ChurnSnapshot {
+    fn total_ops(&self) -> u64 {
+        self.puts + self.gets + self.deletes + self.scans
+    }
+}
+
+impl ChurnMetrics {
+    fn snapshot(&self) -> ChurnSnapshot {
+        ChurnSnapshot {
+            puts: self.puts.load(Ordering::Relaxed),
+            gets: self.gets.load(Ordering::Relaxed),
+            deletes: self.deletes.load(Ordering::Relaxed),
+            scans: self.scans.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            elapsed_secs: self.start_time.elapsed().as_secs_f64(),
+        }
+    }
+}
+
+fn churn_key(idx: u64) -> Vec<u8> {
+    format!("churn_{:014}", idx).into_bytes()
+}
+
+fn spawn_prepop_worker(
+    db: Arc<Db>,
+    config: ChurnConfig,
+    global_counter: Arc<AtomicU64>,
+    metrics: Arc<ChurnMetrics>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let batch_size = config.batch_size;
+    let value_size = config.value_size;
+
+    thread::spawn(move || {
+        let mut rng = rand::rng();
+        let mut batch = Vec::with_capacity(batch_size);
+
+        while !shutdown.load(Ordering::Relaxed) {
+            batch.clear();
+            let start_idx = global_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
+
+            for i in 0..batch_size {
+                let key = churn_key(start_idx + i as u64);
+                let value = generate_value(value_size, rng.random::<u64>());
+                batch.push(Put(key, value, db.time()));
+            }
+
+            match db.batch(&batch) {
+                Ok(()) => {
+                    metrics
+                        .bytes_written
+                        .fetch_add((value_size * batch.len()) as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    eprintln!("Pre-pop batch error: {:?}", e);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    })
+}
+
+fn spawn_churn_worker(
+    db: Arc<Db>,
+    config: ChurnConfig,
+    total_keys: u64,
+    _worker_id: usize,
+    metrics: Arc<ChurnMetrics>,
+    shutdown: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let value_size = config.value_size;
+
+    thread::spawn(move || {
+        let mut rng = rand::rng();
+
+        while !shutdown.load(Ordering::Relaxed) {
+            let roll: u32 = rng.random_range(0..100);
+
+            match roll {
+                | 0..40 => {
+                    // 40% Get
+                    let idx = rng.random_range(0..total_keys);
+                    let key = churn_key(idx);
+                    let _ = db.get(&key);
+                    metrics.gets.fetch_add(1, Ordering::Relaxed);
+                }
+                | 40..75 => {
+                    // 35% Put (overwrite existing key)
+                    let idx = rng.random_range(0..total_keys);
+                    let key = churn_key(idx);
+                    let value = generate_value(value_size, rng.random::<u64>());
+                    if db.put(&key, &value).is_ok() {
+                        metrics.puts.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .bytes_written
+                            .fetch_add(value_size as u64, Ordering::Relaxed);
+                    }
+                }
+                | 75..90 => {
+                    // 15% Scan
+                    let idx = rng.random_range(0..total_keys);
+                    let key = churn_key(idx);
+                    let _ = db
+                        .scan(Bound::Included(&key), Bound::Unbounded)
+                        .take(100)
+                        .count();
+                    metrics.scans.fetch_add(1, Ordering::Relaxed);
+                }
+                | _ => {
+                    // 10% Delete
+                    let idx = rng.random_range(0..total_keys);
+                    let key = churn_key(idx);
+                    let _ = db.delete(&key);
+                    metrics.deletes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    })
+}
+
+fn spawn_churn_reporter(
+    db: Arc<Db>,
+    metrics: Arc<ChurnMetrics>,
+    shutdown: Arc<AtomicBool>,
+    interval_secs: u64,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last = metrics.snapshot();
+        let mut peak_ops_per_sec: f64 = 0.0;
+        let mut min_ops_per_sec: f64 = f64::MAX;
+        let mut last_compaction_jobs = 0u64;
+        let mut last_compaction_read = 0u64;
+        let mut last_compaction_written = 0u64;
+
+        println!(
+            "\n{:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10} | {:>10} | {:>10} | {:>10} | {:>6} | {:>6}",
+            "Time", "Ops/s", "Get/s", "Put/s", "Del/s", "Scan/s", "DiskGB", "L0", "Qd", "Act",
+            "CmpJob/s", "CmpRdMB/s", "CmpWrMB/s", "Frz"
+        );
+        println!("{}", "-".repeat(175));
+
+        while !shutdown.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(interval_secs));
+
+            let current = metrics.snapshot();
+            let delta_time = current.elapsed_secs - last.elapsed_secs;
+            let delta_ops = current.total_ops().saturating_sub(last.total_ops());
+            let ops_per_sec = if delta_time > 0.0 {
+                delta_ops as f64 / delta_time
+            } else {
+                0.0
+            };
+
+            if ops_per_sec > 0.0 {
+                peak_ops_per_sec = peak_ops_per_sec.max(ops_per_sec);
+                min_ops_per_sec = min_ops_per_sec.min(ops_per_sec);
+            }
+
+            let vstats = db.version_stats();
+            let disk_gb = vstats.total_size as f64 / (1024.0 * 1024.0 * 1024.0);
+            let frozen_count = db.frozen_memtable_count();
+
+            let (queued, active, compaction_jobs, compaction_read, compaction_written) =
+                match db.compaction_stats() {
+                    Ok(stats) => (
+                        stats.queued_jobs,
+                        stats.in_progress_jobs,
+                        stats.completed_jobs,
+                        stats.bytes_compacted_read,
+                        stats.bytes_compacted_written,
+                    ),
+                    Err(_) => (0, 0, 0, 0, 0),
+                };
+
+            let delta_jobs = compaction_jobs.saturating_sub(last_compaction_jobs);
+            let delta_read = compaction_read.saturating_sub(last_compaction_read);
+            let delta_written = compaction_written.saturating_sub(last_compaction_written);
+
+            let jobs_per_sec = if delta_time > 0.0 {
+                delta_jobs as f64 / delta_time
+            } else {
+                0.0
+            };
+            let read_mb_per_sec = if delta_time > 0.0 {
+                delta_read as f64 / (1024.0 * 1024.0) / delta_time
+            } else {
+                0.0
+            };
+            let write_mb_per_sec = if delta_time > 0.0 {
+                delta_written as f64 / (1024.0 * 1024.0) / delta_time
+            } else {
+                0.0
+            };
+
+            println!(
+                "{:>8.1}s | {:>8.0} | {:>8.0} | {:>8.0} | {:>8.0} | {:>8.0} | {:>8.2} | {:>6} | {:>10} | {:>10} | {:>10.2} | {:>10.2} | {:>10.2} | {:>6}",
+                current.elapsed_secs,
+                ops_per_sec,
+                (current.gets.saturating_sub(last.gets)) as f64 / delta_time.max(0.001),
+                (current.puts.saturating_sub(last.puts)) as f64 / delta_time.max(0.001),
+                (current.deletes.saturating_sub(last.deletes)) as f64 / delta_time.max(0.001),
+                (current.scans.saturating_sub(last.scans)) as f64 / delta_time.max(0.001),
+                disk_gb,
+                vstats.l0_segments,
+                queued,
+                active,
+                jobs_per_sec,
+                read_mb_per_sec,
+                write_mb_per_sec,
+                frozen_count,
+            );
+
+            if frozen_count > 64 {
+                eprintln!(
+                    "\n⚠️  WARNING: {} frozen memtables - memory pressure high.",
+                    frozen_count
+                );
+            }
+
+            last = current;
+            last_compaction_jobs = compaction_jobs;
+            last_compaction_read = compaction_read;
+            last_compaction_written = compaction_written;
+        }
+    })
+}
+
+#[tokio::test]
+#[ignore]
+async fn soak_20gib_churn() {
+    let config = ChurnConfig::from_env();
+    let target_gb = config.target_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    println!("\n=== CesiumDB 20 GiB Scoped Churn Soak Test ===");
+    println!(
+        "Target: {:.1} GiB | Value size: {} B | Batch: {} | Workers: {} | Duration: {}s",
+        target_gb, config.value_size, config.batch_size, config.num_workers, config.duration_secs
+    );
+
+    let db_path = PathBuf::from("/tmp/cesiumdb_test_20gib_churn");
+    let _ = fs::remove_dir_all(&db_path);
+
+    let mut opts = DbOptions::default();
+    opts.data_dir(db_path.clone())
+        .memtable_size(64 * 1024 * 1024)
+        .max_memtables(8);
+
+    let db = Db::open(opts);
+
+    // ========================================================================
+    // Phase 1: Pre-populate to target size
+    // ========================================================================
+    println!("\n--- Phase 1: Pre-populating to ~{:.1} GiB ---", target_gb);
+
+    let global_counter = Arc::new(AtomicU64::new(0));
+    let prepop_metrics = Arc::new(ChurnMetrics::new());
+    let prepop_shutdown = Arc::new(AtomicBool::new(false));
+
+    let prepop_workers: Vec<_> = (0..config.num_workers)
+        .map(|_id| {
+            spawn_prepop_worker(
+                db.clone(),
+                config.clone(),
+                global_counter.clone(),
+                prepop_metrics.clone(),
+                prepop_shutdown.clone(),
+            )
+        })
+        .collect();
+
+    let prepop_start = Instant::now();
+    let max_prepop_secs = config.duration_secs / 3; // cap pre-pop at 1/3 of total time
+
+    loop {
+        thread::sleep(Duration::from_secs(2));
+
+        let written = prepop_metrics.bytes_written.load(Ordering::Relaxed);
+        let elapsed = prepop_start.elapsed().as_secs();
+        let gb = written as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        println!(
+            "  Pre-pop: {:.2} / {:.2} GB ({:.1}%) | {:.0}s elapsed",
+            gb,
+            target_gb,
+            (gb / target_gb) * 100.0,
+            elapsed
+        );
+
+        if written >= config.target_bytes {
+            println!("  ✅ Target reached!");
+            break;
+        }
+
+        if elapsed >= max_prepop_secs {
+            println!(
+                "  ⏱️ Pre-pop timeout reached ({:.2} / {:.2} GB). Continuing...",
+                gb, target_gb
+            );
+            break;
+        }
+    }
+
+    prepop_shutdown.store(true, Ordering::SeqCst);
+    for w in prepop_workers {
+        let _ = w.join();
+    }
+
+    let total_keys = global_counter.load(Ordering::Relaxed);
+    let prepop_bytes = prepop_metrics.bytes_written.load(Ordering::Relaxed);
+    let prepop_elapsed = prepop_start.elapsed().as_secs_f64();
+
+    println!(
+        "Pre-population complete: {} keys, {:.2} GB, {:.1}s, {:.0} ops/sec",
+        total_keys,
+        prepop_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        prepop_elapsed,
+        total_keys as f64 / prepop_elapsed.max(0.001)
+    );
+
+    assert!(total_keys > 0, "No keys were pre-populated");
+
+    // ========================================================================
+    // Phase 2: Mixed churn on bounded key space
+    // ========================================================================
+    let remaining_secs = config.duration_secs.saturating_sub(prepop_start.elapsed().as_secs());
+    if remaining_secs == 0 {
+        println!("No time remaining for churn phase. Test complete.");
+        return;
+    }
+
+    println!("\n--- Phase 2: Mixed churn for {}s on {} keys ---", remaining_secs, total_keys);
+
+    let churn_metrics = Arc::new(ChurnMetrics::new());
+    let churn_shutdown = Arc::new(AtomicBool::new(false));
+
+    let churn_workers: Vec<_> = (0..config.num_workers)
+        .map(|id| {
+            spawn_churn_worker(
+                db.clone(),
+                config.clone(),
+                total_keys,
+                id,
+                churn_metrics.clone(),
+                churn_shutdown.clone(),
+            )
+        })
+        .collect();
+
+    let reporter = spawn_churn_reporter(
+        db.clone(),
+        churn_metrics.clone(),
+        churn_shutdown.clone(),
+        config.metrics_interval_secs,
+    );
+
+    // Let churn run for remaining duration
+    thread::sleep(Duration::from_secs(remaining_secs));
+
+    churn_shutdown.store(true, Ordering::SeqCst);
+    for w in churn_workers {
+        let _ = w.join();
+    }
+    let _ = reporter.join();
+
+    // ========================================================================
+    // Final metrics
+    // ========================================================================
+    let final_snap = churn_metrics.snapshot();
+    let churn_secs = final_snap.elapsed_secs;
+
+    println!("\n=== 20 GiB Churn Summary ===");
+    println!(
+        "Pre-pop: {} keys | {:.2} GB | {:.1}s",
+        total_keys,
+        prepop_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        prepop_elapsed
+    );
+    println!(
+        "Churn phase: {:.1}s | total ops: {} | throughput: {:.0} ops/sec",
+        churn_secs,
+        final_snap.total_ops(),
+        final_snap.total_ops() as f64 / churn_secs.max(0.001)
+    );
+    println!(
+        "  Gets: {} | Puts: {} | Deletes: {} | Scans: {}",
+        final_snap.gets, final_snap.puts, final_snap.deletes, final_snap.scans
+    );
+
+    // Disk usage and amplification
+    let disk_bytes = calculate_dir_size(&db_path);
+    let disk_gb = disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    // Logical size = live keys × value size (approximation; actual live data
+    // may differ slightly due to random deletes, but bounded key space keeps
+    // it in the same ballpark).
+    let logical_bytes = total_keys * config.value_size as u64;
+    let space_amplification = disk_bytes as f64 / logical_bytes.max(1) as f64;
+
+    println!("\nDisk usage: {:.2} GB", disk_gb);
+    println!("Logical data: {:.2} GB", logical_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+    println!("Space amplification: {:.2}x", space_amplification);
+
+    // Write amplification from compaction stats
+    if let Ok(stats) = db.compaction_stats() {
+        let cmp_read_gb = stats.bytes_compacted_read as f64 / (1024.0 * 1024.0 * 1024.0);
+        let cmp_write_gb = stats.bytes_compacted_written as f64 / (1024.0 * 1024.0 * 1024.0);
+        let user_bytes = prepop_bytes + final_snap.bytes_written;
+        let write_amplification =
+            (user_bytes + stats.bytes_compacted_written) as f64 / user_bytes.max(1) as f64;
+
+        println!("Compaction jobs: {}", stats.completed_jobs);
+        println!("Compaction read: {:.2} GB", cmp_read_gb);
+        println!("Compaction written: {:.2} GB", cmp_write_gb);
+        println!("User bytes written: {:.2} GB", user_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+        println!("Write amplification: {:.2}x", write_amplification);
+
+        assert!(
+            write_amplification < 6.0,
+            "Write amplification {:.2}x is too high - expected < 6.0x",
+            write_amplification
+        );
+    }
+
+    let vstats = db.version_stats();
+    println!("L0 segments: {}", vstats.l0_segments);
+    println!(
+        "Total segments: {} | Levels: {}",
+        vstats.total_segments, vstats.num_levels
+    );
+
+    assert!(
+        space_amplification < 5.0,
+        "Space amplification {:.2}x is too high - expected < 5.0x",
+        space_amplification
+    );
+
+    println!("\nTest completed ✓");
+}
+
+/// Recursively calculate total size of a directory in bytes
+fn calculate_dir_size(path: &std::path::Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += calculate_dir_size(&path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }

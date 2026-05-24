@@ -115,7 +115,7 @@ impl CompactionTestData {
             let path = self
                 .output_dir
                 .path()
-                .join("sstables")
+                .join("segments")
                 .join(idx.to_string());
             let segment_id = idx as u64 + 1;
 
@@ -159,7 +159,7 @@ fn bench_full_compaction_throughput(c: &mut Criterion) {
                                 .collect();
 
                             let iterators: Vec<_> = readers
-                                .iter()
+                                .into_iter()
                                 .map(|reader| {
                                     reader
                                         .scan(Bound::Unbounded, Bound::Unbounded)
@@ -213,7 +213,7 @@ fn bench_compaction_with_overlap(c: &mut Criterion) {
                             .collect();
 
                         let iterators: Vec<_> = readers
-                            .iter()
+                            .into_iter()
                             .map(|reader| {
                                 reader
                                     .scan(Bound::Unbounded, Bound::Unbounded)
@@ -270,7 +270,7 @@ fn bench_compaction_with_tombstones(c: &mut Criterion) {
                             .collect();
 
                         let iterators: Vec<_> = readers
-                            .iter()
+                            .into_iter()
                             .map(|reader| {
                                 reader
                                     .scan(Bound::Unbounded, Bound::Unbounded)
@@ -361,8 +361,8 @@ fn bench_queue_operations(c: &mut Criterion) {
             // Dequeue all
             let mut count = 0;
             while let Some(job) = queue.dequeue() {
-                black_box(job);
-                queue.mark_completed();
+                black_box(&job);
+                queue.mark_completed(job);
                 count += 1;
             }
 
@@ -393,7 +393,7 @@ fn create_dummy_job(id: u64) -> CompactionJob {
 
     let output = CompactionOutput::new(1, 64 * 1024 * 1024);
 
-    CompactionJob::new(id, CompactionJobType::Flush, input, None, output)
+    CompactionJob::new(id, CompactionJobType::Flush, input, None, output, vec![])
 }
 
 criterion_group!(
