@@ -1,7 +1,10 @@
 [package]
 name = "cesiumdb"
+description = "Blazing fast, persistent key-value store for Rust"
+license = "GPL-3.0"
+repository = "https://github.com/siennathesane/cesiumdb"
 authors = ["Sienna Meridian Satterwhite <sienna@r3t.io>"]
-version = "0.0.5"
+version = "0.1.0"
 edition = "2024"
 
 [lints.rust]
@@ -16,7 +19,6 @@ benchmarks = []
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 
 [dependencies]
-bloom2 = { git = "https://github.com/domodwyer/bloom2.git", rev = "4154df9347fa0c28c3420635e6603e26e8a9a58c", features = ["bytes"] } # no support yet, might just permanently vendor
 bytes = "1.9"# no_std support
 crc32fast = "1.4" # no_std support
 crossbeam-channel = "0.5" # no_std might be supported soon?

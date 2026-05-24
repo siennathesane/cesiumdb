@@ -16,7 +16,7 @@ use std::{
     thread,
 };
 
-use bloom2::{
+use crate::bloom::{
     Bloom2,
     BloomFilterBuilder,
     CompressedBitmap,

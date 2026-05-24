@@ -75,6 +75,8 @@ pub(crate) mod block;
 
 mod block_alloc;
 
+mod bloom;
+
 #[cfg(feature = "benchmarks")]
 pub mod compact;
 #[cfg(not(feature = "benchmarks"))]

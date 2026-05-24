@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use bloom2::{
+use crate::bloom::{
     Bloom2,
     BloomFilterBuilder,
     BytesBitmap,
