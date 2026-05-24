@@ -80,6 +80,10 @@ pub struct CompactionQueue {
 
     /// Whether the queue is shutting down
     shutdown: AtomicBool,
+
+    /// Completed jobs waiting for post-processing (e.g., in-flight clearance,
+    /// registry cleanup)
+    completed_jobs: SegQueue<Arc<CompactionJob>>,
 }
 
 impl CompactionQueue {
@@ -94,6 +98,7 @@ impl CompactionQueue {
             in_progress: AtomicUsize::new(0),
             completed: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            completed_jobs: SegQueue::new(),
         }
     }
 
@@ -148,9 +153,23 @@ impl CompactionQueue {
     /// Marks a job as completed
     ///
     /// Should be called after a job finishes executing (success or failure).
-    pub fn mark_completed(&self) {
+    /// The job is moved to the completed queue for post-processing.
+    pub fn mark_completed(&self, job: Arc<CompactionJob>) {
         self.in_progress.fetch_sub(1, Ordering::Release);
         self.completed.fetch_add(1, Ordering::Release);
+        self.completed_jobs.push(job);
+    }
+
+    /// Drains all completed jobs from the queue
+    ///
+    /// Returns jobs that have finished executing but not yet been processed
+    /// by the compaction manager (e.g., for in-flight segment clearance).
+    pub fn drain_completed(&self) -> Vec<Arc<CompactionJob>> {
+        let mut jobs = Vec::new();
+        while let Some(job) = self.completed_jobs.pop() {
+            jobs.push(job);
+        }
+        jobs
     }
 
     /// Returns the number of queued jobs (not yet started)
@@ -185,7 +204,7 @@ impl CompactionQueue {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    /// Drains all pending jobs from the queue
+    /// Drains all pending and completed jobs from the queue
     ///
     /// Returns all jobs that were queued but not yet started.
     /// Useful for cleanup during shutdown.
@@ -302,12 +321,11 @@ mod tests {
         queue.enqueue(job);
         assert_eq!(queue.queued_count(), 1);
 
-        let dequeued = queue.dequeue();
-        assert!(dequeued.is_some());
+        let job_arc = queue.dequeue().unwrap();
         assert_eq!(queue.queued_count(), 0);
         assert_eq!(queue.in_progress_count(), 1);
 
-        queue.mark_completed();
+        queue.mark_completed(job_arc);
         assert_eq!(queue.in_progress_count(), 0);
         assert_eq!(queue.completed_count(), 1);
     }
@@ -405,8 +423,8 @@ mod tests {
             let q = queue.clone();
             consumers.push(thread::spawn(move || {
                 let mut count = 0;
-                while let Some(_job) = q.dequeue() {
-                    q.mark_completed();
+                while let Some(job) = q.dequeue() {
+                    q.mark_completed(job);
                     count += 1;
                 }
                 count
@@ -441,5 +459,47 @@ mod tests {
         let stats = queue.stats();
         assert_eq!(stats.queued, 0);
         assert_eq!(stats.in_progress, 1);
+    }
+
+    #[test]
+    fn test_drain_completed() {
+        let queue = CompactionQueue::new();
+        let job = create_test_job(50.0);
+        queue.enqueue(job);
+
+        let job_arc = queue.dequeue().unwrap();
+        assert_eq!(queue.drain_completed().len(), 0);
+
+        queue.mark_completed(job_arc);
+        let drained = queue.drain_completed();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, 1);
+    }
+
+    #[test]
+    fn test_drain_completed_empty() {
+        let queue = CompactionQueue::new();
+        assert!(queue.drain_completed().is_empty());
+    }
+
+    #[test]
+    fn test_multiple_completed_jobs() {
+        let queue = CompactionQueue::new();
+        for i in 0..3 {
+            let mut job = create_test_job(i as f64);
+            job.id = i + 1;
+            queue.enqueue(job);
+        }
+
+        let mut completed = Vec::new();
+        while let Some(job) = queue.dequeue() {
+            completed.push(job);
+        }
+        for job in completed {
+            queue.mark_completed(job);
+        }
+
+        let drained = queue.drain_completed();
+        assert_eq!(drained.len(), 3);
     }
 }

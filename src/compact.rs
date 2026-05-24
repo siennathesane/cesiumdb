@@ -43,6 +43,81 @@ pub struct CompactOutput {
     pub entry_count: u64,
 }
 
+/// Reopen a closed segment for reading.
+///
+/// After a segment is closed, its mmap handles are dropped. This helper
+/// reopens the underlying files so the segment can be queried.
+fn reopen_segment_for_reading(
+    output_path: &PathBuf,
+    segment_id: u64,
+) -> Result<Arc<Segment>, SegmentError> {
+    use crate::{
+        index::Index,
+        map::Map,
+        segment::Metadata,
+    };
+
+    let key_id = segment_id;
+    let val_id = segment_id + 1;
+
+    let key_path = output_path.join(key_id.to_string());
+    let val_path = output_path.join(val_id.to_string());
+
+    let key_map = Arc::new(match Map::open(key_path) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    });
+    let val_map = Arc::new(match Map::open(val_path) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    });
+
+    let key_metadata = {
+        let len = key_map.len();
+        if len < 32 {
+            return Err(SegmentError::CorruptedBlock);
+        }
+        match key_map.read_range(len - 32..len, |slice| {
+            Metadata::from(Bytes::copy_from_slice(slice))
+        }) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let val_metadata = {
+        let len = val_map.len();
+        if len < 32 {
+            return Err(SegmentError::CorruptedBlock);
+        }
+        match val_map.read_range(len - 32..len, |slice| {
+            Metadata::from(Bytes::copy_from_slice(slice))
+        }) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let index_bytes = {
+        let start = key_metadata.index_start();
+        let size = key_metadata.index_size();
+
+        if key_map.len() < start + size {
+            return Err(SegmentError::CorruptedBlock);
+        }
+
+        match key_map.read_range(start..start + size, |slice| Bytes::copy_from_slice(slice)) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let key_index = Index::from(index_bytes);
+    let val_block_count = val_metadata.block_count() as u64;
+
+    Segment::open(key_map, key_index, key_id, val_map, val_id, val_block_count)
+}
+
 #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
 pub fn compact<I>(
     iterators: Vec<I>,
@@ -70,7 +145,7 @@ where
     let merge_setup_time = merge_start.elapsed();
 
     let builder_start = Instant::now();
-    let builder = match SegmentBuilder::new(output_path) {
+    let builder = match SegmentBuilder::new(output_path.clone()) {
         | Ok(b) => b,
         | Err(e) => return Err(e),
     };
@@ -125,14 +200,11 @@ where
                 last_key = Some(current_key);
                 continue;
             }
-            // Not a tombstone - write it and keep older versions
+            // Not a tombstone - write it (newest version only)
             skip_until_new_key = false;
             last_key = Some(current_key);
-        } else if skip_until_new_key {
-            // Still processing versions of a key whose newest is a tombstone - skip all
-            continue;
-        } else if value.is_tombstone() {
-            // Older tombstone for a key we're already keeping - just skip it
+        } else {
+            // Older version of a key we've already processed - skip it
             continue;
         }
 
@@ -173,6 +245,15 @@ where
     }
     let close_time = close_start.elapsed();
 
+    // Drop the writer segment to release mmap locks before reopening
+    drop(seg);
+
+    // Reopen the segment for reading so handles are populated
+    let reopened = match reopen_segment_for_reading(&output_path, segment_id) {
+        Ok(s) => s,
+        Err(e) => return Err(e),
+    };
+
     let total_time = start_time.elapsed();
     let merge_time = loop_time - serialize_time - write_time;
 
@@ -192,7 +273,7 @@ where
     );
 
     Ok(CompactOutput {
-        segment: Arc::new(seg),
+        segment: reopened,
         min_key: min_key.unwrap_or_default(),
         max_key: max_key.unwrap_or_default(),
         entry_count,
@@ -228,7 +309,7 @@ where
 
     let merge_iter = RawMergeIterator::new(iterators);
 
-    let builder = match SegmentBuilder::new(output_path) {
+    let builder = match SegmentBuilder::new(output_path.clone()) {
         | Ok(b) => b,
         | Err(e) => return Err(e),
     };
@@ -288,9 +369,8 @@ where
             }
             skip_until_new_key = false;
             last_dedup_key = Some(entry.raw_key().slice(..entry.raw_key().len() - 16));
-        } else if skip_until_new_key {
-            continue;
-        } else if entry.is_tombstone() {
+        } else {
+            // Older version of a key we've already processed - skip it
             continue;
         }
 
@@ -321,11 +401,18 @@ where
 
     let close_start = Instant::now();
     if let Err(e) = seg.close() {
-
         return Err(e);
-
     } // Automatically rebuilds index
     let close_time = close_start.elapsed();
+
+    // Drop the writer segment to release mmap locks before reopening
+    drop(seg);
+
+    // Reopen the segment for reading so handles are populated
+    let reopened = match reopen_segment_for_reading(&output_path, segment_id) {
+        Ok(s) => s,
+        Err(e) => return Err(e),
+    };
 
     let total_time = start_time.elapsed();
 
@@ -340,7 +427,7 @@ where
     );
 
     Ok(CompactOutput {
-        segment: Arc::new(seg),
+        segment: reopened,
         min_key: min_key.unwrap_or_default(),
         max_key: max_key.unwrap_or_default(),
         entry_count,
@@ -419,36 +506,63 @@ pub fn flush_memtable(
     // Track min/max keys for manifest
     let mut min_key: Option<Vec<u8>> = None;
     let mut max_key: Option<Vec<u8>> = None;
-    let mut last_key_bytes: Option<Bytes> = None; // Track last key for max_key
+
+    // Deduplicate: memtable.scan() iterates in ascending byte order (newest
+    // first because timestamps are stored as u128::MAX - ts, so smaller
+    // serialized bytes = newer timestamp). We only want the newest version
+    // per key in the flushed segment, otherwise point reads via
+    // SegmentScanIterator::next() will return the oldest version.
+    let mut last_key: Option<KeyBytes> = None;
+    let mut last_val: Option<ValueBytes> = None;
 
     // Scan all entries in the memtable (including tombstones)
     use std::collections::Bound;
     let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
 
     for (key, value) in iter {
-        // NOTE: We do NOT filter tombstones here - they're needed to mask
-        // older versions that may exist in L0 segments
-        let key_bytes = key.serialize();
-        let val_bytes = value.serialize();
+        let same_logical_key = match &last_key {
+            Some(prev) => prev.ns() == key.ns() && prev.as_bytes() == key.as_bytes(),
+            None => false,
+        };
 
-        // Track first key only once
+        if same_logical_key {
+            // Same key, older version (scan is newest-first, so later = older).
+            // Drop this one, keep the first (newest) we saw.
+            continue;
+        } else {
+            // Key changed. Flush the buffered entry (if any).
+            if let (Some(prev_key), Some(prev_val)) = (last_key.take(), last_val.take()) {
+                let key_bytes = prev_key.serialize();
+                let val_bytes = prev_val.serialize();
+
+                if min_key.is_none() {
+                    min_key = Some(key_bytes.to_vec());
+                }
+                if let Err(e) = seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
+                    return Err(e);
+                }
+                entry_count += 1;
+                max_key = Some(key_bytes.to_vec());
+            }
+
+            last_key = Some(key);
+            last_val = Some(value);
+        }
+    }
+
+    // Flush the final buffered entry
+    if let (Some(prev_key), Some(prev_val)) = (last_key, last_val) {
+        let key_bytes = prev_key.serialize();
+        let val_bytes = prev_val.serialize();
+
         if min_key.is_none() {
             min_key = Some(key_bytes.to_vec());
         }
-
-        // Write to segment
         if let Err(e) = seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
             return Err(e);
         }
         entry_count += 1;
-
-        // Keep reference to last key (cheap Bytes clone)
-        last_key_bytes = Some(key_bytes);
-    }
-
-    // Clone max_key only once at the end
-    if let Some(last) = last_key_bytes {
-        max_key = Some(last.to_vec());
+        max_key = Some(key_bytes.to_vec());
     }
 
     // Close the segment (writes index and metadata)

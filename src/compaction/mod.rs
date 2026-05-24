@@ -60,7 +60,10 @@ pub use registry::{
     RegistryStats,
     SegmentRegistry,
 };
-pub use scheduler::CompactionScheduler;
+pub use scheduler::{
+    CompactionScheduler,
+    SchedulerConfig,
+};
 pub use subcompaction::{
     SubcompactionConfig,
     SubcompactionJob,
