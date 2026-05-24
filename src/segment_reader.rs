@@ -42,6 +42,7 @@ use crate::{
             Value,
         },
         DEFAULT_SEGMENT_SIZE,
+        Metadata,
     },
     segment_iterator::{
         RawSegmentScanIterator,
@@ -129,24 +130,37 @@ impl SegmentReader {
     ) -> Result<Self, SegmentError> {
         let segment_size = key_handle.len();
 
-        if segment_size % BLOCK_SIZE != 0 {
-            return Err(InvalidSize);
-        }
+        // Read metadata from the end of the file to get the authoritative block count.
+        // Only trust it if the index + metadata fit exactly at the end (properly closed
+        // segment). Otherwise fall back to heuristics for test segments / old files.
+        let metadata_block_count = if segment_size >= 32 {
+            match key_handle.read_range(segment_size - 32..segment_size, |slice| {
+                Metadata::from(Bytes::copy_from_slice(slice))
+            }) {
+                | Ok(m) => {
+                    let index_end = m.index_start() + m.index_size();
+                    if index_end + 32 == segment_size {
+                        Some(m.block_count())
+                    } else {
+                        None
+                    }
+                },
+                | Err(_) => None,
+            }
+        } else {
+            None
+        };
 
         // Use the actual number of blocks that were written, not the file size
-        // The file might be larger than the actual data due to pre-allocation
         let index_blocks = key_index.read().num_blocks() as usize;
-        let num_blocks = segment_size / BLOCK_SIZE;
+        let num_blocks = segment_size.div_ceil(BLOCK_SIZE);
 
         // Determine visible blocks:
-        // - If index has num_blocks set (from metadata), use it (handles empty segments
-        //   correctly)
-        // - Otherwise (test segments or old files), fall back to file size
-        // We can't perfectly distinguish "empty segment" from "uninitialized test
-        // segment", but we can check if the file is pre-allocated to max size
-        // (64MB) with no data
-        let visible_key_blocks = if index_blocks > 0 {
-            // Metadata says there are blocks - trust it
+        // - If metadata is present and valid, trust its block_count
+        // - Otherwise fall back to index_blocks or file size heuristics
+        let visible_key_blocks = if let Some(block_count) = metadata_block_count {
+            block_count as usize
+        } else if index_blocks > 0 {
             index_blocks
         } else if segment_size >= DEFAULT_SEGMENT_SIZE as usize {
             // Large pre-allocated file with 0 blocks in metadata - this is an empty segment
@@ -567,11 +581,11 @@ impl SegmentReader {
     /// * `upper_bound` - The upper bound of the key range (inclusive if
     ///   Included, exclusive if Excluded)
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-    pub fn scan<'a>(
-        &'a self,
+    pub fn scan(
+        self,
         lower_bound: Bound<&[u8]>,
         upper_bound: Bound<&[u8]>,
-    ) -> SegmentScanIterator<'a> {
+    ) -> SegmentScanIterator {
         // Determine starting block based on lower bound
         let start_block = match lower_bound {
             | Bound::Included(key) | Bound::Excluded(key) => {
@@ -601,11 +615,11 @@ impl SegmentReader {
     /// Same logic as `scan()` but returns `RawSegmentScanIterator` which yields
     /// `RawEntry` instead of `(KeyBytes, ValueBytes)`.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-    pub(crate) fn scan_raw<'a>(
-        &'a self,
+    pub(crate) fn scan_raw(
+        self,
         lower_bound: Bound<&[u8]>,
         upper_bound: Bound<&[u8]>,
-    ) -> RawSegmentScanIterator<'a> {
+    ) -> RawSegmentScanIterator {
         let start_block = match lower_bound {
             | Bound::Included(key) | Bound::Excluded(key) => {
                 debug_assert!(
@@ -753,22 +767,25 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_size() {
-        // Create Map with size that's not a multiple of BLOCK_SIZE
-        let invalid_size = BLOCK_SIZE * 2 + 100; // Not a multiple of BLOCK_SIZE
-        let (_dir, key_map) = create_test_map(invalid_size);
-        let (_dir2, val_map) = create_test_map(invalid_size);
+    fn test_non_aligned_size_accepted() {
+        // Segment files may not be exact multiples of BLOCK_SIZE due to
+        // metadata/index appends or growth increments. The reader should
+        // accept any size and compute visible blocks with div_ceil.
+        let non_aligned_size = BLOCK_SIZE * 2 + 100; // Not a multiple of BLOCK_SIZE
+        let (_dir, key_map) = create_test_map(non_aligned_size);
+        let (_dir2, val_map) = create_test_map(non_aligned_size);
 
         let key_index = Index::new(1, 1234);
-        let val_index = Index::new(1, 1234);
 
         let result = SegmentReader::new(
             key_map.clone(),
             val_map.clone(),
             Arc::new(parking_lot::RwLock::new(key_index)),
         );
-        assert!(result.is_err());
-        assert!(matches!(result.err().unwrap(), InvalidSize));
+        assert!(result.is_ok(), "SegmentReader should accept non-aligned sizes");
+        let reader = result.unwrap();
+        // num_blocks should round up: (8192+100)/4096 = 3
+        assert_eq!(reader.num_blocks, 3);
     }
 
     #[test]

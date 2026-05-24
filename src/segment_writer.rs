@@ -269,7 +269,7 @@ impl SegmentWriter {
             },
         };
 
-        *current_offset += index_end;
+        *current_offset = index_end;
 
         Ok(index_start as u64)
     }
@@ -280,16 +280,23 @@ impl SegmentWriter {
             return Err(NotClosing);
         }
 
-        // Always write at the end of the file
         let metadata_size = metadata.serialized_size();
-        let map_size = self.map.len();
+        let mut current_offset = self.current_offset.lock();
+        let metadata_start = *current_offset;
+        let metadata_end = *current_offset + metadata_size;
 
-        // Calculate position at the end
-        let metadata_start = map_size - metadata_size;
+        // Grow map if needed
+        if metadata_end > self.map.len() {
+            let new_size = self.calculate_new_size(metadata_end);
+            match self.map.grow(new_size) {
+                | Ok(_) => {},
+                | Err(e) => return Err(e),
+            };
+        }
 
-        let metadata_range = metadata_start..map_size;
+        let metadata_range = metadata_start..metadata_end;
 
-        // Write metadata
+        // Write metadata at current offset so it becomes the last bytes after shrink
         // SAFETY: we know this memory range will exist
         match self.map.write_to_range(metadata_range, |slice| unsafe {
             metadata.finalize(slice.as_mut_ptr());
@@ -298,8 +305,7 @@ impl SegmentWriter {
             | Err(e) => return Err(e),
         };
 
-        self.closed.store(true, Relaxed);
-
+        *current_offset = metadata_end;
         Ok(())
     }
 
@@ -313,17 +319,22 @@ impl SegmentWriter {
     }
 
     /// Close the segment writer. This will flush any remaining data to the map,
-    /// and it is now safe to `drop`.
+    /// truncate the file to the actual written size, and it is now safe to `drop`.
     #[instrument(level = "trace")]
     pub(crate) fn close(&self) -> Result<(), SegmentError> {
         if self.closed.load(Relaxed) {
             return Ok(());
         }
 
-        match self.map.close() {
-            | Ok(_) => Ok(()),
-            | Err(e) => Err(e),
-        }
+        let current_offset = self.current_offset();
+        self.map.close()?;
+
+        // Truncate file to actual written size to eliminate space amplification
+        // from pre-allocated unused space.
+        self.map.shrink(current_offset as u64)?;
+
+        self.closed.store(true, Relaxed);
+        Ok(())
     }
 }
 
@@ -808,5 +819,29 @@ mod tests {
                 .expect("failed to read");
             assert_eq!(num_entries, 1, "Block {} should have 1 entry", i);
         }
+    }
+
+    #[test]
+    fn test_close_truncates_to_actual_size() {
+        let (map, _dir) = create_test_map().expect("failed to create map");
+        let initial_size = map.len();
+
+        let mut writer = SegmentWriter::new(map.clone()).expect("failed to create segment writer");
+
+        // Write a single block
+        let mut block = Block::new();
+        block
+            .add_complete_entry(b"hello world")
+            .expect("failed to add entry");
+        writer.write_block(block).expect("failed to write block");
+
+        let written = writer.current_offset();
+        assert_eq!(written, BLOCK_SIZE);
+        assert!(written < initial_size);
+
+        // Close should truncate the file to the written size
+        writer.close().expect("close failed");
+
+        assert_eq!(map.len(), written, "map should be truncated to actual written size");
     }
 }

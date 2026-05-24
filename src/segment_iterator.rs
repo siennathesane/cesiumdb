@@ -126,8 +126,8 @@ impl<'a> Iterator for SeekingBlockIterator<'a> {
 }
 
 /// Iterator for scanning a range of keys in a segment.
-pub struct SegmentScanIterator<'a> {
-    reader: &'a SegmentReader,
+pub struct SegmentScanIterator {
+    reader: SegmentReader,
     current_block_index: usize,
     current_key_block: Option<crate::block::ReadOnlyBlock>,
     current_key_index: usize,
@@ -137,7 +137,7 @@ pub struct SegmentScanIterator<'a> {
     is_lower_inclusive: bool,
 }
 
-impl<'a> Iterator for SegmentScanIterator<'a> {
+impl Iterator for SegmentScanIterator {
     type Item = Result<(KeyBytes, ValueBytes), SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -151,17 +151,7 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
             {
                 match self.load_next_block() {
                     | Ok(false) => return None, // No more blocks
-                    | Ok(true) => {
-                        // Fast-skip optimization: Check if we should skip this entire block
-                        // by checking its last entry against our lower bound
-                        if let Some(should_skip) = self.should_skip_current_block() {
-                            if should_skip {
-                                // Mark block as exhausted to load next one
-                                self.current_key_block = None;
-                                continue;
-                            }
-                        }
-                    },
+                    | Ok(true) => {},
                     | Err(e) => return Some(Err(e)), // Error loading block
                 }
             }
@@ -195,11 +185,7 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
 
                     // Check if the key is within our range (using stripped key_data)
                     if !self.is_in_range(&key_data) {
-                        // If we're past the upper bound, we can stop scanning
-                        if self.is_past_upper_bound(&key_data) {
-                            return None;
-                        }
-                        continue; // Skip this key (before lower bound)
+                        continue; // Skip this key (out of range)
                     }
 
                     // Parse the key (without value location metadata)
@@ -226,7 +212,7 @@ impl<'a> Iterator for SegmentScanIterator<'a> {
     }
 }
 
-impl<'a> SegmentScanIterator<'a> {
+impl SegmentScanIterator {
     /// Creates a new segment scan iterator for the given reader and key range.
     ///
     /// # Arguments
@@ -235,7 +221,7 @@ impl<'a> SegmentScanIterator<'a> {
     /// * `start_block` - Block index to start scanning from (from index lookup
     ///   optimization)
     pub fn new(
-        reader: &'a SegmentReader,
+        reader: SegmentReader,
         range: (Bound<&[u8]>, Bound<&[u8]>),
         start_block: usize,
     ) -> Self {
@@ -408,8 +394,8 @@ impl<'a> SegmentScanIterator<'a> {
 /// ValueBytes)`, this iterator yields `RawEntry` — zero-copy wrappers around
 /// the serialized bytes. Used by the compaction path to eliminate
 /// deserialize/re-serialize overhead.
-pub(crate) struct RawSegmentScanIterator<'a> {
-    reader: &'a SegmentReader,
+pub(crate) struct RawSegmentScanIterator {
+    reader: SegmentReader,
     current_block_index: usize,
     current_key_block: Option<crate::block::ReadOnlyBlock>,
     current_key_index: usize,
@@ -419,7 +405,7 @@ pub(crate) struct RawSegmentScanIterator<'a> {
     is_lower_inclusive: bool,
 }
 
-impl<'a> Iterator for RawSegmentScanIterator<'a> {
+impl Iterator for RawSegmentScanIterator {
     type Item = Result<crate::raw_entry::RawEntry, SegmentError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -430,14 +416,7 @@ impl<'a> Iterator for RawSegmentScanIterator<'a> {
             {
                 match self.load_next_block() {
                     | Ok(false) => return None,
-                    | Ok(true) => {
-                        if let Some(should_skip) = self.should_skip_current_block() {
-                            if should_skip {
-                                self.current_key_block = None;
-                                continue;
-                            }
-                        }
-                    },
+                    | Ok(true) => {},
                     | Err(e) => return Some(Err(e)),
                 }
             }
@@ -460,9 +439,6 @@ impl<'a> Iterator for RawSegmentScanIterator<'a> {
                     let key_data = key_bytes.slice(KEY_DATA_OFFSET..);
 
                     if !self.is_in_range(&key_data) {
-                        if self.is_past_upper_bound(&key_data) {
-                            return None;
-                        }
                         continue;
                     }
 
@@ -483,10 +459,10 @@ impl<'a> Iterator for RawSegmentScanIterator<'a> {
     }
 }
 
-impl<'a> RawSegmentScanIterator<'a> {
+impl RawSegmentScanIterator {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn new(
-        reader: &'a SegmentReader,
+        reader: SegmentReader,
         range: (Bound<&[u8]>, Bound<&[u8]>),
         start_block: usize,
     ) -> Self {

@@ -163,6 +163,11 @@ impl Map {
 
         {
             let file = self.file.lock();
+            // Sync file before truncating to ensure all writes are persisted
+            match file.sync_all() {
+                | Ok(_) => {},
+                | Err(e) => return Err(IoError(e)),
+            };
             match file.set_len(new_size) {
                 | Ok(_) => {},
                 | Err(e) => return Err(IoError(e)),
