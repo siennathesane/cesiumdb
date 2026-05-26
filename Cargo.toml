@@ -4,7 +4,7 @@ description = "Blazing fast, persistent key-value store for Rust"
 license = "GPL-3.0"
 repository = "https://github.com/siennathesane/cesiumdb"
 authors = ["Sienna Meridian Satterwhite <sienna@r3t.io>"]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 
 [lints.rust]

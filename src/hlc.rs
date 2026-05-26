@@ -3,6 +3,11 @@
 
 #[cfg(target_arch = "aarch64")]
 use std::sync::atomic::AtomicU128 as StdAtomicU128;
+#[cfg(target_arch = "x86_64")]
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
 use std::{
     sync::{
         Arc,
