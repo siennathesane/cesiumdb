@@ -23,7 +23,6 @@ use crate::{
         Metadata,
         Segment,
     },
-    segment_reader::SegmentReader,
     segment_writer::SegmentWriter,
 };
 
@@ -68,12 +67,12 @@ impl SegmentBuilder {
 
         let key_seg_writer = match SegmentWriter::new(key_handle.clone()) {
             | Ok(v) => v,
-            | Err(e) => return Err(CantCreateWriter(Value, key_segment_id)),
+            | Err(_e) => return Err(CantCreateWriter(Value, key_segment_id)),
         };
 
         let val_seg_writer = match SegmentWriter::new(val_handle.clone()) {
             | Ok(v) => v,
-            | Err(e) => return Err(CantCreateWriter(Value, val_segment_id)),
+            | Err(_e) => return Err(CantCreateWriter(Value, val_segment_id)),
         };
 
         let segment = Arc::new(Segment::new(
@@ -153,8 +152,8 @@ impl SegmentBuilder {
         }
 
         // For non-empty segments, validate index bounds
-        if block_count > 0 {
-            if index_start >= key_file_size || index_start + index_size > key_file_size {
+        if block_count > 0
+            && (index_start >= key_file_size || index_start + index_size > key_file_size) {
                 return Err(SegmentError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -163,7 +162,6 @@ impl SegmentBuilder {
                     ),
                 )));
             }
-        }
 
         // Read and deserialize the index
         let mut key_index = if block_count == 0 {
@@ -252,8 +250,6 @@ impl SegmentBuilder {
 mod tests {
     use rand::{
         Rng,
-        SeedableRng,
-        random_range,
         rng,
     };
     use tempfile::tempdir;
@@ -265,15 +261,12 @@ mod tests {
             HLC,
             HybridLogicalClock,
         },
-        index::Index,
-        keypair,
         keypair::{
             DEFAULT_NS,
             Key,
             KeyBytes,
             ValueBytes,
         },
-        segment::Segment,
         utils::Serializer,
     };
 

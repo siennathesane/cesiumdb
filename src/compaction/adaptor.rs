@@ -1,5 +1,5 @@
 //! Workload-adaptive compaction strategy selector
-//!
+#![allow(unused)]
 //! Automatically adjusts compaction strategies based on observed workload
 //! patterns.
 
@@ -99,11 +99,10 @@ impl WorkloadAdaptor {
         }
 
         // Check if enough time has passed since last adaptation
-        if let Some(last) = self.last_adaptation {
-            if last.elapsed() < self.policy.min_adaptation_interval {
+        if let Some(last) = self.last_adaptation
+            && last.elapsed() < self.policy.min_adaptation_interval {
                 return None;
             }
-        }
 
         // Determine recommended strategy based on workload pattern
         let recommended = match analysis.pattern {
@@ -167,7 +166,7 @@ impl WorkloadAdaptor {
         };
 
         self.last_adaptation = Some(Instant::now());
-        self.current_strategy = Some(recommended.clone());
+        self.current_strategy = Some(recommended);
 
         Some(StrategyRecommendation {
             strategy: recommended,

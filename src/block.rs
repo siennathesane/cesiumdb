@@ -1,7 +1,8 @@
 use std::ptr;
 
+#[cfg(test)]
+use bytes::BufMut;
 use bytes::{
-    BufMut,
     Bytes,
     BytesMut,
 };
@@ -18,16 +19,12 @@ use crate::{
 };
 
 const OFFSET_SIZE: usize = size_of::<u16>();
-const MAX_ENTRIES: usize = BLOCK_SIZE / ENTRY_SIZE;
 /// The size of a block in bytes. This is the most common page size for memory
 /// and NVMe devices.
 pub const BLOCK_SIZE: usize = 4096;
 /// The size of an entry in a block. An entry consists of a 2-byte offset and a
 /// byte flag for the entry type.
 pub(crate) const ENTRY_SIZE: usize = size_of::<u16>() + size_of::<u8>();
-/// The overhead of a block, which is the space taken up by the offsets and
-/// flags.
-pub(crate) const BLOCK_OVERHEAD: usize = BLOCK_SIZE - MAX_ENTRIES;
 /// The maximum entry size that can fit into an empty block.
 pub(crate) const MAX_ENTRY_SIZE: usize = BLOCK_SIZE - OFFSET_SIZE - ENTRY_SIZE;
 
@@ -82,6 +79,56 @@ pub(crate) struct ReadOnlyBlock {
 }
 
 impl Block {
+    /// Finalize the block by writing directly to the provided memory location.
+    ///
+    /// # Safety
+    /// - dst must be valid for BLOCK_SIZE bytes
+    /// - dst must be properly aligned for u16 writes (2-byte alignment)
+    /// - dst must not overlap with any source data
+    /// - Caller must ensure exclusive access to the dst memory region
+    pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
+        // SAFETY: Verify alignment invariants in debug builds
+        debug_assert!(!dst.is_null(), "Destination pointer must not be null");
+        debug_assert!(
+            (dst as usize).is_multiple_of(std::mem::align_of::<u16>()),
+            "Destination pointer must be 2-byte aligned for u16 writes"
+        );
+
+        // SAFETY: All writes stay within BLOCK_SIZE bytes.
+        // Each write uses non-overlapping offsets.
+        unsafe {
+            // write num_entries
+            ptr::copy_nonoverlapping(
+                self.num_entries.to_le_bytes().as_ptr(),
+                dst,
+                size_of::<u16>(),
+            );
+
+            // write offsets
+            ptr::copy_nonoverlapping(
+                self.offsets.as_ptr(),
+                dst.add(size_of::<u16>()),
+                self.offsets.len(),
+            );
+
+            // write entries
+            ptr::copy_nonoverlapping(
+                self.entries.as_ptr(),
+                dst.add(size_of::<u16>() + self.offsets.len()),
+                self.entries.len(),
+            );
+
+            // zero remaining space
+            let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
+            if written < BLOCK_SIZE {
+                ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Block {
     /// Create a new block with BytesMut staging buffers
     pub(crate) fn new() -> Self {
         Block {
@@ -123,53 +170,6 @@ impl Block {
         Ok(())
     }
 
-    /// Finalize the block by writing directly to the provided memory location.
-    ///
-    /// # Safety
-    /// - dst must be valid for BLOCK_SIZE bytes
-    /// - dst must be properly aligned for u16 writes (2-byte alignment)
-    /// - dst must not overlap with any source data
-    /// - Caller must ensure exclusive access to the dst memory region
-    pub(crate) unsafe fn finalize(&self, dst: *mut u8) {
-        // SAFETY: Verify alignment invariants in debug builds
-        debug_assert!(!dst.is_null(), "Destination pointer must not be null");
-        debug_assert!(
-            dst as usize % std::mem::align_of::<u16>() == 0,
-            "Destination pointer must be 2-byte aligned for u16 writes"
-        );
-
-        // SAFETY: All writes stay within BLOCK_SIZE bytes.
-        // Each write uses non-overlapping offsets.
-        unsafe {
-            // write num_entries
-            ptr::copy_nonoverlapping(
-                self.num_entries.to_le_bytes().as_ptr(),
-                dst,
-                size_of::<u16>(),
-            );
-
-            // write offsets
-            ptr::copy_nonoverlapping(
-                self.offsets.as_ptr(),
-                dst.add(size_of::<u16>()),
-                self.offsets.len(),
-            );
-
-            // write entries
-            ptr::copy_nonoverlapping(
-                self.entries.as_ptr(),
-                dst.add(size_of::<u16>() + self.offsets.len()),
-                self.entries.len(),
-            );
-
-            // zero remaining space
-            let written = size_of::<u16>() + self.offsets.len() + self.entries.len();
-            if written < BLOCK_SIZE {
-                ptr::write_bytes(dst.add(written), 0, BLOCK_SIZE - written);
-            }
-        }
-    }
-
     #[inline]
     pub fn get(&self, index: usize) -> Option<(EntryFlag, &[u8])> {
         if index >= self.num_entries as usize {
@@ -203,11 +203,6 @@ impl Block {
         Some((flag, &entry_data[1..]))
     }
 
-    /// Add an entry that is part of a single block.
-    pub(crate) fn add_complete_entry(&mut self, entry: &[u8]) -> Result<(), BlockError> {
-        self.add_entry(entry, EntryFlag::Complete)
-    }
-
     /// Returns an iterator over the entries in the block.
     #[inline]
     pub fn iter(&self) -> BlockIterator<'_> {
@@ -221,12 +216,8 @@ impl Block {
 }
 
 /// Helper methods.
+#[cfg(test)]
 impl Block {
-    #[inline]
-    pub(crate) fn offsets(&self) -> &[u8] {
-        self.offsets.as_ref()
-    }
-
     #[inline]
     pub(crate) fn entries(&self) -> &[u8] {
         self.entries.as_ref()
@@ -250,11 +241,6 @@ impl Block {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == size_of::<u16>()
-    }
-
-    #[inline]
-    pub fn num_entries(&self) -> u16 {
-        self.num_entries
     }
 
     /// Check if an entry of given size will fit in this block
@@ -379,15 +365,6 @@ impl<'a> BlockBuilder<'a> {
             .copy_from_slice(&self.entries);
     }
 
-    #[inline]
-    pub(crate) fn num_entries(&self) -> u16 {
-        self.num_entries
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.num_entries == 0
-    }
 }
 
 // ReadOnlyBlock methods - same interface as Block for reading
@@ -428,17 +405,10 @@ impl ReadOnlyBlock {
     pub fn num_entries(&self) -> u16 {
         self.num_entries
     }
+}
 
-    #[inline]
-    pub fn iter(&self) -> BlockIterator<'_> {
-        BlockIterator {
-            entries: self.entries.as_ref(),
-            offsets: self.offsets.as_ref(),
-            current: 0,
-            num_entries: self.num_entries,
-        }
-    }
-
+#[cfg(test)]
+impl ReadOnlyBlock {
     #[inline]
     pub(crate) fn offsets(&self) -> &[u8] {
         self.offsets.as_ref()
@@ -484,6 +454,7 @@ impl Deserializer for ReadOnlyBlock {
 }
 
 /// An iterator over the entries in a block.
+#[cfg(test)]
 pub struct BlockIterator<'a> {
     /// Reference to the entries data
     entries: &'a [u8],
@@ -495,6 +466,7 @@ pub struct BlockIterator<'a> {
     num_entries: u16,
 }
 
+#[cfg(test)]
 impl<'a> Iterator for BlockIterator<'a> {
     type Item = (EntryFlag, &'a [u8]);
 
@@ -610,7 +582,7 @@ mod tests {
     #[test]
     fn test_add_entry_is_full() {
         let mut block = Block::new();
-        let entry = [0u8; BLOCK_SIZE - MAX_ENTRIES];
+        let entry = [0u8; BLOCK_SIZE - (BLOCK_SIZE / ENTRY_SIZE)];
         block.add_entry(&entry, EntryFlag::Complete).unwrap();
         assert!(block.is_full());
     }

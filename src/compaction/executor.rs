@@ -7,10 +7,7 @@
 
 use std::{
     ops::Bound,
-    path::{
-        Path,
-        PathBuf,
-    },
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{
@@ -35,15 +32,9 @@ use crate::{
         },
     },
     errs::SegmentError,
-    levels::{
-        KeyRange,
-        VersionSet,
-    },
+    levels::KeyRange,
     manifest_writer::ManifestWriter,
-    memtable::Memtable,
     segment::Segment,
-    segment_reader::SegmentReader,
-    utils::Serializer,
     version::{
         VersionEdit,
         VersionManager,
@@ -65,9 +56,6 @@ pub enum ExecutorError {
     #[error("No input segments")]
     NoInputSegments,
 
-    #[error("Invalid job type: {0:?}")]
-    InvalidJobType(CompactionJobType),
-
     #[error("Flush jobs are handled by the background flusher, not the compaction executor")]
     FlushNotRouted,
 }
@@ -83,9 +71,6 @@ pub struct CompactionResult {
     /// Segments that were compacted (to be deleted)
     pub inputs_to_delete: Vec<u64>,
 
-    /// Number of entries processed
-    pub entries_processed: u64,
-
     /// Bytes read
     pub bytes_read: u64,
 
@@ -97,7 +82,6 @@ pub struct CompactionResult {
 struct SubcompactionResult {
     segment: Arc<Segment>,
     key_range: KeyRange,
-    entry_count: u64,
     bytes_read: u64,
     bytes_written: u64,
 }
@@ -129,22 +113,6 @@ pub struct CompactionExecutor {
 }
 
 impl CompactionExecutor {
-    /// Creates a new compaction executor
-    pub fn new(
-        version_manager: Arc<VersionManager>,
-        base_path: PathBuf,
-        manifest: Option<Arc<Mutex<ManifestWriter>>>,
-        registry: Arc<SegmentRegistry>,
-    ) -> Self {
-        Self::with_planner(
-            version_manager,
-            base_path,
-            manifest,
-            registry,
-            SubcompactionPlanner::new(),
-        )
-    }
-
     pub fn with_planner(
         version_manager: Arc<VersionManager>,
         base_path: PathBuf,
@@ -188,7 +156,7 @@ impl CompactionExecutor {
                     let l0_ids: std::collections::HashSet<u64> =
                         version.l0.iter().map(|s| s.id()).collect();
                     let inputs_ok = job.input.segments.iter().all(|s| l0_ids.contains(&s.id()));
-                    let next_ok = job.next_level_input.as_ref().map_or(true, |next| {
+                    let next_ok = job.next_level_input.as_ref().is_none_or(|next| {
                         let next_idx = next.level as usize - 1;
                         if next_idx < version.levels.len() {
                             let next_ids: std::collections::HashSet<u64> = version.levels[next_idx]
@@ -217,7 +185,7 @@ impl CompactionExecutor {
                         .segments
                         .iter()
                         .all(|s| level_ids.contains(&s.id()));
-                    let next_ok = job.next_level_input.as_ref().map_or(true, |next| {
+                    let next_ok = job.next_level_input.as_ref().is_none_or(|next| {
                         let next_idx = next.level as usize - 1;
                         if next_idx < version.levels.len() {
                             let next_ids: std::collections::HashSet<u64> = version.levels[next_idx]
@@ -334,7 +302,6 @@ impl CompactionExecutor {
             output_segments,
             output_ranges,
             inputs_to_delete,
-            entries_processed: 0,
             bytes_read: 0,
             bytes_written: 0,
         })
@@ -350,11 +317,10 @@ impl CompactionExecutor {
         }
 
         // Check if this job should be split into parallel subcompactions
-        if let Some(subjobs) = self.subcompaction_planner.split(job) {
-            if subjobs.len() > 1 {
+        if let Some(subjobs) = self.subcompaction_planner.split(job)
+            && subjobs.len() > 1 {
                 return self.execute_subcompactions(job, subjobs);
             }
-        }
 
         self.execute_single_merge(job)
     }
@@ -406,7 +372,6 @@ impl CompactionExecutor {
             output_segments: vec![compact_output.segment],
             output_ranges: vec![output_range],
             inputs_to_delete,
-            entries_processed: compact_output.entry_count,
             bytes_read,
             bytes_written,
         })
@@ -451,7 +416,6 @@ impl CompactionExecutor {
         // Aggregate outputs
         let mut output_segments = Vec::with_capacity(num_subs);
         let mut output_ranges = Vec::with_capacity(num_subs);
-        let mut total_entries = 0u64;
         let mut total_bytes_read = 0u64;
         let mut total_bytes_written = 0u64;
 
@@ -459,7 +423,6 @@ impl CompactionExecutor {
             let sub = result?;
             output_segments.push(sub.segment);
             output_ranges.push(sub.key_range);
-            total_entries += sub.entry_count;
             total_bytes_read += sub.bytes_read;
             total_bytes_written += sub.bytes_written;
         }
@@ -475,7 +438,6 @@ impl CompactionExecutor {
             output_segments,
             output_ranges,
             inputs_to_delete,
-            entries_processed: total_entries,
             bytes_read: total_bytes_read,
             bytes_written: total_bytes_written,
         })
@@ -536,7 +498,6 @@ impl CompactionExecutor {
         Ok(SubcompactionResult {
             segment: compact_output.segment,
             key_range,
-            entry_count: compact_output.entry_count,
             bytes_read,
             bytes_written,
         })
@@ -749,11 +710,6 @@ impl CompactionExecutor {
 
         Ok(())
     }
-
-    /// Returns the base path for segment files
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
-    }
 }
 
 #[cfg(test)]
@@ -764,9 +720,12 @@ mod tests {
     use super::*;
     use crate::{
         compact::flush_memtable,
-        compaction::job::{
-            CompactionInput,
-            CompactionOutput,
+        compaction::{
+            job::{
+                CompactionInput,
+                CompactionOutput,
+            },
+            subcompaction::SubcompactionConfig,
         },
         hlc::{
             HLC,
@@ -777,20 +736,9 @@ mod tests {
             KeyBytes,
             ValueBytes,
         },
-        levels::VersionSet,
         memtable::Memtable,
         version::VersionManager,
     };
-
-    #[test]
-    fn test_executor_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let vm = Arc::new(VersionManager::new(7));
-        let registry = Arc::new(SegmentRegistry::new(temp_dir.path().to_path_buf()));
-        let executor = CompactionExecutor::new(vm, temp_dir.path().to_path_buf(), None, registry);
-
-        assert_eq!(executor.base_path(), temp_dir.path());
-    }
 
     #[test]
     fn test_trivial_move_no_inputs() {
@@ -802,7 +750,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let vm = Arc::new(VersionManager::new(7));
         let registry = Arc::new(SegmentRegistry::new(temp_dir.path().to_path_buf()));
-        let executor = CompactionExecutor::new(vm, temp_dir.path().to_path_buf(), None, registry);
+        let executor = CompactionExecutor::with_planner(
+            vm,
+            temp_dir.path().to_path_buf(),
+            None,
+            registry,
+            SubcompactionPlanner::new(),
+        );
 
         let input = CompactionInput {
             level: 1,
@@ -886,7 +840,7 @@ mod tests {
 
         // Extract IDs and sizes before moving segments into job
         let seg1_id = segment1.id();
-        let seg2_id = segment2.id();
+        let _seg2_id = segment2.id();
         let total_size = segment1.size_in_bytes() + segment2.size_in_bytes();
 
         // Build compaction input (this moves the Arcs)
@@ -913,12 +867,10 @@ mod tests {
             base_path.clone(),
             None,
             Arc::clone(&registry),
-            crate::compaction::SubcompactionPlanner::with_config(
-                crate::compaction::SubcompactionConfig {
-                    min_size_for_split: u64::MAX,
-                    ..Default::default()
-                },
-            ),
+            crate::compaction::SubcompactionPlanner::with_config(SubcompactionConfig {
+                min_size_for_split: u64::MAX,
+                ..Default::default()
+            }),
         );
 
         let result = executor.execute(&job).unwrap();

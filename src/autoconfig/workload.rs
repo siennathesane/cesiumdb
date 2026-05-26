@@ -26,13 +26,8 @@ use crate::Db;
 /// Metrics collected from a single benchmark run.
 #[derive(Debug, Clone)]
 pub struct BenchmarkMetrics {
-    pub duration_secs: f64,
     pub ops_per_sec: f64,
-    pub bytes_written: u64,
-    pub bytes_read: u64,
     pub write_amplification: f64,
-    pub degradation_ratio: f64,
-    pub p99_latency_us: f64,
 }
 
 /// Runs a sustained write benchmark.
@@ -58,7 +53,7 @@ pub fn run_write_benchmark(
             let bytes = bytes_written.clone();
             let shutdown = shutdown.clone();
             thread::spawn(move || {
-                let rng = ThreadRng::default();
+                let _rng = ThreadRng::default();
                 let value = vec![0u8; value_size];
                 let worker_key_offset = id * 1_000_000;
                 while !shutdown.load(Ordering::Relaxed) {
@@ -92,13 +87,8 @@ pub fn run_write_benchmark(
     };
 
     BenchmarkMetrics {
-        duration_secs: elapsed,
         ops_per_sec: total_ops as f64 / elapsed,
-        bytes_written: total_bytes,
-        bytes_read: 0,
         write_amplification: write_amp,
-        degradation_ratio: 1.0,
-        p99_latency_us: 0.0,
     }
 }
 
@@ -116,16 +106,12 @@ pub fn run_read_benchmark(
 ) -> BenchmarkMetrics {
     let start = Instant::now();
     let ops = Arc::new(AtomicU64::new(0));
-    let bytes_read = Arc::new(AtomicU64::new(0));
-    let bytes_written = Arc::new(AtomicU64::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let workers: Vec<_> = (0..num_workers)
         .map(|id| {
             let db = db.clone();
             let ops = ops.clone();
-            let bytes_r = bytes_read.clone();
-            let bytes_w = bytes_written.clone();
             let shutdown = shutdown.clone();
             thread::spawn(move || {
                 let mut rng = ThreadRng::default();
@@ -136,9 +122,7 @@ pub fn run_read_benchmark(
                     for _ in 0..reads_per_write {
                         let key_idx = rng.random_range(0..key_space);
                         let key = format!("key_{:010}", key_idx).into_bytes();
-                        if let Ok(Some(v)) = db.get(&key) {
-                            bytes_r.fetch_add(v.len() as u64, Ordering::Relaxed);
-                        }
+                        let _ = db.get(&key);
                         ops.fetch_add(1, Ordering::Relaxed);
                     }
                     // Occasional write
@@ -146,7 +130,6 @@ pub fn run_read_benchmark(
                         .into_bytes();
                     let _ = db.put(&key, &value);
                     ops.fetch_add(1, Ordering::Relaxed);
-                    bytes_w.fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
                 }
             })
         })
@@ -162,13 +145,8 @@ pub fn run_read_benchmark(
     let total_ops = ops.load(Ordering::Relaxed);
 
     BenchmarkMetrics {
-        duration_secs: elapsed,
         ops_per_sec: total_ops as f64 / elapsed,
-        bytes_written: bytes_written.load(Ordering::Relaxed),
-        bytes_read: bytes_read.load(Ordering::Relaxed),
         write_amplification: 1.0,
-        degradation_ratio: 1.0,
-        p99_latency_us: 0.0,
     }
 }
 

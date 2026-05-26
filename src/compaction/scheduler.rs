@@ -35,7 +35,6 @@ use crate::{
         KeyRange,
         VersionSet,
     },
-    segment::Segment,
     version::VersionManager,
 };
 
@@ -112,11 +111,6 @@ pub struct CompactionScheduler {
 }
 
 impl CompactionScheduler {
-    /// Creates a new scheduler with default configuration
-    pub fn new(version_manager: Arc<VersionManager>) -> Self {
-        Self::with_config(SchedulerConfig::default(), version_manager)
-    }
-
     /// Creates a new scheduler with custom configuration
     pub fn with_config(config: SchedulerConfig, version_manager: Arc<VersionManager>) -> Self {
         Self {
@@ -210,8 +204,8 @@ impl CompactionScheduler {
         // 2. At most one L0 compaction
         if version.l0.len() >= self.config.l0_compaction_trigger {
             let l0_conflicts = version.l0.iter().any(|s| in_flight.contains(&s.id()));
-            if !l0_conflicts {
-                if let Some(job) = self.create_l0_compaction(version) {
+            if !l0_conflicts
+                && let Some(job) = self.create_l0_compaction(version) {
                     // Verify none of the chosen L0 segments are in-flight
                     let conflicts = job
                         .input
@@ -225,7 +219,6 @@ impl CompactionScheduler {
                         }
                     }
                 }
-            }
         }
 
         // 3. Level compactions — try every level above threshold, sorted by score
@@ -247,7 +240,7 @@ impl CompactionScheduler {
                     .segments
                     .iter()
                     .any(|s| in_flight.contains(&s.id())) ||
-                    job.next_level_input.as_ref().map_or(false, |next| {
+                    job.next_level_input.as_ref().is_some_and(|next| {
                         next.segments.iter().any(|s| in_flight.contains(&s.id()))
                     });
                 if !conflicts {
@@ -257,73 +250,6 @@ impl CompactionScheduler {
         }
 
         jobs
-    }
-
-    /// Finds a trivial move opportunity
-    ///
-    /// A segment can be trivially moved if it doesn't overlap with
-    /// any segments in the next level.
-    fn find_trivial_move(&self, version: &VersionSet) -> Option<CompactionJob> {
-        // Check each level for trivial move candidates
-        for level in &version.levels {
-            // Can't move from the last level
-            if level.level_num as usize >= version.num_levels() - 1 {
-                continue;
-            }
-
-            // Leveled compaction only (tiered allows overlaps)
-            if level.strategy.allows_overlaps() {
-                continue;
-            }
-
-            // Look for segments that don't overlap with next level
-            let next_level_num = level.level_num + 1;
-            let next_level = &version.levels[next_level_num as usize - 1];
-
-            for segment in &level.segments {
-                let segment_range = level
-                    .key_ranges
-                    .iter()
-                    .find(|r| r.segment_id == segment.id())
-                    .expect("segment should have key range");
-
-                // Check if this segment overlaps with any segment in next level
-                let has_overlap = next_level
-                    .key_ranges
-                    .iter()
-                    .any(|r| r.overlaps(segment_range));
-
-                if !has_overlap {
-                    // Found a trivial move!
-                    let input = CompactionInput::with_key_range(
-                        level.level_num,
-                        vec![segment.clone()],
-                        &level.key_ranges,
-                    );
-
-                    let output = CompactionOutput::new(
-                        next_level_num,
-                        self.config.target_segment_size_for_level(next_level_num),
-                    );
-
-                    let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-
-                    // Trivial moves don't create new segments, so allocate 0 IDs
-                    let allocated_ids: Vec<u64> = vec![];
-
-                    return Some(CompactionJob::new(
-                        job_id,
-                        CompactionJobType::TrivialMove,
-                        input,
-                        None,
-                        output,
-                        allocated_ids,
-                    ));
-                }
-            }
-        }
-
-        None
     }
 
     /// Creates an L0 compaction job
@@ -419,32 +345,6 @@ impl CompactionScheduler {
             output,
             allocated_ids,
         ))
-    }
-
-    /// Finds the level with the highest compaction score
-    fn find_level_compaction(&self, version: &VersionSet) -> Option<CompactionJob> {
-        // Find level with highest score above threshold
-        let mut best_level: Option<(u8, f64)> = None;
-
-        for level in &version.levels {
-            let score = level.score();
-
-            if score > self.config.score_threshold {
-                if let Some((_, best_score)) = best_level {
-                    if score > best_score {
-                        best_level = Some((level.level_num, score));
-                    }
-                } else {
-                    best_level = Some((level.level_num, score));
-                }
-            }
-        }
-
-        if let Some((level_num, _)) = best_level {
-            self.create_level_compaction(version, level_num)
-        } else {
-            None
-        }
     }
 
     /// Creates a level compaction job
@@ -629,11 +529,6 @@ impl CompactionScheduler {
         }
     }
 
-    /// Checks if writes should be stopped due to L0 file count
-    pub fn should_stop_writes(&self, version: &VersionSet) -> bool {
-        version.l0.len() >= self.config.l0_stop_writes_trigger
-    }
-
     /// Returns the current configuration
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
@@ -648,7 +543,8 @@ mod tests {
     #[test]
     fn test_scheduler_creation() {
         let version_manager = Arc::new(VersionManager::new(7));
-        let scheduler = CompactionScheduler::new(version_manager);
+        let scheduler =
+            CompactionScheduler::with_config(SchedulerConfig::default(), version_manager);
         assert_eq!(scheduler.config.l0_compaction_trigger, 8);
         assert_eq!(scheduler.config.max_concurrent_jobs, 8);
     }
@@ -673,7 +569,8 @@ mod tests {
     #[test]
     fn test_no_compaction_needed_empty_version() {
         let version_manager = Arc::new(VersionManager::new(7));
-        let scheduler = CompactionScheduler::new(version_manager);
+        let scheduler =
+            CompactionScheduler::with_config(SchedulerConfig::default(), version_manager);
         let version = VersionSet::new(0, 7);
 
         let job = scheduler.pick_compaction(&version);
@@ -681,23 +578,10 @@ mod tests {
     }
 
     #[test]
-    fn test_should_stop_writes() {
-        let version_manager = Arc::new(VersionManager::new(7));
-        let scheduler = CompactionScheduler::new(version_manager);
-        let version = VersionSet::new(0, 7);
-
-        // Empty L0 should not stop writes
-        assert!(!scheduler.should_stop_writes(&version));
-
-        // We can't easily add segments without full infrastructure,
-        // but we can test the threshold logic
-        assert_eq!(scheduler.config.l0_stop_writes_trigger, 16);
-    }
-
-    #[test]
     fn test_job_id_increments() {
         let version_manager = Arc::new(VersionManager::new(7));
-        let scheduler = CompactionScheduler::new(version_manager);
+        let scheduler =
+            CompactionScheduler::with_config(SchedulerConfig::default(), version_manager);
 
         let id1 = scheduler.next_job_id.load(Ordering::SeqCst);
         scheduler.next_job_id.fetch_add(1, Ordering::SeqCst);

@@ -10,9 +10,3 @@ pub mod zero_copy_merge;
 
 pub use basic::MergeIterator;
 pub(crate) use raw_merge::RawMergeIterator;
-pub use zero_copy_merge::{
-    MergeError,
-    MergeSource,
-    MergeStats,
-    ZeroCopyMergeIterator,
-};

@@ -9,7 +9,6 @@ use std::{
 
 use bytes::Bytes;
 use rand::random;
-use tracing::instrument;
 
 use crate::{
     errs::SegmentError,
@@ -18,10 +17,7 @@ use crate::{
         ValueBytes,
     },
     memtable::Memtable,
-    merge::{
-        MergeIterator,
-        RawMergeIterator,
-    },
+    merge::RawMergeIterator,
     raw_entry::RawEntry,
     segment::{
         DEFAULT_SEGMENT_SIZE,
@@ -39,8 +35,6 @@ pub struct CompactOutput {
     pub min_key: Vec<u8>,
     /// Largest serialized key in the output segment (empty if no entries)
     pub max_key: Vec<u8>,
-    /// Number of entries written
-    pub entry_count: u64,
 }
 
 /// Reopen a closed segment for reading.
@@ -106,7 +100,7 @@ fn reopen_segment_for_reading(
             return Err(SegmentError::CorruptedBlock);
         }
 
-        match key_map.read_range(start..start + size, |slice| Bytes::copy_from_slice(slice)) {
+        match key_map.read_range(start..start + size, Bytes::copy_from_slice) {
             | Ok(v) => v,
             | Err(e) => return Err(e),
         }
@@ -116,168 +110,6 @@ fn reopen_segment_for_reading(
     let val_block_count = val_metadata.block_count() as u64;
 
     Segment::open(key_map, key_index, key_id, val_map, val_id, val_block_count)
-}
-
-#[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-pub fn compact<I>(
-    iterators: Vec<I>,
-    output_path: PathBuf,
-    segment_id: u64,
-) -> Result<CompactOutput, SegmentError>
-where
-    I: Iterator<Item = (KeyBytes, ValueBytes)>, {
-    use std::time::Instant;
-    let start_time = Instant::now();
-
-    // Ensure the output directory exists
-    if let Some(parent) = output_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            return Err(SegmentError::IoError(e));
-        }
-    }
-    if let Err(e) = fs::create_dir_all(&output_path) {
-        return Err(SegmentError::IoError(e));
-    }
-    let setup_time = start_time.elapsed();
-
-    let merge_start = Instant::now();
-    let merge_iter = MergeIterator::new(iterators);
-    let merge_setup_time = merge_start.elapsed();
-
-    let builder_start = Instant::now();
-    let builder = match SegmentBuilder::new(output_path.clone()) {
-        | Ok(b) => b,
-        | Err(e) => return Err(e),
-    };
-    let seed = random();
-    let segment = match builder.new_segment(segment_id, seed, DEFAULT_SEGMENT_SIZE) {
-        | Ok(s) => s,
-        | Err(e) => return Err(e),
-    };
-    let builder_time = builder_start.elapsed();
-
-    let mut entry_count = 0u64;
-    let mut min_key: Option<Vec<u8>> = None;
-    let mut max_key: Option<Vec<u8>> = None;
-    let mut last_key_bytes: Option<Bytes> = None; // Track last serialized key for max_key
-
-    // Unwrap the Arc to get mutable access
-    let segment_mut = match Arc::try_unwrap(segment) {
-        | Ok(s) => s,
-        | Err(_) => {
-            return Err(SegmentError::CantCreateWriter(
-                crate::segment::BlockType::Key,
-                segment_id,
-            ));
-        },
-    };
-
-    let seg = segment_mut;
-
-    // Track the last key (namespace + key bytes, without timestamp) to handle
-    // duplicates
-    let mut last_key: Option<(u64, Bytes)> = None;
-    let mut skip_until_new_key = false;
-
-    let mut serialize_time = std::time::Duration::ZERO;
-    let mut write_time = std::time::Duration::ZERO;
-    let loop_start = Instant::now();
-
-    for (key, value) in merge_iter {
-        let current_key = (key.ns(), key.key().clone());
-
-        // Check if this is a new logical key
-        let is_new_key = match &last_key {
-            | None => true,
-            | Some(prev) => prev != &current_key,
-        };
-
-        if is_new_key {
-            // New key - check if newest version is a tombstone
-            if value.is_tombstone() {
-                // Skip this key and all older versions
-                skip_until_new_key = true;
-                last_key = Some(current_key);
-                continue;
-            }
-            // Not a tombstone - write it (newest version only)
-            skip_until_new_key = false;
-            last_key = Some(current_key);
-        } else {
-            // Older version of a key we've already processed - skip it
-            continue;
-        }
-
-        // Serialize and write
-        let ser_start = Instant::now();
-        let key_bytes = key.serialize();
-        let val_bytes = value.serialize();
-        serialize_time += ser_start.elapsed();
-
-        // Track min key only once (first written)
-        if min_key.is_none() {
-            min_key = Some(key_bytes.to_vec());
-        }
-
-        // Write immediately (no extra indirection)
-        let write_start = Instant::now();
-        if let Err(e) = seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
-            return Err(e);
-        }
-        write_time += write_start.elapsed();
-        entry_count += 1;
-
-        // Store last key for max_key (cheap Bytes clone)
-        last_key_bytes = Some(key_bytes);
-    }
-
-    let loop_time = loop_start.elapsed();
-
-    // Clone max_key only once at the end (last key written)
-    if let Some(last) = last_key_bytes {
-        max_key = Some(last.to_vec());
-    }
-
-    // Close the segment (writes index and metadata)
-    let close_start = Instant::now();
-    if let Err(e) = seg.close() {
-        return Err(e);
-    }
-    let close_time = close_start.elapsed();
-
-    // Drop the writer segment to release mmap locks before reopening
-    drop(seg);
-
-    // Reopen the segment for reading so handles are populated
-    let reopened = match reopen_segment_for_reading(&output_path, segment_id) {
-        | Ok(s) => s,
-        | Err(e) => return Err(e),
-    };
-
-    let total_time = start_time.elapsed();
-    let merge_time = loop_time - serialize_time - write_time;
-
-    tracing::info!(
-        segment_id = segment_id,
-        entries = entry_count,
-        total_ms = total_time.as_millis(),
-        setup_ms = setup_time.as_millis(),
-        merge_setup_ms = merge_setup_time.as_millis(),
-        builder_ms = builder_time.as_millis(),
-        loop_ms = loop_time.as_millis(),
-        merge_ms = merge_time.as_millis(),
-        serialize_ms = serialize_time.as_millis(),
-        write_ms = write_time.as_millis(),
-        close_ms = close_time.as_millis(),
-        "Compaction timing breakdown"
-    );
-
-    Ok(CompactOutput {
-        segment: reopened,
-        min_key: min_key.unwrap_or_default(),
-        max_key: max_key.unwrap_or_default(),
-        entry_count,
-    })
 }
 
 /// Zero-copy compaction: merges raw serialized entries without deserializing.
@@ -298,11 +130,10 @@ where
     let start_time = Instant::now();
 
     // Ensure the output directory exists
-    if let Some(parent) = output_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+    if let Some(parent) = output_path.parent()
+        && let Err(e) = fs::create_dir_all(parent) {
             return Err(SegmentError::IoError(e));
         }
-    }
     if let Err(e) = fs::create_dir_all(&output_path) {
         return Err(SegmentError::IoError(e));
     }
@@ -319,7 +150,6 @@ where
         | Err(e) => return Err(e),
     };
 
-    let mut entry_count = 0u64;
     let mut min_key: Option<Vec<u8>> = None;
     let mut max_key: Option<Vec<u8>> = None;
     let mut last_key_bytes: Option<Bytes> = None;
@@ -338,7 +168,6 @@ where
     // dedup_key = [ns:8][user_key] (everything except timestamp)
     // Bytes::clone is just an Arc refcount bump — zero copy.
     let mut last_dedup_key: Option<Bytes> = None;
-    let mut skip_until_new_key = false;
 
     let mut write_time = std::time::Duration::ZERO;
     let loop_start = Instant::now();
@@ -359,11 +188,9 @@ where
 
         if is_new_key {
             if entry.is_tombstone() {
-                skip_until_new_key = true;
                 last_dedup_key = Some(entry.raw_key().slice(..entry.raw_key().len() - 16));
                 continue;
             }
-            skip_until_new_key = false;
             last_dedup_key = Some(entry.raw_key().slice(..entry.raw_key().len() - 16));
         } else {
             // Older version of a key we've already processed - skip it
@@ -384,7 +211,6 @@ where
             return Err(e);
         }
         write_time += write_start.elapsed();
-        entry_count += 1;
 
         last_key_bytes = Some(key_ref.clone());
     }
@@ -414,7 +240,6 @@ where
 
     tracing::info!(
         segment_id = segment_id,
-        entries = entry_count,
         total_ms = total_time.as_millis(),
         loop_ms = loop_time.as_millis(),
         write_ms = write_time.as_millis(),
@@ -426,13 +251,12 @@ where
         segment: reopened,
         min_key: min_key.unwrap_or_default(),
         max_key: max_key.unwrap_or_default(),
-        entry_count,
     })
 }
 
 /// Flush a memtable to disk as an L0 segment.
 ///
-/// Unlike `compact()`, this function preserves tombstones because:
+/// This function preserves tombstones because:
 /// - Tombstones in the memtable may be deleting keys from older L0 segments
 /// - They should only be discarded during major compaction when all versions
 ///   are merged
@@ -459,11 +283,10 @@ pub fn flush_memtable(
     segment_id: u64,
 ) -> Result<(Arc<Segment>, Vec<u8>, Vec<u8>), SegmentError> {
     // Ensure the output directory exists
-    if let Some(parent) = output_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+    if let Some(parent) = output_path.parent()
+        && let Err(e) = fs::create_dir_all(parent) {
             return Err(SegmentError::IoError(e));
         }
-    }
     if let Err(e) = fs::create_dir_all(&output_path) {
         return Err(SegmentError::IoError(e));
     }
@@ -478,8 +301,6 @@ pub fn flush_memtable(
         | Ok(s) => s,
         | Err(e) => return Err(e),
     };
-
-    let mut entry_count = 0u64;
 
     // Unwrap the Arc to get mutable access
     let segment_mut = match Arc::try_unwrap(segment) {
@@ -532,7 +353,6 @@ pub fn flush_memtable(
                 if let Err(e) = seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
                     return Err(e);
                 }
-                entry_count += 1;
                 max_key = Some(key_bytes.to_vec());
             }
 
@@ -552,7 +372,6 @@ pub fn flush_memtable(
         if let Err(e) = seg.write(key_bytes.as_ref(), val_bytes.as_ref()) {
             return Err(e);
         }
-        entry_count += 1;
         max_key = Some(key_bytes.to_vec());
     }
 
@@ -564,7 +383,6 @@ pub fn flush_memtable(
     tracing::info!(
         memtable_id = memtable.id(),
         segment_id = segment_id,
-        entries = entry_count,
         "Memtable flush complete"
     );
 
@@ -634,7 +452,7 @@ pub fn flush_memtable(
             return Err(SegmentError::CorruptedBlock);
         }
 
-        match key_map.read_range(start..start + size, |slice| Bytes::copy_from_slice(slice)) {
+        match key_map.read_range(start..start + size, Bytes::copy_from_slice) {
             | Ok(v) => v,
             | Err(e) => return Err(e),
         }
@@ -678,119 +496,6 @@ mod tests {
         },
         memtable::Memtable,
     };
-
-    #[test]
-    fn test_compact_empty_iterators() {
-        let dir = tempdir().unwrap();
-        let output_path = dir.path().join("compacted.segment");
-
-        let empty: Vec<Vec<(KeyBytes, ValueBytes)>> = vec![];
-        let iters = empty.into_iter().map(IntoIterator::into_iter).collect();
-
-        let result = compact(iters, output_path, 1);
-        assert!(result.is_ok(), "Compacting empty iterators should succeed");
-    }
-
-    #[test]
-    fn test_compact_single_memtable() {
-        let dir = tempdir().unwrap();
-        let output_path = dir.path().join("compacted.segment");
-        let clock = HybridLogicalClock::new();
-
-        let memtable = Memtable::new(1, 1024 * 1024);
-
-        // Insert some data
-        for i in 0..10 {
-            let key = KeyBytes::new(DEFAULT_NS, Bytes::from(format!("key-{}", i)), clock.time());
-            let val = ValueBytes::new(DEFAULT_NS, Bytes::from(format!("value-{}", i)));
-            memtable.put(key, val).unwrap();
-        }
-
-        let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
-        let segment = compact(vec![iter], output_path, 1).unwrap();
-
-        assert!(segment.segment.is_read_only());
-    }
-
-    #[test]
-    fn test_compact_multiple_memtables() {
-        let dir = tempdir().unwrap();
-        let output_path = dir.path().join("compacted.segment");
-        let clock = HybridLogicalClock::new();
-
-        let memtable1 = Memtable::new(1, 1024 * 1024);
-        let memtable2 = Memtable::new(2, 1024 * 1024);
-
-        // Insert data into first memtable
-        memtable1
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key1"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value1_v2")),
-            )
-            .unwrap();
-        memtable1
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key2"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value2_v1")),
-            )
-            .unwrap();
-
-        // Insert data into second memtable
-        memtable2
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key1"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value1_v3")),
-            )
-            .unwrap();
-        memtable2
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key3"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value3_v1")),
-            )
-            .unwrap();
-
-        let iter1 = memtable1.scan(Bound::Unbounded, Bound::Unbounded);
-        let iter2 = memtable2.scan(Bound::Unbounded, Bound::Unbounded);
-
-        let segment = compact(vec![iter1, iter2], output_path, 1).unwrap();
-
-        assert!(segment.segment.is_read_only());
-    }
-
-    #[test]
-    fn test_compact_preserves_version_order() {
-        let dir = tempdir().unwrap();
-        let output_path = dir.path().join("compacted.segment");
-        let clock = HybridLogicalClock::new();
-
-        let memtable1 = Memtable::new(1, 1024 * 1024);
-        let memtable2 = Memtable::new(2, 1024 * 1024);
-
-        // Insert different versions of same key
-        let key_name = Bytes::from("versioned-key");
-
-        memtable1
-            .put(
-                KeyBytes::new(DEFAULT_NS, key_name.clone(), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("v1")),
-            )
-            .unwrap();
-
-        memtable2
-            .put(
-                KeyBytes::new(DEFAULT_NS, key_name.clone(), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("v2")),
-            )
-            .unwrap();
-
-        let iter1 = memtable1.scan(Bound::Unbounded, Bound::Unbounded);
-        let iter2 = memtable2.scan(Bound::Unbounded, Bound::Unbounded);
-
-        let segment = compact(vec![iter1, iter2], output_path, 1).unwrap();
-
-        assert!(segment.segment.is_read_only());
-        // The segment should contain both versions in correct order
-    }
 
     #[test]
     fn test_flush_memtable_basic() {
@@ -940,172 +645,5 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2, "Should have 2 entries");
-    }
-
-    #[test]
-    fn test_compact_reopen_simple() {
-        // Simplest possible test: compact 2 entries, then reopen and read them back
-        let dir = tempdir().unwrap();
-        let output_path = dir.path().join("simple.segment");
-        let clock = HybridLogicalClock::new();
-
-        let memtable = Memtable::new(1, 1024 * 1024);
-        memtable
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key1"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value1")),
-            )
-            .unwrap();
-        memtable
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key2"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value2")),
-            )
-            .unwrap();
-
-        let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
-        let segment = compact(vec![iter], output_path.clone(), 1).unwrap();
-        assert!(segment.segment.is_read_only());
-
-        // Drop and reopen
-        drop(segment);
-        let builder = SegmentBuilder::new(output_path).unwrap();
-        let reopened = builder.open(1).unwrap();
-        let reader = reopened.new_reader().unwrap();
-
-        let mut count = 0;
-        for result in reader.scan(Bound::Unbounded, Bound::Unbounded) {
-            let (_key, _value) = result.unwrap();
-            count += 1;
-        }
-        assert_eq!(count, 2, "Should have 2 entries");
-    }
-
-    #[test]
-    fn test_compact_filters_tombstones() {
-        let dir = tempdir().unwrap();
-        let output_path = dir.path().join("compacted.segment");
-        let clock = HybridLogicalClock::new();
-
-        let memtable1 = Memtable::new(1, 1024 * 1024);
-        let memtable2 = Memtable::new(2, 1024 * 1024);
-
-        // Insert data in first memtable
-        memtable1
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key1"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value1")),
-            )
-            .unwrap();
-
-        // Insert a tombstone in second memtable
-        memtable2
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key1"), clock.time()),
-                ValueBytes::new_tombstone(DEFAULT_NS),
-            )
-            .unwrap();
-
-        // Add a regular key too
-        memtable2
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("key2"), clock.time()),
-                ValueBytes::new(DEFAULT_NS, Bytes::from("value2")),
-            )
-            .unwrap();
-
-        let iter1 = memtable1.scan(Bound::Unbounded, Bound::Unbounded);
-        let iter2 = memtable2.scan(Bound::Unbounded, Bound::Unbounded);
-
-        // Compact should filter out tombstones
-        let output_path_clone = output_path.clone();
-        let segment = compact(vec![iter1, iter2], output_path, 1).unwrap();
-
-        assert!(segment.segment.is_read_only());
-
-        // Drop the segment to ensure files are closed
-        drop(segment);
-
-        // Reopen the segment to read from it
-        let builder = SegmentBuilder::new(output_path_clone).unwrap();
-        let reopened = builder.open(1).unwrap();
-        let reader = reopened.new_reader().unwrap();
-        let mut count = 0;
-        for result in reader.scan(Bound::Unbounded, Bound::Unbounded) {
-            let (_key, value) = result.unwrap();
-            // None of the values should be tombstones
-            assert!(
-                !value.is_tombstone(),
-                "Tombstones should be filtered during compaction"
-            );
-            count += 1;
-        }
-
-        // We should only have key2 (key1's tombstone should have removed all versions)
-        assert_eq!(
-            count, 1,
-            "Should only have one non-tombstone entry after compaction"
-        );
-    }
-
-    #[test]
-    fn test_flush_vs_compact_tombstone_handling() {
-        let dir = tempdir().unwrap();
-        let clock = HybridLogicalClock::new();
-
-        // Create a memtable with a tombstone
-        let memtable = Arc::new(Memtable::new(1, 1024 * 1024));
-        memtable
-            .put(
-                KeyBytes::new(DEFAULT_NS, Bytes::from("deleted-key"), clock.time()),
-                ValueBytes::new_tombstone(DEFAULT_NS),
-            )
-            .unwrap();
-        memtable.freeze();
-
-        // Flush should preserve tombstones
-        let flush_path = dir.path().join("flushed.segment");
-        let (flushed_segment, _min_key, _max_key) =
-            flush_memtable(memtable.clone(), flush_path.clone(), 1).unwrap();
-
-        // Drop the segment to ensure files are closed
-        drop(flushed_segment);
-
-        // Reopen the flushed segment to read from it
-        let builder = SegmentBuilder::new(flush_path).unwrap();
-        let reopened_flush = builder.open(1).unwrap();
-        let flush_reader = reopened_flush.new_reader().unwrap();
-        let mut found_tombstone = false;
-        for result in flush_reader.scan(Bound::Unbounded, Bound::Unbounded) {
-            let (_key, value) = result.unwrap();
-            if value.is_tombstone() {
-                found_tombstone = true;
-            }
-        }
-        assert!(found_tombstone, "Flush should preserve tombstones for L0");
-
-        // Compact should filter tombstones
-        let compact_path = dir.path().join("compacted.segment");
-        let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
-        let compacted_segment = compact(vec![iter], compact_path.clone(), 2).unwrap();
-
-        // Drop the segment to ensure files are closed
-        drop(compacted_segment);
-
-        // Reopen the compacted segment to read from it
-        let builder2 = SegmentBuilder::new(compact_path).unwrap();
-        let reopened_compact = builder2.open(2).unwrap();
-        let compact_reader = reopened_compact.new_reader().unwrap();
-        let mut found_tombstone_in_compact = false;
-        for result in compact_reader.scan(Bound::Unbounded, Bound::Unbounded) {
-            let (_key, value) = result.unwrap();
-            if value.is_tombstone() {
-                found_tombstone_in_compact = true;
-            }
-        }
-        assert!(
-            !found_tombstone_in_compact,
-            "Compact should filter tombstones"
-        );
     }
 }

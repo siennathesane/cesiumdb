@@ -35,7 +35,11 @@ use opentelemetry::{
 #[cfg(feature = "telemetry")]
 use opentelemetry_sdk::{
     runtime,
-    trace::{RandomIdGenerator, Sampler, TracerProvider},
+    trace::{
+        RandomIdGenerator,
+        Sampler,
+        TracerProvider,
+    },
 };
 
 /// Guard that ensures telemetry is properly flushed on drop
@@ -132,8 +136,8 @@ pub fn init() -> TelemetryGuard {
 
 /// Create a debug span (only active when telemetry feature is enabled)
 ///
-/// This macro handles both span creation and entry, avoiding unit value warnings.
-/// Usage: `telemetry_span!("span_name", field = value);`
+/// This macro handles both span creation and entry, avoiding unit value
+/// warnings. Usage: `telemetry_span!("span_name", field = value);`
 #[macro_export]
 macro_rules! telemetry_span {
     ($name:expr $(, $($fields:tt)*)?) => {{

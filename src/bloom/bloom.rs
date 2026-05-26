@@ -1,10 +1,19 @@
 // Copyright (c) Dom Dwyer <dom@itsallbroken.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::bloom::{bitmap::CompressedBitmap, FilterSize, VecBitmap};
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash};
-use std::marker::PhantomData;
+use std::{
+    collections::hash_map::RandomState,
+    hash::{
+        BuildHasher,
+        Hash,
+    },
+    marker::PhantomData,
+};
+
+use crate::bloom::{
+    FilterSize,
+    bitmap::CompressedBitmap,
+};
 // TODO(dom): AND, XOR, NOT + examples
 
 // [`Bloom2`]: crate::bloom::Bloom2
@@ -12,8 +21,8 @@ use std::marker::PhantomData;
 // [`hash`]: std::hash::Hash
 // [`FilterSize`]: crate::bloom::FilterSize
 
-/// A trait to abstract bit storage for use in a [`Bloom2`](crate::bloom::Bloom2)
-/// filter.
+/// A trait to abstract bit storage for use in a
+/// [`Bloom2`](crate::bloom::Bloom2) filter.
 pub trait Bitmap {
     /// Construct a new [`Bitmap`] impl with capacity to hold at least `max_key`
     /// number of bits.
@@ -24,31 +33,28 @@ pub trait Bitmap {
 
     /// Return `true` if the given bit index was previously set to `true`.
     fn get(&self, key: usize) -> bool;
-
-    /// Return the size of the bitmap in bytes.
-    fn byte_size(&self) -> usize;
-
-    /// Return the bitwise OR of both `self` and `other`.`
-    fn or(&self, other: &Self) -> Self;
 }
 
 /// Construct [`Bloom2`] instances with varying parameters.
 ///
 /// ```rust
 /// use std::collections::hash_map::RandomState;
-/// use crate::bloom::{BloomFilterBuilder, FilterSize};
+///
+/// use crate::bloom::{
+///     BloomFilterBuilder,
+///     FilterSize,
+/// };
 ///
 /// let mut filter = BloomFilterBuilder::hasher(RandomState::default())
-///                     .size(FilterSize::KeyBytes2)
-///                     .build();
+///     .size(FilterSize::KeyBytes2)
+///     .build();
 ///
 /// filter.insert(&"success!");
 /// ```
 pub struct BloomFilterBuilder<H, B>
 where
     H: BuildHasher,
-    B: Bitmap,
-{
+    B: Bitmap, {
     hasher: H,
     bitmap: B,
     key_size: FilterSize,
@@ -101,8 +107,7 @@ where
 
     pub fn with_bitmap<U>(self) -> BloomFilterBuilder<H, U>
     where
-        U: Bitmap,
-    {
+        U: Bitmap, {
         BloomFilterBuilder {
             hasher: self.hasher,
             bitmap: U::new_with_capacity(key_size_to_bits(self.key_size)),
@@ -187,8 +192,7 @@ fn key_size_to_bits(k: FilterSize) -> usize {
 pub struct Bloom2<H, B, T>
 where
     H: BuildHasher,
-    B: Bitmap,
-{
+    B: Bitmap, {
     hasher: H,
     bitmap: B,
     key_size: FilterSize,
@@ -261,7 +265,7 @@ where
     ///     email: String,
     /// }
     ///
-    /// let user = User{
+    /// let user = User {
     ///     id: 42,
     ///     email: "dom@itsallbroken.com".to_string(),
     /// };
@@ -293,55 +297,8 @@ where
             .any(|chunk| self.bitmap.get(bytes_to_usize_key(chunk)))
     }
 
-    /// Union two [`Bloom2`] instances (of identical configuration), returning
-    /// the merged combination of both.
-    ///
-    /// The returned filter will return "true" for all calls to
-    /// [`Bloom2::contains()`] for all values that would return true for one (or
-    /// both) of the inputs, and will return "false" for all values that return
-    /// false from both inputs.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the two [`Bloom2`] instances have different
-    /// configuration.
-    pub fn union(&mut self, other: &Self) {
-        assert_eq!(self.key_size, other.key_size);
-        self.bitmap = self.bitmap.or(&other.bitmap);
-    }
-
-    /// Return the byte size of this filter.
-    pub fn byte_size(&mut self) -> usize {
-        self.bitmap.byte_size()
-    }
-
     pub fn bitmap(&self) -> &B {
         &self.bitmap
-    }
-}
-
-impl<H, T> Bloom2<H, CompressedBitmap, T>
-where
-    H: BuildHasher,
-{
-    /// Minimise the memory usage of this instance by shrinking the
-    /// underlying vectors, discarding their excess capacity.
-    pub fn shrink_to_fit(&mut self) {
-        self.bitmap.shrink_to_fit();
-    }
-}
-
-impl<H, T> Bloom2<H, VecBitmap, T>
-where
-    H: BuildHasher,
-{
-    /// Compress the bitmap to reduce memory consumption.
-    ///
-    /// The compressed representation is optimised for reads, but subsequent
-    /// inserts will be slower. This reduction is `O(n)` in time, and up to
-    /// `O(2n)` in space.
-    pub fn compress(self) -> Bloom2<H, CompressedBitmap, T> {
-        Bloom2::from(self)
     }
 }
 
@@ -350,18 +307,3 @@ fn bytes_to_usize_key<'a, I: IntoIterator<Item = &'a u8>>(bytes: I) -> usize {
         .into_iter()
         .fold(0, |key, &byte| (key << 8) | byte as usize)
 }
-
-impl<H, T> From<Bloom2<H, VecBitmap, T>> for Bloom2<H, CompressedBitmap, T>
-where
-    H: BuildHasher,
-{
-    fn from(v: Bloom2<H, VecBitmap, T>) -> Self {
-        Self {
-            hasher: v.hasher,
-            bitmap: CompressedBitmap::from(v.bitmap),
-            key_size: v.key_size,
-            _key_type: PhantomData,
-        }
-    }
-}
-

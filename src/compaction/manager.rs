@@ -26,7 +26,6 @@ use parking_lot::{
 
 use crate::{
     compaction::{
-        AdaptationPolicy,
         AdaptiveExecutor,
         CompactionExecutor,
         CompactionJob,
@@ -38,7 +37,6 @@ use crate::{
         SchedulerConfig,
         SegmentRegistry,
         SubcompactionPlanner,
-        WorkloadAdaptor,
         WorkloadStats,
     },
     manifest_writer::ManifestWriter,
@@ -70,14 +68,8 @@ pub struct CompactionManager {
     /// Parallel compaction coordinator
     parallel_manager: Arc<ParallelCompactionManager>,
 
-    /// Subcompaction planner
-    subcompaction_planner: Arc<SubcompactionPlanner>,
-
     /// Workload statistics
     workload_stats: Arc<WorkloadStats>,
-
-    /// Workload adaptor for dynamic strategy
-    workload_adaptor: parking_lot::Mutex<WorkloadAdaptor>,
 
     /// Background thread handle
     bg_thread: Option<thread::JoinHandle<()>>,
@@ -146,19 +138,14 @@ impl CompactionManager {
             Arc::clone(&version_manager),
         ));
         let parallel_manager = Arc::new(ParallelCompactionManager::new(4));
-        let subcompaction_planner = Arc::new(SubcompactionPlanner::new());
         let workload_stats = Arc::new(WorkloadStats::new());
-        let workload_adaptor = parking_lot::Mutex::new(WorkloadAdaptor::new(
-            Arc::clone(&workload_stats),
-            AdaptationPolicy::default(),
-        ));
 
         let executor_impl = Arc::new(CompactionExecutor::with_planner(
             Arc::clone(&version_manager),
             base_path,
             manifest,
             Arc::clone(&registry),
-            (*subcompaction_planner).clone(),
+            SubcompactionPlanner::new(),
         ));
 
         let limits = ResourceLimits::default();
@@ -176,9 +163,7 @@ impl CompactionManager {
             version_manager,
             registry,
             parallel_manager,
-            subcompaction_planner,
             workload_stats,
-            workload_adaptor,
             bg_thread: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             failed_jobs: Arc::new(AtomicU64::new(0)),
@@ -305,7 +290,7 @@ impl CompactionManager {
                             .segments
                             .iter()
                             .any(|seg| guard.contains(&seg.id())) ||
-                            job.next_level_input.as_ref().map_or(false, |next| {
+                            job.next_level_input.as_ref().is_some_and(|next| {
                                 next.segments.iter().any(|seg| guard.contains(&seg.id()))
                             })
                     };

@@ -1,5 +1,6 @@
 //! Zero-copy merge iterator for efficient compaction
 //!
+#![allow(unused)]
 //! This module provides a high-performance merge iterator that combines
 //! multiple sorted iterators without copying data unnecessarily.
 
@@ -8,15 +9,11 @@ use std::{
     collections::BinaryHeap,
 };
 
-use bytes::Bytes;
 
-use crate::{
-    keypair::{
+use crate::keypair::{
         KeyBytes,
         ValueBytes,
-    },
-    simd::simd_compare_keys,
-};
+    };
 
 /// Entry from a merge source
 #[derive(Clone)]
@@ -176,11 +173,10 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         // Initialize on first call
-        if self.keys_merged == 0 && self.heap.is_empty() {
-            if let Err(e) = self.init() {
+        if self.keys_merged == 0 && self.heap.is_empty()
+            && let Err(e) = self.init() {
                 return Some(Err(e));
             }
-        }
 
         loop {
             // Pop the smallest key

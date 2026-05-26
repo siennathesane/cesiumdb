@@ -1,12 +1,11 @@
 //! Workload statistics collection and analysis
-//!
+#![allow(unused)]
 //! Tracks database workload patterns to enable adaptive compaction strategy
 //! selection.
 
 use std::{
     sync::atomic::{
         AtomicU64,
-        AtomicUsize,
         Ordering,
     },
     time::{

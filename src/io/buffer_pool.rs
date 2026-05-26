@@ -1,5 +1,5 @@
 //! Buffer pool for reusable I/O buffers
-//!
+#![allow(unused)]
 //! This module provides a thread-safe pool of reusable buffers to minimize
 //! allocations during compaction and I/O operations.
 

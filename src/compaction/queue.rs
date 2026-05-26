@@ -1,5 +1,5 @@
 //! Lock-free job queue for compaction coordination
-//!
+#![allow(unused)]
 //! This module provides a thread-safe, lock-free queue for coordinating
 //! compaction jobs across multiple worker threads.
 

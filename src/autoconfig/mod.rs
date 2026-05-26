@@ -6,8 +6,6 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::Arc,
-    time::Instant,
 };
 
 use crate::{
@@ -242,7 +240,7 @@ score_threshold = {score_threshold}
             .target_file_size_multiplier(point.scheduler.target_file_size_multiplier)
             .scheduler_config(point.scheduler.clone());
 
-        let db = Db::open(opts);
+        let db = Db::open(opts).unwrap();
 
         // Write benchmark
         let write_metrics = workload::run_write_benchmark(

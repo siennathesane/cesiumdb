@@ -1,5 +1,5 @@
 //! Parallel compaction coordinator
-//!
+#![allow(unused)]
 //! Enables multiple compaction jobs to run concurrently when they have
 //! non-overlapping key ranges, maximizing throughput.
 

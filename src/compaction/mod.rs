@@ -25,12 +25,6 @@ pub mod workload;
 pub use adaptive::{
     AdaptiveExecutor,
     ResourceLimits,
-    ResourceUsage,
-};
-pub use adaptor::{
-    AdaptationPolicy,
-    StrategyRecommendation,
-    WorkloadAdaptor,
 };
 pub use executor::CompactionExecutor;
 pub use job::{
@@ -41,37 +35,15 @@ pub use manager::{
     CompactionManager,
     CompactionStats,
 };
-pub use parallel::{
-    ParallelCompactionCoordinator,
-    ParallelCompactionManager,
-    ParallelStats,
-};
-pub use queue::{
-    CompactionQueue,
-    JobPriority,
-    QueueStats,
-};
-pub use range_deletion::{
-    RangeDeletionStats,
-    RangeTombstone,
-    RangeTombstoneManager,
-};
-pub use registry::{
-    RegistryStats,
-    SegmentRegistry,
-};
+pub use parallel::ParallelCompactionManager;
+pub use queue::CompactionQueue;
+pub use registry::SegmentRegistry;
 pub use scheduler::{
     CompactionScheduler,
     SchedulerConfig,
 };
 pub use subcompaction::{
-    SubcompactionConfig,
     SubcompactionJob,
     SubcompactionPlanner,
-    SubcompactionStats,
 };
-pub use workload::{
-    WorkloadAnalysis,
-    WorkloadPattern,
-    WorkloadStats,
-};
+pub use workload::WorkloadStats;

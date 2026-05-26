@@ -1,5 +1,5 @@
 //! Parallel segment writing for high-throughput compaction
-//!
+#![allow(unused)]
 //! This module provides parallel writing capabilities for segments,
 //! allowing multiple blocks to be written concurrently during compaction.
 

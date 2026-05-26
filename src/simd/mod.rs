@@ -7,8 +7,4 @@
 
 pub mod key_compare;
 
-pub use key_compare::{
-    SimdCapabilities,
-    simd_compare_keys,
-    simd_memcmp,
-};
+pub use key_compare::simd_compare_keys;

@@ -1,5 +1,5 @@
 //! Range deletion optimization
-//!
+#![allow(unused)]
 //! Efficiently handles deletion of large contiguous key ranges by using
 //! range tombstones instead of individual per-key tombstones.
 
@@ -87,17 +87,15 @@ impl RangeTombstone {
         }
 
         // Adjacent (this.end + 1 == other.start or other.end + 1 == this.start)
-        if let Some(next) = self.next_key() {
-            if next.as_ref() == other.start.as_ref() {
+        if let Some(next) = self.next_key()
+            && next.as_ref() == other.start.as_ref() {
                 return true;
             }
-        }
 
-        if let Some(next) = other.next_key() {
-            if next.as_ref() == self.start.as_ref() {
+        if let Some(next) = other.next_key()
+            && next.as_ref() == self.start.as_ref() {
                 return true;
             }
-        }
 
         false
     }

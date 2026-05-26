@@ -1,40 +1,24 @@
 use std::{
-    cmp::min,
     fmt::Debug,
-    hash::RandomState,
-    io::Read,
     ptr,
-    sync::Arc,
 };
 
-use crate::bloom::{
-    Bloom2,
-    BloomFilterBuilder,
-    BytesBitmap,
-    CompressedBitmap,
-    FilterSize::KeyBytes3,
-};
 use bytes::{
     BufMut,
     Bytes,
     BytesMut,
 };
-use gxhash::{
-    GxBuildHasher,
-    GxHasher,
-    gxhash64,
-};
-use tracing::{
-    instrument,
-    trace,
-};
+use gxhash::gxhash64;
+use tracing::instrument;
 
 use crate::{
-    hash::SeedableHasher,
-    utils::{
-        Deserializer,
-        Serializer,
+    bloom::{
+        Bloom2,
+        BloomFilterBuilder,
+        BytesBitmap,
+        FilterSize::KeyBytes3,
     },
+    hash::SeedableHasher,
 };
 
 // Index header constants
@@ -48,10 +32,6 @@ const INDEX_HEADER_SIZE: usize = INDEX_HEADER_FIELDS * size_of::<u64>();
 const OFFSET_ENTRY_SIZE: usize = 2 * size_of::<u64>();
 /// Minimum valid index size (header + some data)
 pub(crate) const MIN_INDEX_SIZE: usize = 56;
-
-/// The value at which the bloom filter has a 50% probability of false positives
-/// for 3-byte key storage
-const BLOOM_OVERRIDE: usize = 10300768;
 
 /// Integrated index that combines bloom filtering with block-level lookup. The
 /// workflow is exposed for internal flexibility. Lookups are O(log n) for any
@@ -197,7 +177,7 @@ impl Index {
     #[instrument(level = "trace")]
     pub fn get_namespace_block(&self, ns: u64) -> Option<u64> {
         self.ns_offset_entries
-            .binary_search_by_key(&ns, |(n, b)| *n)
+            .binary_search_by_key(&ns, |(n, _b)| *n)
             .ok()
             .map(|idx| self.ns_offset_entries[idx].1)
     }
@@ -207,7 +187,7 @@ impl Index {
     pub fn get_block(&self, key: &[u8]) -> Option<u64> {
         let hash = gxhash64(key, self.bloom_filter_seed);
         self.block_offset_entries
-            .binary_search_by_key(&hash, |(h, b)| *h)
+            .binary_search_by_key(&hash, |(h, _b)| *h)
             .ok()
             .map(|idx| self.block_offset_entries[idx].1)
     }
@@ -253,11 +233,6 @@ impl Index {
         header_size + bloom_size + block_offset_size + ns_offset_size
     }
 
-    /// get number of block entries in the in-memory index
-    fn block_entries_len(&self) -> usize {
-        self.block_offset_entries.len()
-    }
-
     /// Finalizes the Index by writing it directly to a memory location.
     ///
     /// # Safety
@@ -271,7 +246,7 @@ impl Index {
         // SAFETY: Verify alignment invariants in debug builds
         debug_assert!(!dst.is_null(), "Destination pointer must not be null");
         debug_assert!(
-            dst as usize % std::mem::align_of::<u64>() == 0,
+            (dst as usize).is_multiple_of(std::mem::align_of::<u64>()),
             "Destination pointer must be 8-byte aligned for u64 writes"
         );
 
@@ -472,7 +447,7 @@ impl From<Bytes> for Index {
             block_buf.copy_from_slice(chunk[8..16].as_ref());
             let block_offset = u64::from_le_bytes(block_buf);
 
-            match ns_offset_entries.binary_search_by_key(&ns, |(n, b)| *n) {
+            match ns_offset_entries.binary_search_by_key(&ns, |(n, _b)| *n) {
                 | Ok(_) => {},
                 | Err(idx) => ns_offset_entries.insert(idx, (ns, block_offset)),
             }
@@ -515,7 +490,7 @@ impl Debug for Index {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    
 
     use bytes::Bytes;
 
@@ -559,7 +534,7 @@ mod tests {
         assert_eq!(index.id(), 42);
         assert_eq!(index.block_count(), 0);
         assert_eq!(index.ns_offset_count(), 0);
-        assert_eq!(index.block_entries_len(), 0);
+        assert_eq!(index.block_offset_entries.len(), 0);
     }
 
     #[test]
@@ -612,20 +587,16 @@ mod tests {
 
         // add items
         let mut keys = Vec::new();
-        let mut ns_offsets = 0;
-        let mut blocks = 0;
         for i in 0..1000 {
             let key = create_test_key(i);
             index.insert_item(&key);
 
             if i % 20 == 0 {
                 index.insert_ns_offset(i as u64);
-                ns_offsets += 1;
             }
 
             if i % 100 == 0 {
                 index.inc_block_count(1);
-                blocks += 1;
             }
 
             keys.push(key);
@@ -669,20 +640,20 @@ mod tests {
 
         // add items
         let mut keys = Vec::new();
-        let mut ns_offsets = 0;
-        let mut blocks = 0;
+        let mut _ns_offsets = 0;
+        let mut _blocks = 0;
         for i in 0..1000 {
             let key = create_test_key(i);
             index.insert_item(&key);
 
             if i % 20 == 0 {
                 index.insert_ns_offset(i as u64);
-                ns_offsets += 1;
+                _ns_offsets += 1;
             }
 
             if i % 100 == 0 {
                 index.inc_block_count(1);
-                blocks += 1;
+                _blocks += 1;
             }
 
             keys.push(key);
@@ -697,8 +668,8 @@ mod tests {
         // verify the indexes match
         assert_eq!(id, deserialized.id);
         assert_eq!(seed, deserialized.bloom_filter_seed);
-        assert_eq!(ns_offsets, deserialized.ns_offset_entries.len());
-        assert_eq!(blocks, deserialized.block_count());
+        assert_eq!(_ns_offsets, deserialized.ns_offset_entries.len());
+        assert_eq!(_blocks, deserialized.block_count());
 
         // verify all added keys are found in the deserialized index
         for key in &keys {
@@ -721,7 +692,7 @@ mod tests {
         assert_eq!(deserialized.id(), 1);
         assert_eq!(deserialized.block_count(), 0);
         assert_eq!(deserialized.ns_offset_count(), 0);
-        assert_eq!(deserialized.block_entries_len(), 0);
+        assert_eq!(deserialized.block_offset_entries.len(), 0);
     }
 
     #[test]
@@ -1050,7 +1021,7 @@ mod tests {
         // Insert many namespaces to test binary search correctness
         let namespaces = vec![10u64, 20, 30, 40, 50, 60, 70, 80, 90, 100];
 
-        for (i, ns) in namespaces.iter().enumerate() {
+        for (_i, ns) in namespaces.iter().enumerate() {
             index.insert_ns_offset(*ns);
             index.inc_block_count(1);
         }

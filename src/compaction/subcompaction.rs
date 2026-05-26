@@ -1,5 +1,5 @@
 //! Subcompaction - range splitting for parallel execution
-//!
+#![allow(unused)]
 //! Splits large compaction jobs into smaller range-based sub-jobs that can
 //! be executed in parallel, dramatically improving throughput for large
 //! compactions.

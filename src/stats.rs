@@ -6,7 +6,7 @@ use std::sync::{
     atomic::AtomicUsize,
 };
 
-pub(crate) static STATS: LazyLock<Stats> = LazyLock::new(|| Stats::default());
+pub(crate) static STATS: LazyLock<Stats> = LazyLock::new(Stats::default);
 
 #[derive(Debug, Default)]
 pub(crate) struct Stats {

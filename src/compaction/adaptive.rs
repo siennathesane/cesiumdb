@@ -1,5 +1,5 @@
 //! Adaptive compaction executor with resource monitoring
-//!
+#![allow(unused)]
 //! Provides an intelligent thread pool that:
 //! - Monitors CPU and memory usage
 //! - Auto-tunes thread count based on workload
@@ -17,10 +17,7 @@ use std::{
         },
     },
     thread,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Duration,
 };
 
 use crate::{
@@ -265,7 +262,7 @@ impl AdaptiveExecutor {
                 thread::sleep(Duration::from_secs(1));
 
                 let current_jobs = jobs_completed.load(Ordering::Relaxed);
-                let jobs_delta = current_jobs - last_jobs_completed;
+                let _jobs_delta = current_jobs - last_jobs_completed;
                 let queue_depth = queue.queued_count();
                 let active = active_workers.load(Ordering::Relaxed);
                 let current_desired = desired_workers.load(Ordering::Relaxed);
@@ -381,17 +378,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        compaction::job::{
-            CompactionInput,
-            CompactionJobType,
-            CompactionOutput,
+        compaction::{
+            SubcompactionPlanner,
+            job::{
+                CompactionInput,
+                CompactionJobType,
+                CompactionOutput,
+            },
         },
-        levels::{
-            CompactionStrategy,
-            KeyRange,
-            Level,
-            VersionSet,
-        },
+        levels::KeyRange,
     };
 
     fn create_test_executor() -> (AdaptiveExecutor, TempDir) {
@@ -400,11 +395,12 @@ mod tests {
 
         let version_manager = Arc::new(VersionManager::new(7)); // 7 levels
         let registry = Arc::new(crate::compaction::SegmentRegistry::new(path.clone()));
-        let executor = Arc::new(CompactionExecutor::new(
+        let executor = Arc::new(CompactionExecutor::with_planner(
             Arc::clone(&version_manager),
             path,
             None,
             registry,
+            SubcompactionPlanner::new(),
         ));
         let queue = Arc::new(CompactionQueue::new());
 

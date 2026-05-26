@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn test_score_calculation_flush() {
         // Flush jobs score based on number of memtables
-        let input = CompactionInput {
+        let _input = CompactionInput {
             level: 0,
             segments: vec![], // Would normally contain memtable references
             key_range: KeyRange::new(vec![], vec![], 0),

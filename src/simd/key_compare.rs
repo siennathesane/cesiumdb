@@ -1,5 +1,5 @@
 //! SIMD-optimized key comparison
-//!
+#![allow(unused)]
 //! Provides vectorized key comparison operations that are significantly
 //! faster than byte-by-byte comparison for keys longer than 16 bytes.
 
@@ -88,7 +88,7 @@ pub fn simd_memcmp(a: &[u8], b: &[u8]) -> Ordering {
         unsafe { return simd_memcmp_neon(a, b) }
     }
 
-    // Fallback for other architectures
+    #[allow(unreachable_code)]
     a.cmp(b)
 }
 

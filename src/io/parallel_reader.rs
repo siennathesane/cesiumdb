@@ -1,5 +1,5 @@
 //! Parallel segment reading for high-throughput scans
-//!
+#![allow(unused)]
 //! This module provides parallel reading capabilities for segments,
 //! allowing multiple blocks/ranges to be read concurrently.
 
@@ -8,10 +8,7 @@ use std::{
     thread,
 };
 
-use bytes::{
-    Bytes,
-    BytesMut,
-};
+use bytes::Bytes;
 use crossbeam_channel::{
     Receiver,
     Sender,
@@ -19,14 +16,8 @@ use crossbeam_channel::{
 };
 
 use crate::{
-    block::{
-        BLOCK_SIZE,
-        Block,
-    },
-    io::buffer_pool::{
-        BufferPool,
-        PooledBuffer,
-    },
+    block::BLOCK_SIZE,
+    io::buffer_pool::BufferPool,
     segment::BlockType,
     segment_reader::SegmentReader,
     utils::Deserializer,

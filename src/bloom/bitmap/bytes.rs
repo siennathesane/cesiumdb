@@ -1,15 +1,19 @@
 // Copyright (c) Dom Dwyer <dom@itsallbroken.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
-
-
 use std::convert::TryInto;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{
+    Bytes,
+    BytesMut,
+};
 
 use crate::bloom::{
-    bitmap::{bitmask_for_key, index_for_key},
     Bitmap,
+    bitmap::{
+        bitmask_for_key,
+        index_for_key,
+    },
 };
 
 /// A plain, heap-allocated, `O(1)` indexed bitmap using `bytes::BytesMut` for
@@ -31,10 +35,6 @@ pub struct BytesBitmap {
 impl BytesBitmap {
     pub fn freeze(self) -> Bytes {
         self.bitmap.freeze()
-    }
-
-    pub fn max_key(&self) -> usize {
-        self.max_key
     }
 
     pub fn from_bytes(bitmap: impl Into<Bytes>) -> Self {
@@ -80,30 +80,4 @@ impl Bitmap for BytesBitmap {
         let num = usize::from_ne_bytes(slice.try_into().unwrap());
         num & bitmask_for_key(key) != 0
     }
-
-    fn byte_size(&self) -> usize {
-        self.bitmap.len()
-    }
-
-    fn or(&self, other: &Self) -> Self {
-        assert_eq!(self.bitmap.len(), other.bitmap.len());
-
-        let mut result = BytesMut::with_capacity(self.bitmap.len());
-        let chunks = self
-            .bitmap
-            .chunks_exact(size_of::<usize>())
-            .zip(other.bitmap.chunks_exact(size_of::<usize>()));
-
-        for (a_chunk, b_chunk) in chunks {
-            let a = usize::from_ne_bytes(a_chunk.try_into().unwrap());
-            let b = usize::from_ne_bytes(b_chunk.try_into().unwrap());
-            result.put_slice(&(a | b).to_ne_bytes());
-        }
-
-        Self {
-            bitmap: result,
-            max_key: self.max_key,
-        }
-    }
 }
-
