@@ -531,7 +531,7 @@ mod x86_atomic_tests {
         for &success_order in &success_orderings {
             for &failure_order in &failure_orderings {
                 // Skip invalid combinations where failure is stronger than success
-                if (failure_order == Ordering::SeqCst && success_order != Ordering::SeqCst) {
+                if failure_order == Ordering::SeqCst && success_order != Ordering::SeqCst {
                     continue;
                 }
 
