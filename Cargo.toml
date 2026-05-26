@@ -4,7 +4,7 @@ description = "Blazing fast, persistent key-value store for Rust"
 license = "GPL-3.0"
 repository = "https://github.com/siennathesane/cesiumdb"
 authors = ["Sienna Meridian Satterwhite <sienna@r3t.io>"]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [lints.rust]
@@ -71,6 +71,9 @@ required-features = ["benchmarks"]
 name = "compaction"
 harness = false
 required-features = ["benchmarks"]
+
+[package.metadata.docs.rs]
+rustc-args = ["-C", "target-feature=+aes,+sse2"]
 
 [build-dependencies]
 cbindgen = "0.27.0"
