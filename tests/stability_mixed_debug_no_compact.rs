@@ -28,7 +28,7 @@ fn stability_mixed_debug_no_compact() {
     scheduler_config.l0_compaction_trigger = 10000;
     opts.scheduler_config(scheduler_config);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
     let verifier = Arc::new(Mutex::new(ShadowVerifier::new()));
 
     let config = StabilityConfig {

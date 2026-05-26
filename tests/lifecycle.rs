@@ -14,7 +14,7 @@ fn make_db(dir: &std::path::Path) -> Arc<Db> {
     opts.data_dir(dir.to_path_buf())
         .memtable_size(1024 * 1024) // 1MB memtable for faster flushes
         .max_memtables(2);
-    Db::open(opts)
+    Db::open(opts).unwrap()
 }
 
 #[test]

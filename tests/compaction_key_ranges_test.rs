@@ -13,7 +13,7 @@ fn test_l0_to_l1_compaction_with_key_ranges() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(256 * 1024) // Small memtable for frequent flushes
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Write data in multiple batches to create several L0 segments
     for batch in 0..3 {
@@ -62,7 +62,7 @@ fn test_overlap_detection_with_key_ranges() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(128 * 1024)
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Create L0 segments with distinct key ranges
     // Batch 1: keys starting with 'a'
@@ -108,7 +108,7 @@ fn test_multi_level_compaction_with_key_ranges() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(128 * 1024)
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Create enough data to trigger multiple levels of compaction
     for batch in 0..3 {

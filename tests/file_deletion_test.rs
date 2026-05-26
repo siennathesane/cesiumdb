@@ -34,7 +34,7 @@ fn test_flush_creates_segment_files() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(64 * 1024) // Note: memtable_size is currently a no-op in DbOptions
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Write enough data to fill at least one memtable and force a flush.
     // With 64MB default memtables, we need ~64MB of data.
@@ -74,7 +74,7 @@ fn test_compaction_data_integrity() {
     let mut opts = DbOptions::new();
     opts.data_dir(temp_dir.path().to_path_buf())
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Write a moderate amount of data
     for batch in 0..3 {

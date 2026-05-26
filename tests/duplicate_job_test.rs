@@ -13,7 +13,7 @@ fn test_manual_compact_no_duplicates() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(256 * 1024)
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Create L0 segments
     for i in 0..1000 {
@@ -50,7 +50,7 @@ fn test_in_flight_cleared_after_completion() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(256 * 1024)
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // First compaction
     for i in 0..800 {
@@ -97,7 +97,7 @@ fn test_concurrent_manual_compactions() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(128 * 1024)
         .max_memtables(2);
-    let db = std::sync::Arc::new(Db::open(opts));
+    let db = std::sync::Arc::new(Db::open(opts).unwrap());
 
     // Create data
     for i in 0..600 {

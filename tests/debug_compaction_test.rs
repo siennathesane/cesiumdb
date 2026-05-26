@@ -11,7 +11,7 @@ fn debug_compaction() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(256 * 1024)
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     for batch in 0..3 {
         for i in 0..500 {
@@ -27,7 +27,7 @@ fn debug_compaction() {
 
     db.compact().unwrap();
 
-    for i in 0..30 {
+    for _i in 0..30 {
         let stats = db.compaction_stats().unwrap();
         if stats.queued_jobs == 0 && stats.in_progress_jobs == 0 {
             break;

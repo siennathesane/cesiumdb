@@ -26,7 +26,7 @@ fn stability_write_read_verify() {
     let mut opts = DbOptions::default();
     opts.data_dir(temp_dir.path().to_path_buf());
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
     let verifier = Arc::new(Mutex::new(ShadowVerifier::new()));
 
     let config = StabilityConfig {

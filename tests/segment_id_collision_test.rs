@@ -20,7 +20,7 @@ fn test_no_segment_id_collision_between_flush_and_compaction() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(512 * 1024) // 512KB memtable for faster flushes
         .max_memtables(2);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Trigger multiple flushes to create L0 segments
     for batch in 0..3 {
@@ -75,7 +75,7 @@ fn test_segment_id_persists_across_restart() {
     {
         let mut opts = DbOptions::new();
         opts.data_dir(temp_dir.path().to_path_buf());
-        let db = Db::open(opts);
+        let db = Db::open(opts).unwrap();
 
         db.put(b"key1", b"value1").unwrap();
         db.put(b"key2", b"value2").unwrap();
@@ -89,7 +89,7 @@ fn test_segment_id_persists_across_restart() {
     {
         let mut opts = DbOptions::new();
         opts.data_dir(temp_dir.path().to_path_buf());
-        let db = Db::open(opts);
+        let db = Db::open(opts).unwrap();
 
         db.put(b"key4", b"value4").unwrap();
         db.put(b"key5", b"value5").unwrap();
@@ -123,7 +123,7 @@ fn test_concurrent_flush_and_compaction_no_collisions() {
     opts.data_dir(temp_dir.path().to_path_buf())
         .memtable_size(256 * 1024) // Small memtable for frequent flushes
         .max_memtables(3);
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Spawn multiple threads doing writes (triggering flushes)
     let mut handles = vec![];

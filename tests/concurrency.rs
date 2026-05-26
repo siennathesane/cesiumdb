@@ -22,7 +22,7 @@ fn make_db(dir: &std::path::Path) -> Arc<Db> {
     opts.data_dir(dir.to_path_buf())
         .memtable_size(512 * 1024) // 512KB memtable for faster rotation
         .max_memtables(4);
-    Db::open(opts)
+    Db::open(opts).unwrap()
 }
 
 #[test]

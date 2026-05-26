@@ -12,7 +12,7 @@ fn test_multi_version_point_read() {
     let mut opts = DbOptions::default();
     opts.data_dir(temp_dir.path().to_path_buf());
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     db.put(b"testkey", b"value1").unwrap();
     db.put(b"testkey", b"value2").unwrap();
@@ -38,7 +38,7 @@ fn test_multi_version_point_read() {
     let start = b"testkey".to_vec();
     let end = b"testkey".to_vec();
     let mut count = 0;
-    for (k, v) in db.scan(Bound::Included(&start), Bound::Included(&end)) {
+    for (k, v) in db.scan(Bound::Included(&start), Bound::Included(&end)).unwrap() {
         println!(
             "Scan entry {}: key={:?}, value={:?}",
             count,

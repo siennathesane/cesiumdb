@@ -14,7 +14,7 @@ use tempfile::TempDir;
 fn make_db_with_path(path: std::path::PathBuf) -> Arc<Db> {
     let mut opts = DbOptions::new();
     opts.data_dir(path);
-    Db::open(opts)
+    Db::open(opts).unwrap()
 }
 
 #[test]

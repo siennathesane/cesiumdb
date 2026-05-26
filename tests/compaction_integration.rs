@@ -66,7 +66,7 @@ fn test_10gb_write_heavy_workload() {
         .memtable_size(64 * 1024 * 1024) // 64MB memtables
         .max_memtables(4);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Target: 10GB of data
     // Strategy: Write 1KB values, need ~10 million entries
@@ -253,7 +253,7 @@ fn test_concurrent_reads_during_compaction() {
     opts.data_dir(db_path.clone())
         .memtable_size(32 * 1024 * 1024);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Phase 1: Populate database with 1GB of data
     const VALUE_SIZE: usize = 1024;
@@ -379,7 +379,7 @@ fn test_mixed_workload_with_updates() {
     opts.data_dir(db_path.clone())
         .memtable_size(32 * 1024 * 1024);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     const VALUE_SIZE: usize = 512;
     const NUM_KEYS: u64 = 1_000_000; // 1M keys
@@ -551,7 +551,7 @@ fn test_deletion_with_compaction() {
     opts.data_dir(db_path.clone())
         .memtable_size(16 * 1024 * 1024);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     const VALUE_SIZE: usize = 1024;
     const NUM_ENTRIES: u64 = 500_000; // 500k entries
@@ -654,7 +654,7 @@ fn test_background_compaction_triggers() {
         .memtable_size(8 * 1024 * 1024) // Small memtables to trigger flushes
         .max_memtables(4); // Trigger compaction quickly
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     const VALUE_SIZE: usize = 1024;
     const NUM_ENTRIES: u64 = 200_000;
@@ -741,7 +741,7 @@ fn test_point_lookup_performance() {
     opts.data_dir(db_path.clone())
         .memtable_size(64 * 1024 * 1024);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     const VALUE_SIZE: usize = 256;
     const NUM_ENTRIES: u64 = 1_000_000;

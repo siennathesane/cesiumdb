@@ -18,7 +18,7 @@ fn test_l0_key_ranges_persist_across_flush() {
         .memtable_size(512 * 1024) // 512KB memtable
         .max_memtables(2);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Insert keys "a" to "z"
     for c in b'a'..=b'z' {
@@ -59,7 +59,7 @@ fn test_l0_key_ranges_recovered_from_manifest() {
             .data_dir(temp_dir.path().to_path_buf())
             .memtable_size(512 * 1024)
             .max_memtables(2);
-        let db = Db::open(opts1);
+        let db = Db::open(opts1).unwrap();
         db.put(b"m", b"value_m").unwrap();
         db.put(b"p", b"value_p").unwrap();
         db.put(b"x", b"value_x").unwrap();
@@ -74,7 +74,7 @@ fn test_l0_key_ranges_recovered_from_manifest() {
             .data_dir(temp_dir.path().to_path_buf())
             .memtable_size(512 * 1024)
             .max_memtables(2);
-        let db = Db::open(opts2);
+        let db = Db::open(opts2).unwrap();
 
         // Verify all keys are readable after recovery
         let result_m = db.get(b"m").unwrap();
@@ -112,7 +112,7 @@ fn test_multiple_l0_segments_have_key_ranges() {
         .memtable_size(512 * 1024)
         .max_memtables(2);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Create multiple L0 segments with different key ranges
     // Batch 1: keys starting with "a"
@@ -171,7 +171,7 @@ fn test_l0_compaction_uses_key_ranges() {
         .memtable_size(256 * 1024) // Smaller memtable for more L0 files
         .max_memtables(2);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Create many L0 segments to trigger compaction
     for batch in 0..10 {

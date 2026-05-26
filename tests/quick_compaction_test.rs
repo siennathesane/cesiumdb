@@ -16,7 +16,7 @@ fn test_compaction_small_dataset() {
         .memtable_size(32 * 1024 * 1024)
         .max_memtables(4);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Write 100k keys
     const NUM_KEYS: u64 = 100_000;

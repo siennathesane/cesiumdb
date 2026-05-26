@@ -299,7 +299,7 @@ fn open_db(args: &Args) -> Arc<Db> {
     opts.scheduler_config(scheduler);
 
     // Note: block_size isn't directly exposed on DbOptions yet.
-    Db::open(opts)
+    Db::open(opts).unwrap()
 }
 
 fn run_fillseq(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
@@ -603,6 +603,7 @@ fn run_seekrandom(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
                     let op_start = Instant::now();
                     let _count = db
                         .scan(Bound::Included(&key), Bound::Unbounded)
+                        .unwrap()
                         .take(10)
                         .count();
                     local.push(op_start.elapsed().as_micros() as u64);

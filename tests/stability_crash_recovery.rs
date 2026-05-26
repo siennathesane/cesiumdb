@@ -3,7 +3,6 @@
 //! Writes data, drops the Db without shutdown (simulating a crash),
 //! then reopens and verifies all committed data is present.
 
-use std::sync::Arc;
 
 use cesiumdb::{
     Db,
@@ -23,7 +22,7 @@ fn stability_crash_recovery() {
     let mut opts = DbOptions::default();
     opts.data_dir(path.clone());
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
     let mut verifier = ShadowVerifier::new();
 
     // Write a known set of keys
@@ -50,7 +49,7 @@ fn stability_crash_recovery() {
     // Phase 2: Reopen and verify
     let mut opts2 = DbOptions::default();
     opts2.data_dir(path);
-    let db2 = Db::open(opts2);
+    let db2 = Db::open(opts2).unwrap();
 
     // Full point-read verification
     let mut errors = 0;

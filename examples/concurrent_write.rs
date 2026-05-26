@@ -1,7 +1,4 @@
-use std::{
-    sync::Arc,
-    thread,
-};
+use std::thread;
 
 use cesiumdb::{
     Db,
@@ -10,7 +7,7 @@ use cesiumdb::{
 
 fn main() {
     let opts = DbOptions::new();
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     let key = vec![0u8; 32];
     let val = vec![0u8; 256];

@@ -192,7 +192,6 @@ impl MetricsCollector {
         self.latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     fn record_error(&self) {
         self.error_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -506,6 +505,7 @@ impl Workload for MixedWorkload {
                 let start = self.random_key(rng);
                 let _ = db
                     .scan(Bound::Included(&start), Bound::Unbounded)
+                    .unwrap()
                     .take(100)
                     .count();
                 OpType::Scan
@@ -772,6 +772,7 @@ impl Workload for ScanHeavyWorkload {
                 let scan_size = rng.random_range(10..1000);
                 let _ = db
                     .scan(Bound::Included(&start_key), Bound::Unbounded)
+                    .unwrap()
                     .take(scan_size)
                     .count();
                 OpType::Scan
@@ -941,7 +942,6 @@ impl Workload for DeleteHeavyWorkload {
 
 #[derive(Debug)]
 struct WorkerStats {
-    #[allow(dead_code)]
     ops_completed: u64,
 }
 
@@ -1043,7 +1043,7 @@ async fn run_soak_test(
         .memtable_size(config.memtable_size)
         .max_memtables(config.max_memtables);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Pre-populate if needed
     let setup_start = Instant::now();
@@ -1361,7 +1361,6 @@ impl SustainedWriteMetrics {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct SustainedWriteSnapshot {
     bytes_written: u64,
     ops_written: u64,
@@ -1602,7 +1601,7 @@ async fn soak_20gib_write_sustained() {
         .memtable_size(64 * 1024 * 1024) // 64 MiB memtables
         .max_memtables(8); // max 512 MiB frozen memtable memory
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     let metrics = Arc::new(SustainedWriteMetrics::new());
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1889,6 +1888,7 @@ fn spawn_churn_worker(
                     let key = churn_key(idx);
                     let _ = db
                         .scan(Bound::Included(&key), Bound::Unbounded)
+                        .unwrap()
                         .take(100)
                         .count();
                     metrics.scans.fetch_add(1, Ordering::Relaxed);
@@ -2044,7 +2044,7 @@ async fn soak_20gib_churn() {
         .memtable_size(64 * 1024 * 1024)
         .max_memtables(8);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // ========================================================================
     // Phase 1: Pre-populate to target size

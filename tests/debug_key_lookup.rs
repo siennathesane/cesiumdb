@@ -18,7 +18,7 @@ fn test_simple_write_and_read() {
         .memtable_size(1024 * 1024) // 1MB memtable - will flush quickly
         .max_memtables(2);
 
-    let db = Db::open(opts);
+    let db = Db::open(opts).unwrap();
 
     // Write a single key
     let key = b"test-key";
@@ -44,7 +44,7 @@ fn test_simple_write_and_read() {
     println!("Frozen memtables: {}", db.frozen_memtable_count());
 
     // Try scanning a few keys
-    let scan_results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
+    let scan_results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).unwrap().collect();
     println!("Total keys in DB scan: {}", scan_results.len());
 
     // Try reading the first filler key

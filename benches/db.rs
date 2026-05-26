@@ -34,7 +34,7 @@ static PAYLOAD_SIZES: [usize; 4] = [KB, 4 * KB, 16 * KB, 32 * KB];
 static BATCH_SIZES: [usize; 4] = [1, 8, 32, 128];
 
 fn db_builder() -> Arc<Db> {
-    Db::open(DbOptions::default())
+    Db::open(DbOptions::default()).unwrap()
 }
 
 fn generate_kvp(db: &Arc<Db>, batch_size: usize, payload_size: usize) {
