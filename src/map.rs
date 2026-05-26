@@ -6,20 +6,15 @@ use std::{
     },
     ops::Range,
     path::PathBuf,
-    ptr,
-    sync::{
-        Arc,
-        atomic::{
+    sync::atomic::{
             AtomicPtr,
             AtomicU64,
             Ordering::{
                 AcqRel,
                 Acquire,
-                Relaxed,
                 Release,
             },
         },
-    },
 };
 
 use memmap2::MmapMut;
@@ -40,7 +35,6 @@ pub const MAX_GROWTH_INCREMENT: u64 = 8 * 1024 * 1024;
 pub struct Map {
     inner: AtomicPtr<SyncUnsafeCell<MmapMut>>,
     file: Mutex<File>,
-    current_offset: AtomicU64,
     current_size: AtomicU64,
     resize_lock: RwLock<()>,
     read_only: bool,
@@ -80,7 +74,6 @@ impl Map {
         Ok(Self {
             inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
             file: Mutex::new(file),
-            current_offset: AtomicU64::new(0),
             current_size: AtomicU64::new(size_metadata),
             resize_lock: RwLock::new(()),
             read_only: false,
@@ -110,7 +103,6 @@ impl Map {
         Ok(Self {
             inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
             file: Mutex::new(file),
-            current_offset: AtomicU64::new(0),
             current_size: AtomicU64::new(size_metadata),
             resize_lock: RwLock::new(()),
             read_only: false,
@@ -142,7 +134,6 @@ impl Map {
         Ok(Self {
             inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
             file: Mutex::new(file),
-            current_offset: AtomicU64::new(0),
             current_size: AtomicU64::new(size_metadata),
             resize_lock: RwLock::new(()),
             read_only: true,
@@ -320,8 +311,7 @@ impl Map {
 
             // Defensive check: ensure the range is valid
             if range.end > inner.len() {
-                return Err(IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(IoError(std::io::Error::other(
                     format!(
                         "write_to_range: range.end ({}) > map.len ({}) after potential grow to {}",
                         range.end,
@@ -346,7 +336,7 @@ impl Map {
         unsafe {
             let mmap = &*ptr;
             let inner = &*mmap.get();
-            inner.advise_range(
+            let _ = inner.advise_range(
                 memmap2::Advice::WillNeed,
                 range.start,
                 range.end - range.start,
@@ -363,7 +353,7 @@ impl Map {
         unsafe {
             let mmap = &*ptr;
             let inner = &mut *mmap.get();
-            match inner.flush().map_err(|e| IoError(e)) {
+            match inner.flush().map_err(IoError) {
                 | Ok(_) => {},
                 | Err(e) => return Err(e),
             };
@@ -407,8 +397,7 @@ impl Map {
 
             // Bounds check
             if range.end > inner.len() {
-                return Err(IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(IoError(std::io::Error::other(
                     format!(
                         "read_range: range.end ({}) > map.len ({})",
                         range.end,
@@ -495,10 +484,9 @@ unsafe impl Sync for Map {}
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Write,
-        path::Path,
-    };
+    
+
+    use std::sync::atomic::Ordering::Relaxed;
 
     use tempfile::tempdir;
 
@@ -514,7 +502,7 @@ mod tests {
 
         assert_eq!(map.len(), initial_size as usize);
         assert!(!map.is_empty());
-        assert_eq!(map.current_offset.load(Relaxed), 0);
+        assert_eq!(map.current_size.load(Relaxed), initial_size);
     }
 
     #[test]

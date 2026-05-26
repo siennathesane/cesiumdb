@@ -242,11 +242,6 @@ mod tests {
     }
 }
 
-use std::sync::atomic::{
-    AtomicU64,
-    Ordering,
-};
-
 #[cfg(target_arch = "x86_64")]
 #[repr(align(16))]
 pub struct AtomicU128 {

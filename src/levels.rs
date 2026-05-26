@@ -169,13 +169,13 @@ impl LevelStats {
     /// Score > 1.0 means the level should be compacted
     pub fn score(&self, max_size: u64, strategy: &CompactionStrategy) -> f64 {
         match strategy {
-            | CompactionStrategy::Tiered { size_ratio, .. } => {
+            | CompactionStrategy::Tiered { .. } => {
                 // Score based on number of files and size ratio
                 let size_score = self.total_size as f64 / max_size as f64;
                 let file_score = self.num_segments as f64 / 10.0;
                 size_score.max(file_score)
             },
-            | CompactionStrategy::Leveled { fanout, .. } => {
+            | CompactionStrategy::Leveled { .. } => {
                 // Simple size-based scoring
                 self.total_size as f64 / max_size as f64
             },

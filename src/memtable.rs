@@ -1,9 +1,9 @@
 // Copyright (c) Sienna Satterwhite, CesiumDB Contributors
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
+
 use std::{
     collections::Bound,
-    hash::RandomState,
     mem::transmute,
     sync::{
         Arc,
@@ -13,32 +13,13 @@ use std::{
             Ordering::Relaxed,
         },
     },
-    thread,
 };
 
-use crate::bloom::{
-    Bloom2,
-    BloomFilterBuilder,
-    CompressedBitmap,
-    FilterSize::KeyBytes3,
-};
 use bytes::Bytes;
-use crossbeam_channel::{
-    Sender,
-    bounded,
-    unbounded,
-};
 use crossbeam_skiplist::{
     SkipMap,
-    map::{
-        Entry,
-        Range,
-    },
+    map::Range,
 };
-use gxhash::gxhash64;
-use parking_lot::Mutex;
-use rand::random;
-use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::{
@@ -54,8 +35,6 @@ use crate::{
         ValueBytes,
         map_key_bound,
     },
-    peek::Peekable,
-    stats::STATS,
     utils::{
         Deserializer,
         Serializer,
@@ -69,9 +48,6 @@ pub const DEFAULT_MEMTABLE_SIZE_IN_BYTES: u64 = 64 * 1024 * 1024; // 64MiB per s
 #[derive(Debug)]
 pub struct Memtable {
     id: u64,
-    gx_seed: Arc<i64>,
-    tx: Sender<Bytes>,
-    bloom: Arc<Mutex<Bloom2<RandomState, CompressedBitmap, u64>>>,
     map: Arc<SkipMap<Bytes, Bytes>>,
     size: AtomicU64,
     max_size: AtomicU64,
@@ -87,43 +63,6 @@ pub struct Memtable {
 impl Memtable {
     pub fn new(id: u64, max_size: u64) -> Self {
         let frozen = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = unbounded::<Bytes>();
-        let gx_seed: Arc<i64> = Arc::new(random());
-        let bloom = Arc::new(Mutex::new(
-            BloomFilterBuilder::default().size(KeyBytes3).build(),
-        ));
-
-        // background thread for batched bloom filter updates
-        let frozen_clone = frozen.clone();
-        let bloom_clone = bloom.clone();
-        let seed_clone = gx_seed.clone();
-        thread::spawn(move || {
-            let mut batch = Vec::with_capacity(1000);
-            while !frozen_clone.load(Relaxed) {
-                // Blocking receive for first key
-                if let Ok(key) = rx.recv() {
-                    batch.push(key);
-
-                    // Drain available keys without blocking (up to batch size)
-                    while batch.len() < 1000 {
-                        match rx.try_recv() {
-                            | Ok(key) => batch.push(key),
-                            | Err(_) => break,
-                        }
-                    }
-
-                    // Lock once and insert all hashed keys
-                    {
-                        let mut bloom = bloom_clone.lock();
-                        for key_ptr in batch.drain(..) {
-                            bloom.insert(&gxhash64(&key_ptr, *seed_clone));
-                        }
-                    }
-                }
-            }
-            STATS.current_threads.fetch_sub(1, Relaxed);
-        });
-        STATS.current_threads.fetch_add(1, Relaxed);
 
         // Conservative initial estimate: assume 1.5KB average, swap at 50%
         // This will be dynamically adjusted based on actual observed entry sizes
@@ -133,9 +72,6 @@ impl Memtable {
 
         Memtable {
             id,
-            gx_seed,
-            tx,
-            bloom,
             map: Arc::new(SkipMap::new()),
             size: AtomicU64::new(0),
             max_size: AtomicU64::new(max_size),
@@ -237,7 +173,7 @@ impl Memtable {
 
             // Dynamic adjustment: recalculate max_entries every 8192 entries
             // based on actual observed average entry size
-            if current_entries > 0 && current_entries % 8192 == 0 {
+            if current_entries > 0 && current_entries.is_multiple_of(8192) {
                 let total_bytes = self.total_bytes_written.load(Relaxed);
                 let avg_entry_size = total_bytes / current_entries;
 
@@ -245,9 +181,6 @@ impl Memtable {
                 let new_max_entries = ((max_size as f64 * 0.5) / avg_entry_size as f64) as u64;
                 self.max_entries.store(new_max_entries, Relaxed);
             }
-
-            // send to the background to prevent a massive performance hit
-            let _ = self.tx.send(_key_ptr);
 
             written += 1;
 
@@ -286,7 +219,7 @@ impl Memtable {
     }
 
     pub fn contains(&self, key: &KeyBytes) -> bool {
-        self.get(&key).is_some()
+        self.get(key).is_some()
     }
 }
 
@@ -316,10 +249,6 @@ impl MemtableIterator {
         MemtableIterator { inner, _map: map }
     }
 
-    #[instrument(level = "trace")]
-    fn peekable(self) -> Peekable<Self> {
-        Peekable::new(self)
-    }
 }
 
 impl Iterator for MemtableIterator {
@@ -354,11 +283,7 @@ impl Iterator for MemtableIterator {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(loom))]
-    use std::{
-        sync::Arc,
-        thread,
-    };
+    
 
     use bytes::Bytes;
     #[cfg(loom)]
@@ -527,7 +452,7 @@ mod tests {
         use std::collections::Bound;
 
         let memtable = Memtable::new(0, DEFAULT_MEMTABLE_SIZE_IN_BYTES);
-        let key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), 0);
+        let _key = KeyBytes::new(DEFAULT_NS, Bytes::from("key"), 0);
 
         let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
         assert!(

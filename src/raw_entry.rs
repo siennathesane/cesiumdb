@@ -118,7 +118,6 @@ mod tests {
     use super::*;
     use crate::{
         keypair::{
-            DEFAULT_NS,
             KeyBytes,
             ValueBytes,
         },

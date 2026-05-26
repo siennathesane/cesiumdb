@@ -3,10 +3,7 @@ use std::hash::{
     Hasher,
 };
 
-use gxhash::{
-    GxHasher,
-    gxhash64,
-};
+use gxhash::GxHasher;
 
 pub(crate) struct SeedableHasher {
     seed: i64,
@@ -91,13 +88,10 @@ impl BuildHasher for SeedableHasher {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{
+    use std::hash::{
             Hash,
             Hasher,
-        },
-    };
+        };
 
     use super::*;
 

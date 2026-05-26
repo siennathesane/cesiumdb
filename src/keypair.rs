@@ -15,7 +15,6 @@ use bytes::{
     Bytes,
     BytesMut,
 };
-use crc32fast::Hasher;
 use tracing::instrument;
 
 use crate::utils::{

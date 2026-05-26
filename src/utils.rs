@@ -1,7 +1,4 @@
-use bytes::{
-    Bytes,
-    BytesMut,
-};
+use bytes::Bytes;
 
 pub trait Serializer {
     fn serialize(&self) -> Bytes;

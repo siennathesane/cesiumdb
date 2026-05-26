@@ -1,11 +1,9 @@
 use std::{
     fmt::Display,
-    mem,
     ptr,
     sync::{
         Arc,
         atomic::{
-            AtomicBool,
             AtomicU64,
             Ordering::Relaxed,
         },
@@ -13,7 +11,6 @@ use std::{
 };
 
 use bytes::{
-    BufMut,
     Bytes,
     BytesMut,
 };
@@ -22,7 +19,6 @@ use parking_lot::Mutex;
 use crate::{
     block::{
         BLOCK_SIZE,
-        Block,
         EntryFlag,
         EntryFlag::{
             Complete,
@@ -46,10 +42,7 @@ use crate::{
         Key,
         Value,
     },
-    segment_reader::{
-        ReadConfig,
-        SegmentReader,
-    },
+    segment_reader::SegmentReader,
     segment_writer::SegmentWriter,
 };
 
@@ -57,22 +50,12 @@ use crate::{
 /// Size of value location metadata: u64 (block_num) + u16 (entry_index) = 10
 /// bytes
 pub(crate) const VALUE_LOCATION_SIZE: usize = size_of::<u64>() + size_of::<u16>();
-/// Offset where value block number is stored in key metadata
-const VALUE_BLOCK_OFFSET: usize = 0;
-/// Offset where value entry index is stored in key metadata
-const VALUE_ENTRY_OFFSET: usize = size_of::<u64>();
 /// Offset where actual key data starts (after metadata)
 pub(crate) const KEY_DATA_OFFSET: usize = VALUE_LOCATION_SIZE;
 
 // Segment file size constants
 /// Default segment size: 64 MiB
 pub(crate) const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
-/// Threshold for detecting pre-allocated empty segments
-const PREALLOCATED_FILE_THRESHOLD: u64 = DEFAULT_SEGMENT_SIZE;
-
-// Metadata size constant
-/// Size of segment metadata: 4 * u64 = 32 bytes
-const METADATA_SIZE: usize = 4 * size_of::<u64>();
 
 #[derive(Debug)]
 pub enum BlockType {
@@ -127,7 +110,7 @@ impl Metadata {
         // SAFETY: Verify alignment invariants in debug builds
         debug_assert!(!dst.is_null(), "Destination pointer must not be null");
         debug_assert!(
-            dst as usize % std::mem::align_of::<u64>() == 0,
+            (dst as usize).is_multiple_of(std::mem::align_of::<u64>()),
             "Destination pointer must be 8-byte aligned for u64 writes"
         );
 
@@ -328,7 +311,7 @@ impl Segment {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub fn write(&self, key: &[u8], val: &[u8]) -> Result<(), SegmentError> {
-        use crate::errs::BlockError;
+        
 
         if self.key_writer.lock().is_none() {
             return Err(ReadOnly);
@@ -648,11 +631,10 @@ impl Segment {
         }
 
         // Process the last chunk (END flag) if there's anything left
-        if !remaining.is_empty() {
-            if let Err(e) = self.write_chunk_to_new_block(remaining, End, r#type) {
+        if !remaining.is_empty()
+            && let Err(e) = self.write_chunk_to_new_block(remaining, End, r#type) {
                 return Err(e);
             }
-        }
 
         Ok((start_block_num, start_entry_index))
     }
@@ -668,7 +650,7 @@ impl Segment {
                     if key_acc.0.is_empty() {
                         return Ok(()); // Nothing to write
                     }
-                    mem::replace(&mut *key_acc, (Vec::new(), Vec::new()))
+                    std::mem::take(&mut *key_acc)
                 };
 
                 // DEFERRED: Index rebuilt after close()
@@ -684,7 +666,9 @@ impl Segment {
                 // }
 
                 // Write block directly to mmap (ZERO-COPY from pre-built vecs!)
-                let result = {
+                
+
+                {
                     let mut writer_guard = self.key_writer.lock();
                     match writer_guard.as_mut() {
                         | Some(writer) => {
@@ -704,9 +688,7 @@ impl Segment {
                         },
                         | None => return Err(ReadOnly),
                     }
-                };
-
-                result
+                }
             },
             | Value => {
                 // Take pre-built vecs (ZERO intermediate copy!)
@@ -715,11 +697,13 @@ impl Segment {
                     if val_acc.0.is_empty() {
                         return Ok(()); // Nothing to write
                     }
-                    mem::replace(&mut *val_acc, (Vec::new(), Vec::new()))
+                    std::mem::take(&mut *val_acc)
                 };
 
                 // Write block directly to mmap (ZERO-COPY from pre-built vecs!)
-                let result = {
+                
+
+                {
                     let mut writer_guard = self.val_writer.lock();
                     match writer_guard.as_mut() {
                         | Some(writer) => {
@@ -739,9 +723,7 @@ impl Segment {
                         },
                         | None => return Err(ReadOnly),
                     }
-                };
-
-                result
+                }
             },
         }
     }
@@ -771,7 +753,7 @@ impl Segment {
 
                 let key_index = self.key_index.write();
                 let index_size = key_index.size();
-                let index_start = match writer.write_index(&*key_index) {
+                let index_start = match writer.write_index(&key_index) {
                     | Ok(v) => v,
                     | Err(e) => return Err(e),
                 };
@@ -961,14 +943,10 @@ impl Drop for Segment {
 #[allow(clippy::missing_safety_doc)]
 #[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::Arc,
-    };
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use rand::{
-        Rng,
         RngCore,
         prelude::SliceRandom,
         rng,
@@ -977,7 +955,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        block::Block,
         hlc::{
             HLC,
             HybridLogicalClock,
@@ -988,8 +965,6 @@ mod tests {
             ValueBytes,
         },
         map::Map,
-        memtable::Memtable,
-        segment_reader::SegmentReader,
         segment_writer::SegmentWriter,
     };
 

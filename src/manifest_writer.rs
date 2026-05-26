@@ -27,7 +27,6 @@ use crate::{
     errs::ManifestError,
     manifest::{
         EditEntry,
-        MANIFEST_MAGIC,
         ManifestHeader,
     },
     version::VersionEdit,
@@ -87,7 +86,7 @@ impl ManifestWriter {
 
         // Open in append mode
         let file = match OpenOptions::new()
-            .write(true)
+            
             .append(true)
             .open(&manifest_path)
         {
@@ -219,7 +218,7 @@ impl ManifestWriter {
 
         // Reopen the new file
         let file = match OpenOptions::new()
-            .write(true)
+            
             .append(true)
             .open(&manifest_path)
         {
