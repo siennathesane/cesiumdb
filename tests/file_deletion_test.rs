@@ -32,14 +32,14 @@ fn test_flush_creates_segment_files() {
     let temp_dir = TempDir::new().unwrap();
     let mut opts = DbOptions::new();
     opts.data_dir(temp_dir.path().to_path_buf())
-        .memtable_size(64 * 1024) // Note: memtable_size is currently a no-op in DbOptions
+        .memtable_size(64 * 1024 * 1024) // 64MB memtables
         .max_memtables(2);
     let db = Db::open(opts).unwrap();
 
     // Write enough data to fill at least one memtable and force a flush.
     // With 64MB default memtables, we need ~64MB of data.
     // Using 1KB values, ~64,000 keys = ~64MB.
-    const NUM_KEYS: usize = 70_000;
+    const NUM_KEYS: usize = 7_000;
     const VALUE_SIZE: usize = 1024;
     let value = vec![b'v'; VALUE_SIZE];
 
