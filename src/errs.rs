@@ -3,7 +3,6 @@
 
 use std::io;
 
-use bytes::Bytes;
 use thiserror::Error;
 
 use crate::segment::BlockType;
@@ -42,6 +41,8 @@ pub enum CesiumError {
     CompactionError(#[from] CompactionError),
     #[error("manifest error: {0}")]
     ManifestError(#[from] ManifestError),
+    #[error("initialization error: {0}")]
+    InitializationError(String),
 }
 
 #[derive(Error, Debug)]
@@ -112,6 +113,8 @@ pub enum SegmentError {
     NotClosing,
     #[error("segment is read-only")]
     ReadOnly,
+    #[error("invalid key format")]
+    InvalidKey,
     #[error("io error")]
     IoError(io::Error),
 }

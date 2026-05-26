@@ -1,14 +1,16 @@
-// Copyright (c) Sienna Satterwhite, CesiumDB Contributors
-
+// Copyright (c) Sienna Meridian Satterwhite
 // SPDX-License-Identifier: GPL-3.0-only WITH Classpath-exception-2.0
 
+#![doc = include_str!("../README.md")]
 #![feature(sync_unsafe_cell)]
 #![cfg_attr(target_arch = "aarch64", feature(integer_atomics))]
-#![allow(dead_code)]
-#![allow(unused)]
+#![deny(dead_code)]
+#![deny(unused)]
 #![deny(unused_mut)]
 #![deny(clippy::missing_safety_doc)]
 #![deny(clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 // for @siennathesane's sanity and to make it clear the scope of error handling. and because it's
 // super fucking subtle and i'll miss it in code reviews sorry not sorry
 #![deny(clippy::question_mark_used)]
@@ -24,20 +26,8 @@ compile_warn!("cesiumdb is not tested on 32-bit systems");
 
 #[allow(unused)]
 use std::sync::Arc;
-use std::{
-    sync::atomic::{
-        AtomicU64,
-        Ordering,
-    },
-    thread,
-    time::Duration,
-};
 
 use bytes::Bytes;
-use parking_lot::{
-    Mutex,
-    RwLock,
-};
 
 use crate::{
     Batch::{
@@ -46,222 +36,104 @@ use crate::{
         Put,
         PutNs,
     },
-    errs::{
-        CesiumError,
-        CesiumError::MemtableError,
-    },
-    hlc::{
-        HLC,
-        HybridLogicalClock,
-    },
+    errs::CesiumError,
+    hlc::HLC,
     keypair::{
         DEFAULT_NS,
         KeyBytes,
-        ValueBytes,
     },
-    state::{
-        DbStorageBuilder,
-        DbStorageState,
-    },
-    utils::Serializer,
 };
 
 pub mod autoconfig;
 
-#[cfg(feature = "benchmarks")]
-pub mod block;
-#[cfg(not(feature = "benchmarks"))]
-pub(crate) mod block;
+/// Makes a module `pub` when the `benchmarks` feature is enabled,
+/// and `pub(crate)` otherwise. This keeps the public API surface minimal
+/// while allowing benchmark and fuzz targets to access internals.
+macro_rules! bench_pub_mod {
+    ($name:ident) => {
+        pub mod $name;
+    };
+}
+
+bench_pub_mod!(block);
 
 mod block_alloc;
-
 mod bloom;
 
-#[cfg(feature = "benchmarks")]
-pub mod compact;
-#[cfg(not(feature = "benchmarks"))]
-pub(crate) mod compact;
+bench_pub_mod!(compact);
 
-pub mod compaction;
+bench_pub_mod!(compaction);
 pub mod errs;
 mod hash;
 pub mod hlc;
 mod index;
 pub(crate) mod io;
-pub mod keypair;
-pub mod levels;
+bench_pub_mod!(keypair);
+bench_pub_mod!(levels);
 pub(crate) mod manifest;
 pub(crate) mod manifest_reader;
 pub(crate) mod manifest_writer;
 
-#[cfg(feature = "benchmarks")]
-pub mod map;
-#[cfg(not(feature = "benchmarks"))]
-pub(crate) mod map;
-
-pub mod memtable;
-pub mod merge;
-pub mod peek;
-pub(crate) mod raw_entry;
-pub mod segment;
-mod segment_builder;
+bench_pub_mod!(map);
+bench_pub_mod!(memtable);
+bench_pub_mod!(merge);
+pub(crate) mod peek;
+bench_pub_mod!(raw_entry);
+bench_pub_mod!(segment);
+bench_pub_mod!(segment_builder);
 mod segment_iterator;
 pub(crate) mod segment_reader;
 
-#[cfg(feature = "benchmarks")]
-pub mod segment_writer;
-#[cfg(not(feature = "benchmarks"))]
-pub(crate) mod segment_writer;
+bench_pub_mod!(segment_writer);
 
-pub mod simd;
+pub(crate) mod simd;
 pub(crate) mod state;
 mod stats;
-pub mod utils;
-pub mod version;
+bench_pub_mod!(utils);
+bench_pub_mod!(version);
 
-/// Wrapper that owns a SegmentReader and its iterator together.
-///
-/// This solves the lifetime issue where SegmentScanIterator borrows from
-/// SegmentReader by having the iterator own the reader.
-struct OwnedSegmentIterator {
-    // reader is None after the iterator is created (taken by scan)
-    reader: Option<segment_reader::SegmentReader>,
-    // Store serialized KeyBytes bounds (with namespace + timestamp)
-    lower: std::ops::Bound<Bytes>,
-    upper: std::ops::Bound<Bytes>,
-    inner: Option<segment_iterator::SegmentScanIterator>,
-}
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 
-impl OwnedSegmentIterator {
-    /// Create a new owned segment iterator.
-    ///
-    /// Takes KeyBytes bounds (already serialized with namespace + timestamp).
-    fn new(
-        reader: segment_reader::SegmentReader,
-        lower: std::ops::Bound<KeyBytes>,
-        upper: std::ops::Bound<KeyBytes>,
-    ) -> Self {
-        use std::ops::Bound;
+// Internal implementation modules.
+mod db_inner;
+mod db_options;
+mod scan;
 
-        // Serialize KeyBytes bounds to raw bytes
-        let lower_bound = match lower {
-            | Bound::Included(k) => Bound::Included(k.serialize()),
-            | Bound::Excluded(k) => Bound::Excluded(k.serialize()),
-            | Bound::Unbounded => Bound::Unbounded,
-        };
-        let upper_bound = match upper {
-            | Bound::Included(k) => Bound::Included(k.serialize()),
-            | Bound::Excluded(k) => Bound::Excluded(k.serialize()),
-            | Bound::Unbounded => Bound::Unbounded,
-        };
+// Re-export types that appear in public API signatures so consumers don't
+// need to reach into internal modules.
+pub use compaction::{
+    CompactionStats,
+    SchedulerConfig,
+};
+pub(crate) use db_inner::DbInner;
+pub use db_options::{
+    Batch,
+    DbOptions,
+};
+pub(crate) use scan::OwnedSegmentIterator;
+pub use scan::{
+    DbScanIterator,
+    ReadAmpStats,
+};
+pub use version::VersionStats;
 
-        Self {
-            reader: Some(reader),
-            lower: lower_bound,
-            upper: upper_bound,
-            inner: None,
-        }
-    }
-}
-
-impl Iterator for OwnedSegmentIterator {
-    type Item = (KeyBytes, ValueBytes);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Create iterator on first call by taking ownership of the reader
-        if self.inner.is_none() {
-            let reader = self.reader.take()?;
-            let lower_ref = match &self.lower {
-                | std::ops::Bound::Included(b) => std::ops::Bound::Included(&b[..]),
-                | std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(&b[..]),
-                | std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-            };
-            let upper_ref = match &self.upper {
-                | std::ops::Bound::Included(b) => std::ops::Bound::Included(&b[..]),
-                | std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(&b[..]),
-                | std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-            };
-            let iter = reader.scan(lower_ref, upper_ref);
-            self.inner = Some(iter);
-        }
-
-        // Iterate, skipping errors
-        loop {
-            match self.inner.as_mut()?.next()? {
-                | Ok(pair) => return Some(pair),
-                | Err(_) => continue, // Skip corrupt entries
-            }
-        }
-    }
-}
-
-/// Iterator over a range of key-value pairs from the database.
-///
-/// This iterator merges results from memtables and all LSM levels,
-/// automatically handling deduplication (newer versions shadow older),
-/// tombstone filtering, and maintaining sorted order.
-pub struct DbScanIterator {
-    inner: merge::MergeIterator<Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>>,
-    last_key: Option<(u64, Bytes)>, // (namespace, key) for deduplication
-}
-
-impl Iterator for DbScanIterator {
-    type Item = (Bytes, Bytes);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.inner.next() {
-                | Some((key, value)) => {
-                    let current_ns = key.ns();
-                    let current_key = key.as_bytes();
-
-                    // Check if this is a duplicate key (different timestamp of same key)
-                    if let Some((last_ns, ref last_key_bytes)) = self.last_key {
-                        if last_ns == current_ns && last_key_bytes == &current_key {
-                            // Skip older version of the same key
-                            continue;
-                        }
-                    }
-
-                    // Update last seen key
-                    self.last_key = Some((current_ns, current_key.clone()));
-
-                    // Filter out tombstones
-                    if value.is_tombstone() {
-                        continue;
-                    }
-
-                    // Convert KeyBytes/ValueBytes to Bytes for public API
-                    return Some((current_key, value.as_bytes()));
-                },
-                | None => return None,
-            }
-        }
-    }
-}
-
-/// Read amplification statistics for point lookups.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ReadAmpStats {
-    /// Total number of db.get operations.
-    pub total_gets: u64,
-    /// Number of L0 segments checked across all gets.
-    pub l0_segments_checked: u64,
-    /// Number of L1-L7 segments checked across all gets.
-    pub ln_segments_checked: u64,
-}
-
-/// The core Cesium database! The API is simple by design, and focused on
-/// performance. It is designed for heavy concurrency, implements sharding, and
-/// Multi-Version Concurrency Control (MVCC).
+/// The core CesiumDB API. Use this to create or open a database, and perform
+/// point lookups and batch operations.
 pub struct Db {
-    inner: Arc<DbInner>,
+    pub(crate) inner: Arc<DbInner>,
     clock: Arc<dyn HLC>,
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
 }
 
 impl Db {
     /// Create or open an existing database.
-    pub fn open(opts: DbOptions) -> Arc<Self> {
+    pub fn open(opts: DbOptions) -> Result<Arc<Self>, CesiumError> {
         opts.build()
     }
 
@@ -336,7 +208,7 @@ impl Db {
     ///     DbOptions,
     /// };
     ///
-    /// let db = Db::open(DbOptions::default());
+    /// let db = Db::open(DbOptions::default()).unwrap();
     /// let start = b"key-00000".to_vec();
     /// let end = b"key-99999".to_vec();
     ///
@@ -349,7 +221,7 @@ impl Db {
         ns: u64,
         lower: std::ops::Bound<&[u8]>,
         upper: std::ops::Bound<&[u8]>,
-    ) -> DbScanIterator {
+    ) -> Result<DbScanIterator, CesiumError> {
         self.inner.scan(ns, lower, upper)
     }
 
@@ -360,7 +232,7 @@ impl Db {
         &self,
         lower: std::ops::Bound<&[u8]>,
         upper: std::ops::Bound<&[u8]>,
-    ) -> DbScanIterator {
+    ) -> Result<DbScanIterator, CesiumError> {
         self.scan_ns(DEFAULT_NS, lower, upper)
     }
 
@@ -415,7 +287,7 @@ impl Db {
     /// - Number of queued/in-progress/completed jobs
     /// - Parallel execution utilization
     /// - Current workload pattern
-    pub fn compaction_stats(&self) -> Result<crate::compaction::CompactionStats, CesiumError> {
+    pub fn compaction_stats(&self) -> Result<CompactionStats, CesiumError> {
         let guard = self.inner.state.lock();
         match guard.compaction_stats() {
             | Some(stats) => Ok(stats),
@@ -432,7 +304,7 @@ impl Db {
     /// - Total segment count across all levels
     /// - Total database size in bytes
     /// - Current sequence number
-    pub fn version_stats(&self) -> crate::version::VersionStats {
+    pub fn version_stats(&self) -> VersionStats {
         self.inner.version_stats()
     }
 
@@ -447,1166 +319,5 @@ impl Db {
     }
 }
 
-/// Configuration options for Cesium.
-#[repr(C)]
-pub struct DbOptions {
-    engine_opts: DbStorageBuilder,
-    clock: Arc<dyn HLC>,
-}
-
-impl DbOptions {
-    pub fn new() -> Self {
-        Self {
-            engine_opts: DbStorageBuilder::default(),
-            clock: Arc::new(HybridLogicalClock::new()),
-        }
-    }
-
-    pub fn engine(&mut self, engine: DbStorageBuilder) -> &mut Self {
-        self.engine_opts = engine;
-        self
-    }
-
-    /// **The Hybrid Linear Clock** *(and how MVCC works in LSM-trees)*
-    ///
-    /// By default, CesiumDB used the bundled hybrid linear clock, which
-    /// provides a perfectly incrementing clock, to determine when writes
-    /// happen. The clock implementation is "client-side", so CesiumDB
-    /// assumes a write happened when the caller said it did. This is
-    /// overrideable behaviour, and consumers can implement their own clock
-    /// via the [`HLC`] trait. Theoretically a provided implementation can
-    /// move the clock to an earlier time than when the DB comes online,
-    /// however that could result in older keys get overwritten.
-    ///
-    /// In an LSM-tree, multiple versions of a key can exist until flushing and
-    /// compaction events. When you call `Db.put(b"key", b"value")`, it
-    /// attaches an internal timestamp based on when that API is called and
-    /// then encodes the reversed timestamp into the key value, along with a
-    /// namespace. As LSM-trees are append-only data structures,
-    /// `Db.get(b"key")` will always return the latest value. When flushing
-    /// happens, the memtables are merged into N sorted string tables (not
-    /// actual strings) and duplicate key versions are merged into "latest"
-    /// to produce a single key for the segments. When compaction happens,
-    /// the various levels of segments (and various segments in a specific
-    /// level) are merged together and the same key duplication is checked.
-    ///
-    /// If you provide your own clock source, in order to ensure that the most
-    /// recent version of your keys is updated on `Db.put`, you need to make
-    /// sure that your most recently updated key's - the last key written to
-    /// the database before `Db.close` is called - timestamp is less than
-    /// `HLC.time` before any other key is updated. If this happens, it is
-    /// considered undefined behavior and is not protected against.
-    ///
-    /// It's recommended to use the provided HLC as it has a general resolution
-    /// of 2-3ns on average.
-    pub fn clock(&mut self, clock: Arc<dyn HLC>) -> &mut Self {
-        self.clock = clock;
-        self
-    }
-
-    /// Sets the data directory for persistent storage.
-    ///
-    /// When set, enables:
-    /// - Background compaction threads
-    /// - Persistent Segment storage
-    /// - Automatic flush-to-disk
-    pub fn data_dir(&mut self, path: std::path::PathBuf) -> &mut Self {
-        self.engine_opts = self.engine_opts.clone().base_path(path);
-        self
-    }
-
-    /// Sets the memtable size in bytes (default: configured in memtable
-    /// module).
-    ///
-    /// Smaller memtables = more frequent flushes, less memory usage
-    /// Larger memtables = fewer flushes, more memory usage
-    pub fn memtable_size(&mut self, size: u64) -> &mut Self {
-        self.engine_opts = self.engine_opts.clone().memtable_size(size);
-        self
-    }
-
-    /// Sets the target Segment size in bytes.
-    ///
-    /// Larger segments reduce file count and compaction overhead,
-    /// but increase memory usage during compaction.
-    pub fn target_segment_size(&mut self, size: u64) -> &mut Self {
-        self.engine_opts = self.engine_opts.clone().target_segment_size(size);
-        self
-    }
-
-    /// Sets the multiplier for target file size per level.
-    ///
-    /// Level N target size = `target_segment_size * multiplier^(N-1)`.
-    /// Default is 1 (same size for all levels).
-    pub fn target_file_size_multiplier(&mut self, multiplier: u64) -> &mut Self {
-        let mut scheduler = self.engine_opts.scheduler_config.clone();
-        scheduler.target_file_size_multiplier = multiplier;
-        self.engine_opts = self.engine_opts.clone().scheduler_config(scheduler);
-        self
-    }
-
-    /// Sets the maximum number of memtables before blocking writes.
-    ///
-    /// This is the num_memtable_limit parameter.
-    pub fn max_memtables(&mut self, count: u64) -> &mut Self {
-        self.engine_opts = self.engine_opts.clone().num_memtable_limit(count);
-        self
-    }
-
-    /// Sets the compaction scheduler configuration.
-    pub fn scheduler_config(&mut self, config: crate::compaction::SchedulerConfig) -> &mut Self {
-        self.engine_opts = self.engine_opts.clone().scheduler_config(config);
-        self
-    }
-
-    pub fn build(&self) -> Arc<Db> {
-        let mut builder = DbStorageBuilder::new()
-            .block_size(self.engine_opts.block_size)
-            .target_segment_size(self.engine_opts.target_segment_size)
-            .num_memtable_limit(self.engine_opts.num_memtable_limit)
-            .memtable_size(self.engine_opts.memtable_size)
-            .scheduler_config(self.engine_opts.scheduler_config.clone());
-
-        if let Some(ref path) = self.engine_opts.base_path {
-            builder = builder.base_path(path.clone());
-        }
-
-        let state = builder.build();
-
-        // Create warm thread pool for parallel LSM reads
-        // Use half the available cores for reads to leave room for writes
-        let num_read_threads = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).max(2))
-            .unwrap_or(4);
-
-        let read_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_read_threads)
-            .thread_name(|i| format!("lsm-reader-{}", i))
-            .build()
-            .expect("failed to create read thread pool");
-
-        let (curr_memtable, version_manager) = {
-            let guard = state.lock();
-            (guard.current_memtable(), Arc::clone(&guard.version_manager))
-        };
-        let inner = DbInner {
-            state,
-            curr_memtable: RwLock::new(curr_memtable),
-            version_manager,
-            read_pool,
-            total_gets: AtomicU64::new(0),
-            l0_reads: AtomicU64::new(0),
-            ln_reads: AtomicU64::new(0),
-        };
-
-        Arc::new(Db {
-            inner: Arc::new(inner),
-            clock: self.clock.clone(),
-        })
-    }
-}
-
-impl Default for DbOptions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[repr(C)]
-pub enum Batch<K: AsRef<[u8]>, V: AsRef<[u8]>> {
-    Put(K, V, u128),
-    Delete(K, u128),
-    PutNs(u64, K, V, u128),
-    DeleteNs(u64, K, u128),
-}
-
-#[repr(C)]
-struct DbInner {
-    state: Mutex<DbStorageState>,
-    /// Cached current memtable to avoid state lock on hot write/get paths.
-    /// Updated whenever `new_memtable()` is called under state lock.
-    curr_memtable: RwLock<Arc<crate::memtable::Memtable>>,
-    /// Version manager for checking L0 size without state lock
-    version_manager: Arc<crate::version::VersionManager>,
-    /// Warm thread pool for parallel LSM reads across levels
-    read_pool: rayon::ThreadPool,
-    /// Cumulative read amplification counters
-    total_gets: AtomicU64,
-    l0_reads: AtomicU64,
-    ln_reads: AtomicU64,
-}
-
-impl DbInner {
-    fn get(&self, key: KeyBytes) -> Result<Option<ValueBytes>, CesiumError> {
-        // Track that we did a get (for read amplification instrumentation)
-        self.total_gets.fetch_add(1, Ordering::Relaxed);
-
-        // 1. Check current memtable (hottest data) without state lock
-        {
-            let mtable = self.curr_memtable.read().clone();
-            if let Some(val) = mtable.get(&key) {
-                // Return None for tombstones
-                if val.is_tombstone() {
-                    return Ok(None);
-                }
-                return Ok(Some(val));
-            }
-        }
-
-        // 2. Check frozen memtables (newest to oldest)
-        {
-            let guard = self.state.lock();
-            if let Some(val) = guard.get_from_frozen(&key) {
-                if val.is_tombstone() {
-                    return Ok(None);
-                }
-                return Ok(Some(val));
-            }
-        }
-
-        // 3. Check L0-L7 via VersionManager (parallelized)
-        {
-            use rayon::prelude::*;
-
-            use crate::utils::Serializer;
-
-            let guard = self.state.lock();
-            let version = guard.version_manager.current();
-            let key_bytes = key.serialize();
-
-            // Check L0 (newest to oldest - reverse chronological)
-            // L0 must be checked sequentially because newer segments override older ones
-            // We need to search by key prefix (ns + key) to find any version
-            // Since timestamps are stored as (u128::MAX - ts), newest=0, oldest=u128::MAX
-            let key_prefix_lower = {
-                use bytes::{
-                    BufMut,
-                    BytesMut,
-                };
-                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len() + 16);
-                bytes.put_u64_le(key.ns());
-                bytes.put_slice(key.as_bytes().as_ref());
-                bytes.put_u128_le(0); // newest possible (u128::MAX - u128::MAX = 0)
-                bytes.freeze()
-            };
-            let key_prefix_upper = {
-                use bytes::{
-                    BufMut,
-                    BytesMut,
-                };
-                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len() + 16);
-                bytes.put_u64_le(key.ns());
-                bytes.put_slice(key.as_bytes().as_ref());
-                bytes.put_u128_le(u128::MAX); // oldest possible (u128::MAX - 0 = u128::MAX)
-                bytes.freeze()
-            };
-
-            // Prepare key without timestamp for bloom filter checks
-            let key_for_bloom = {
-                use bytes::{
-                    BufMut,
-                    BytesMut,
-                };
-                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len());
-                bytes.put_u64_le(key.ns());
-                bytes.put_slice(key.as_bytes().as_ref());
-                bytes.freeze()
-            };
-
-            // Check L0 segments in reverse chronological order (newest first)
-            for segment in version.l0.iter().rev() {
-                let reader = match segment.reader() {
-                    | Ok(r) => r,
-                    | Err(_) => continue,
-                };
-
-                // Fast bloom filter check - skip L0 segments that definitely don't have
-                // this key. L0 segments DO have bloom filters (built during flush).
-                if !reader.may_contain(&key_for_bloom) {
-                    continue;
-                }
-
-                self.l0_reads.fetch_add(1, Ordering::Relaxed);
-
-                // Scan for keys matching this prefix (any timestamp)
-                use std::ops::Bound;
-                let mut scan_iter = reader.scan(
-                    Bound::Included(key_prefix_lower.as_ref()),
-                    Bound::Included(key_prefix_upper.as_ref()),
-                );
-
-                // Take the first match (newest version due to timestamp ordering)
-                // scan_iter returns (KeyBytes, ValueBytes) already deserialized
-                if let Some(Ok((_, val))) = scan_iter.next() {
-                    if val.is_tombstone() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(val));
-                }
-            }
-
-            // Check L1-L7 sequentially from newest level to oldest
-            // Parallel search across levels is unsafe because deeper levels may
-            // return stale data before newer levels are checked.
-            for level in &version.levels {
-                for segment in &level.segments {
-                    if let Ok(reader) = segment.reader() {
-                        // Fast bloom filter check - skip segments that definitely don't have
-                        // this key
-                        if !reader.may_contain(&key_for_bloom) {
-                            continue;
-                        }
-
-                        self.ln_reads.fetch_add(1, Ordering::Relaxed);
-
-                        use std::ops::Bound;
-                        let mut scan_iter = reader.scan(
-                            Bound::Included(key_prefix_lower.as_ref()),
-                            Bound::Included(key_prefix_upper.as_ref()),
-                        );
-                        if let Some(Ok((_, val))) = scan_iter.next() {
-                            if val.is_tombstone() {
-                                return Ok(None);
-                            }
-                            return Ok(Some(val));
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Not found anywhere
-        Ok(None)
-    }
-
-    fn scan(
-        &self,
-        ns: u64,
-        lower: std::ops::Bound<&[u8]>,
-        upper: std::ops::Bound<&[u8]>,
-    ) -> DbScanIterator {
-        use std::ops::Bound;
-
-        // Convert bounds to KeyBytes format (with namespace and timestamp)
-        // For namespace isolation, we need to ensure we only scan within the given
-        // namespace
-        //
-        // IMPORTANT: KeyBytes serializes timestamps as `u128::MAX - ts`, so:
-        // - ts=0 (newest) serializes to MAX (sorts LAST in byte order)
-        // - ts=MAX (oldest) serializes to 0 (sorts FIRST in byte order)
-        // Therefore, to scan forward seeing newest versions first, we need ts=MAX in
-        // lower bound.
-        let lower_key = match lower {
-            | Bound::Included(k) => {
-                // Start with oldest version (ts=MAX serializes to 0, sorts first)
-                Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
-            },
-            | Bound::Excluded(k) => {
-                // Exclude oldest version
-                Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
-            },
-            | Bound::Unbounded => {
-                // Start from the beginning of this namespace
-                Bound::Included(KeyBytes::new(ns, Bytes::new(), u128::MAX))
-            },
-        };
-
-        let upper_key = match upper {
-            | Bound::Included(k) => {
-                // Include newest version (ts=0 serializes to MAX, sorts last)
-                Bound::Included(KeyBytes::new(ns, Bytes::copy_from_slice(k), 0))
-            },
-            | Bound::Excluded(k) => {
-                // Exclude all versions (ts=MAX serializes to 0, sorts first, so excluded bound
-                // excludes all)
-                Bound::Excluded(KeyBytes::new(ns, Bytes::copy_from_slice(k), u128::MAX))
-            },
-            | Bound::Unbounded => {
-                // End at the last possible key in this namespace
-                // Use next namespace's first key as excluded upper bound
-                Bound::Excluded(KeyBytes::new(ns + 1, Bytes::new(), u128::MAX))
-            },
-        };
-
-        let mut iters: Vec<Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>> = Vec::new();
-
-        // 1. Add current memtable iterator (without state lock)
-        {
-            let mtable = self.curr_memtable.read().clone();
-            let memtable_iter = mtable.scan(lower_key.clone(), upper_key.clone());
-            iters
-                .push(Box::new(memtable_iter)
-                    as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
-        }
-
-        // 2. Add frozen memtables and segment iterators under a single state lock
-        {
-            let guard = self.state.lock();
-            let frozen = guard.frozen_memtables_for_scan();
-            for memtable in frozen.iter().rev() {
-                let iter = memtable.scan(lower_key.clone(), upper_key.clone());
-                iters.push(Box::new(iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
-            }
-
-            let version = guard.version_manager.current();
-
-            // Add L0 segments (can overlap, so all must be scanned)
-            for segment in &version.l0 {
-                if let Ok(reader) = segment.reader() {
-                    let owned_iter =
-                        OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
-                    iters.push(Box::new(owned_iter)
-                        as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
-                }
-            }
-
-            // Add segments from L1-L7
-            for level in &version.levels {
-                for segment in &level.segments {
-                    if let Ok(reader) = segment.reader() {
-                        let owned_iter =
-                            OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
-                        iters.push(Box::new(owned_iter)
-                            as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
-                    }
-                }
-            }
-        }
-
-        // Create merge iterator
-        let merge_iter = merge::MergeIterator::new(iters);
-
-        // Debug: check if merge iterator has any items
-        // NOTE: This will consume the first item, so we need to handle that
-
-        DbScanIterator {
-            inner: merge_iter,
-            last_key: None,
-        }
-    }
-
-    fn batch<K: AsRef<[u8]>, V: AsRef<[u8]>>(
-        &self,
-        ops: &[Batch<K, V>],
-    ) -> Result<(), CesiumError> {
-        let mut _batch = Vec::with_capacity(ops.len());
-        for b in ops.iter() {
-            match b {
-                | PutNs(ns, k, v, ts) => {
-                    _batch.push((
-                        KeyBytes::new(*ns, Bytes::copy_from_slice(k.as_ref()), *ts),
-                        ValueBytes::new(*ns, Bytes::copy_from_slice(v.as_ref())),
-                    ));
-                },
-                | DeleteNs(ns, k, ts) => {
-                    _batch.push((
-                        KeyBytes::new(*ns, Bytes::copy_from_slice(k.as_ref()), *ts),
-                        ValueBytes::new_tombstone(*ns),
-                    ));
-                },
-                | Put(k, v, ts) => {
-                    _batch.push((
-                        KeyBytes::new(DEFAULT_NS, Bytes::copy_from_slice(k.as_ref()), *ts),
-                        ValueBytes::new(DEFAULT_NS, Bytes::copy_from_slice(v.as_ref())),
-                    ));
-                },
-                | Delete(k, ts) => {
-                    _batch.push((
-                        KeyBytes::new(DEFAULT_NS, Bytes::copy_from_slice(k.as_ref()), *ts),
-                        ValueBytes::new_tombstone(DEFAULT_NS),
-                    ));
-                },
-            }
-        }
-
-        // Fast path: try to write entire batch to current memtable
-        let mtable = self.curr_memtable.read().clone();
-
-        match mtable.put_batch(_batch.as_ref()) {
-            | Ok(written) if written == _batch.len() => {
-                // All written, done!
-                Ok(())
-            },
-            | Ok(written) => {
-                // Partial write - need to handle remaining with memtable swaps
-                let mut offset = written;
-                let mut last_attempted = mtable.clone();
-                while offset < _batch.len() {
-                    // Wait for flusher to catch up before adding more frozen memtables
-                    self.wait_for_frozen_capacity();
-
-                    // Swap memtable. Only freeze if the memtable we last tried is
-                    // still current; another writer may have already swapped it.
-                    let new_mtable = {
-                        let mut guard = self.state.lock();
-                        let current = guard.current_memtable();
-                        if Arc::ptr_eq(&last_attempted, &current) {
-                            guard.new_memtable();
-                        }
-                        let new = guard.current_memtable();
-                        *self.curr_memtable.write() = new.clone();
-                        new
-                    };
-
-                    // Write remaining to new memtable
-                    match new_mtable.put_batch(&_batch[offset..]) {
-                        | Ok(w) => {
-                            offset += w;
-                            if offset >= _batch.len() {
-                                return Ok(());
-                            }
-                            last_attempted = new_mtable;
-                        },
-                        | Err(e) => {
-                            use crate::errs::MemtableError as MtError;
-                            if matches!(e, MtError::MemtableIsFrozen | MtError::DataExceedsMaximum)
-                            {
-                                last_attempted = new_mtable;
-                                continue; // Retry loop with current memtable
-                            }
-                            return Err(MemtableError(e));
-                        },
-                    }
-                }
-                Ok(())
-            },
-            | Err(e) => {
-                use crate::errs::MemtableError as MtError;
-                match e {
-                    | MtError::DataExceedsMaximum => {
-                        // First entry doesn't fit - same logic as partial write loop,
-                        // since another writer may have swapped the memtable by now
-                        // and the new one might also be full.
-                        let mut offset = 0usize;
-                        let mut last_attempted = mtable.clone();
-                        while offset < _batch.len() {
-                            self.wait_for_frozen_capacity();
-                            let new_mtable = {
-                                let mut guard = self.state.lock();
-                                let current = guard.current_memtable();
-                                if Arc::ptr_eq(&last_attempted, &current) {
-                                    guard.new_memtable();
-                                }
-                                let new = guard.current_memtable();
-                                *self.curr_memtable.write() = new.clone();
-                                new
-                            };
-                            match new_mtable.put_batch(&_batch[offset..]) {
-                                | Ok(w) => {
-                                    offset += w;
-                                    if offset >= _batch.len() {
-                                        return Ok(());
-                                    }
-                                    last_attempted = new_mtable;
-                                },
-                                | Err(e) => {
-                                    if matches!(
-                                        e,
-                                        MtError::MemtableIsFrozen | MtError::DataExceedsMaximum
-                                    ) {
-                                        last_attempted = new_mtable;
-                                        continue;
-                                    }
-                                    return Err(MemtableError(e));
-                                },
-                            }
-                        }
-                        Ok(())
-                    },
-                    | MtError::MemtableIsFrozen => {
-                        // Memtable was frozen during write - get current and retry
-                        // (background flusher swaps memtables asynchronously)
-                        let new_mtable = {
-                            let guard = self.state.lock();
-                            let new = guard.current_memtable();
-                            *self.curr_memtable.write() = new.clone();
-                            new
-                        };
-                        match new_mtable.put_batch(_batch.as_ref()) {
-                            | Ok(_) => Ok(()),
-                            | Err(e) => Err(MemtableError(e)),
-                        }
-                    },
-                    | _ => Err(MemtableError(e)),
-                }
-            },
-        }
-    }
-
-    fn sync(&self) -> Result<(), CesiumError> {
-        let mut guard = self.state.lock();
-        guard.sync()?;
-        // Update cached curr_memtable to match the new empty memtable
-        // created by sync(). Without this, db.get would continue reading
-        // from the old (flushed) memtable via the stale cache.
-        let new_mtable = guard.current_memtable();
-        *self.curr_memtable.write() = new_mtable;
-        Ok(())
-    }
-
-    /// Block until frozen memtables are below the limit.
-    /// This prevents unbounded memory growth when the flusher can't keep up.
-    fn wait_for_frozen_capacity(&self) {
-        let limit = {
-            let guard = self.state.lock();
-            guard.memtable_limit()
-        };
-        // If limit is 0, disable backpressure (default behavior)
-        if limit == 0 {
-            return;
-        }
-        loop {
-            let frozen = {
-                let guard = self.state.lock();
-                guard.frozen_count()
-            };
-            if frozen < limit as usize {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    fn version_stats(&self) -> crate::version::VersionStats {
-        self.state.lock().version_stats()
-    }
-
-    fn read_amp_stats(&self) -> ReadAmpStats {
-        ReadAmpStats {
-            total_gets: self.total_gets.load(Ordering::Relaxed),
-            l0_segments_checked: self.l0_reads.load(Ordering::Relaxed),
-            ln_segments_checked: self.ln_reads.load(Ordering::Relaxed),
-        }
-    }
-
-    fn frozen_memtable_count(&self) -> usize {
-        self.state.lock().frozen_count()
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use crate::{
-        Batch::Put,
-        Db,
-        DbOptions,
-    };
-
-    const MAX_KEYS: u64 = 10_000;
-
-    fn db_builder() -> Arc<Db> {
-        Db::open(DbOptions::default())
-    }
-
-    #[test]
-    fn test_db_put() {
-        let db = db_builder();
-
-        // initial insert
-        let mut keypair_size = 0;
-        for i in 0..MAX_KEYS {
-            let key = format!("key-{}", i).into_bytes();
-            let val = format!("value-{}", i).into_bytes();
-            keypair_size += key.len() + val.len();
-            assert!(db.put(key.as_ref(), val.as_ref()).is_ok());
-        }
-
-        {
-            let guard = db.inner.state.lock();
-            assert!(
-                guard.current_memtable().size() > keypair_size as u64,
-                "the memtable must be bigger than the keypair size to ensure the keys are actually stored"
-            );
-        }
-
-        // re-insert the same keys but with new versions
-        for i in 0..MAX_KEYS {
-            let key = format!("key-{}", i).into_bytes();
-            let val = format!("value-{}", i).into_bytes();
-            keypair_size += key.len() + val.len();
-            assert!(db.put(key.as_ref(), val.as_ref()).is_ok());
-        }
-
-        {
-            let guard = db.inner.state.lock();
-            assert!(
-                guard.current_memtable().size() > (keypair_size * 2) as u64,
-                "the memtable must be at least twice as big as before with the new versions"
-            );
-        }
-    }
-
-    #[test]
-    fn db_put_batch() {
-        let db = db_builder();
-
-        let mut keypair_size = 0;
-        for batch_size in [1, 10, 100].iter() {
-            let mut batch = Vec::with_capacity(*batch_size);
-
-            for i in 0..(*batch_size * 100) {
-                let key = format!("key-{}", i).into_bytes();
-                let val = format!("value-{}", i).into_bytes();
-                keypair_size += key.len() + val.len();
-
-                let op = Put(key, val.clone(), db.time());
-                batch.push(op)
-            }
-
-            assert!(db.batch(&batch).is_ok());
-
-            {
-                let guard = db.inner.state.lock();
-                assert!(
-                    guard.current_memtable().size() > keypair_size as u64,
-                    "the memtable must be bigger than the keypair size to ensure the keys are actually stored"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_db_get() {
-        let db = db_builder();
-
-        // test get on empty db
-        let result = db.get(b"nonexistent");
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "get on empty db should return None"
-        );
-
-        // insert and retrieve
-        let key = b"test-key";
-        let val = b"test-value";
-        assert!(db.put(key, val).is_ok());
-
-        let result = db.get(key);
-        assert!(result.is_ok());
-        let retrieved = result.unwrap();
-        assert!(
-            retrieved.is_some(),
-            "get should return Some for existing key"
-        );
-        assert_eq!(&retrieved.unwrap()[..], val, "retrieved value should match");
-
-        // test get on different key
-        let result = db.get(b"different-key");
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "get on non-existent key should return None"
-        );
-    }
-
-    #[test]
-    fn test_db_get_latest_version() {
-        let db = db_builder();
-
-        let key = b"versioned-key";
-        let val1 = b"value-1";
-        let val2 = b"value-2";
-        let val3 = b"value-3";
-
-        // insert multiple versions
-        assert!(db.put(key, val1).is_ok());
-        assert!(db.put(key, val2).is_ok());
-        assert!(db.put(key, val3).is_ok());
-
-        // get should return the latest version
-        let result = db.get(key);
-        assert!(result.is_ok());
-        let retrieved = result.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(
-            &retrieved.unwrap()[..],
-            val3,
-            "get should return the latest value"
-        );
-    }
-
-    #[test]
-    fn test_db_delete() {
-        let db = db_builder();
-
-        let key = b"key-to-delete";
-        let val = b"value";
-
-        // insert key
-        assert!(db.put(key, val).is_ok());
-
-        // verify it exists
-        let result = db.get(key);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
-
-        // delete the key
-        assert!(db.delete(key).is_ok());
-
-        // verify the key no longer exists (tombstone filters it out)
-        let result = db.get(key);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none(), "deleted key should return None");
-    }
-
-    #[test]
-    fn test_db_put_ns() {
-        let db = db_builder();
-
-        let ns1: u64 = 1;
-        let ns2: u64 = 2;
-        let key = b"same-key";
-        let val1 = b"value-in-ns1";
-        let val2 = b"value-in-ns2";
-
-        // put same key in different namespaces
-        assert!(db.put_ns(ns1, key, val1).is_ok());
-        assert!(db.put_ns(ns2, key, val2).is_ok());
-
-        // retrieve from each namespace
-        let result1 = db.get_ns(ns1, key);
-        assert!(result1.is_ok());
-        let value1 = result1.unwrap();
-        assert!(value1.is_some());
-        assert_eq!(&value1.unwrap()[..], val1);
-
-        let result2 = db.get_ns(ns2, key);
-        assert!(result2.is_ok());
-        let value2 = result2.unwrap();
-        assert!(value2.is_some());
-        assert_eq!(&value2.unwrap()[..], val2);
-    }
-
-    #[test]
-    fn test_db_get_ns() {
-        let db = db_builder();
-
-        let ns: u64 = 42;
-        let key = b"namespaced-key";
-        let val = b"namespaced-value";
-
-        // get on empty namespace
-        let result = db.get_ns(ns, key);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-
-        // insert into namespace
-        assert!(db.put_ns(ns, key, val).is_ok());
-
-        // retrieve from namespace
-        let result = db.get_ns(ns, key);
-        assert!(result.is_ok());
-        let retrieved = result.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(&retrieved.unwrap()[..], val);
-
-        // verify key doesn't exist in default namespace
-        let result = db.get(key);
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "key should not exist in default namespace"
-        );
-    }
-
-    #[test]
-    fn test_db_delete_ns() {
-        let db = db_builder();
-
-        let ns: u64 = 10;
-        let key = b"key-to-delete";
-        let val = b"value";
-
-        // insert into namespace
-        assert!(db.put_ns(ns, key, val).is_ok());
-
-        // verify it exists
-        let result = db.get_ns(ns, key);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
-
-        // delete from namespace
-        assert!(db.delete_ns(ns, key).is_ok());
-
-        // verify the key no longer exists (tombstone filters it out)
-        let result = db.get_ns(ns, key);
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_none(),
-            "deleted key in namespace should return None"
-        );
-    }
-
-    #[test]
-    fn test_db_options_default() {
-        let opts = DbOptions::default();
-        let db = Db::open(opts);
-
-        // basic operation to ensure default options work
-        assert!(db.put(b"test", b"value").is_ok());
-        let result = db.get(b"test");
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
-    }
-
-    #[test]
-    fn test_db_time() {
-        let db = db_builder();
-
-        let time1 = db.time();
-        let time2 = db.time();
-
-        // time should be monotonically increasing
-        assert!(
-            time2 >= time1,
-            "clock should return monotonically increasing values"
-        );
-    }
-
-    #[test]
-    fn test_db_batch_mixed_operations() {
-        use crate::Batch::{
-            Delete,
-            DeleteNs,
-            PutNs,
-        };
-
-        let db = db_builder();
-
-        let ns: u64 = 5;
-        let batch = vec![
-            Put(b"key1".to_vec(), b"val1".to_vec(), db.time()),
-            PutNs(ns, b"key2".to_vec(), b"val2".to_vec(), db.time()),
-            Put(b"key3".to_vec(), b"val3".to_vec(), db.time()),
-        ];
-
-        assert!(db.batch(&batch).is_ok());
-
-        // verify all operations succeeded
-        assert!(db.get(b"key1").unwrap().is_some());
-        assert!(db.get_ns(ns, b"key2").unwrap().is_some());
-        assert!(db.get(b"key3").unwrap().is_some());
-    }
-
-    #[test]
-    fn test_db_empty_key() {
-        let db = db_builder();
-
-        let key = b"";
-        let val = b"empty-key-value";
-
-        assert!(db.put(key, val).is_ok());
-        let result = db.get(key);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
-    }
-
-    #[test]
-    fn test_db_empty_value() {
-        let db = db_builder();
-
-        let key = b"key-with-empty-value";
-        let val = b"";
-
-        assert!(db.put(key, val).is_ok());
-        let result = db.get(key);
-        assert!(result.is_ok());
-        let retrieved = result.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_db_large_key_value() {
-        let db = db_builder();
-
-        let key = vec![b'k'; 1000];
-        let val = vec![b'v'; 10000];
-
-        assert!(db.put(&key, &val).is_ok());
-        let result = db.get(&key);
-        assert!(result.is_ok());
-        let retrieved = result.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().len(), val.len());
-    }
-
-    // ===== Scan API Tests =====
-
-    #[test]
-    fn test_scan_empty_db() {
-        use std::ops::Bound;
-        let db = db_builder();
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_scan_single_memtable() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-        db.put(b"c", b"3").unwrap();
-
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 3);
-        assert_eq!(&results[0].0[..], b"a");
-        assert_eq!(&results[0].1[..], b"1");
-        assert_eq!(&results[1].0[..], b"b");
-        assert_eq!(&results[1].1[..], b"2");
-        assert_eq!(&results[2].0[..], b"c");
-        assert_eq!(&results[2].1[..], b"3");
-    }
-
-    #[test]
-    fn test_scan_with_tombstones() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-        db.put(b"c", b"3").unwrap();
-        db.delete(b"b").unwrap();
-
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 2, "Should filter out tombstone for 'b'");
-        assert_eq!(&results[0].0[..], b"a");
-        assert_eq!(&results[1].0[..], b"c");
-    }
-
-    #[test]
-    fn test_scan_unbounded() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        for i in 0..10 {
-            let key = format!("key-{:02}", i);
-            let val = format!("val-{:02}", i);
-            db.put(key.as_bytes(), val.as_bytes()).unwrap();
-        }
-
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 10);
-    }
-
-    #[test]
-    fn test_scan_bounded() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-        db.put(b"c", b"3").unwrap();
-        db.put(b"d", b"4").unwrap();
-        db.put(b"e", b"5").unwrap();
-
-        // Scan [b, d) should return b and c
-        let results: Vec<_> = db
-            .scan(Bound::Included(b"b"), Bound::Excluded(b"d"))
-            .collect();
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(&results[0].0[..], b"b");
-        assert_eq!(&results[0].1[..], b"2");
-        assert_eq!(&results[1].0[..], b"c");
-        assert_eq!(&results[1].1[..], b"3");
-    }
-
-    #[test]
-    fn test_scan_namespace_isolation() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        db.put_ns(1, b"key", b"ns1-value").unwrap();
-        db.put_ns(2, b"key", b"ns2-value").unwrap();
-        db.put_ns(1, b"key2", b"ns1-value2").unwrap();
-
-        let results_ns1: Vec<_> = db.scan_ns(1, Bound::Unbounded, Bound::Unbounded).collect();
-        let results_ns2: Vec<_> = db.scan_ns(2, Bound::Unbounded, Bound::Unbounded).collect();
-
-        assert_eq!(results_ns1.len(), 2);
-        assert_eq!(results_ns2.len(), 1);
-        assert_eq!(&results_ns2[0].1[..], b"ns2-value");
-    }
-
-    #[test]
-    fn test_scan_across_frozen_memtables() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        // Write some data
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-
-        // Force sync to freeze memtable
-        db.sync().unwrap();
-
-        // Write more data to new memtable
-        db.put(b"c", b"3").unwrap();
-        db.put(b"d", b"4").unwrap();
-
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(
-            results.len(),
-            4,
-            "Should scan across both frozen and current memtable"
-        );
-        assert_eq!(&results[0].0[..], b"a");
-        assert_eq!(&results[1].0[..], b"b");
-        assert_eq!(&results[2].0[..], b"c");
-        assert_eq!(&results[3].0[..], b"d");
-    }
-
-    #[test]
-    fn test_scan_mvcc_ordering() {
-        // Simplified test to check iteration order
-        use std::ops::Bound;
-        let db = db_builder();
-
-        // Write in explicit order to track timestamps
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        db.put(b"key1", b"FIRST").unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        db.put(b"key1", b"SECOND").unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        db.put(b"key1", b"THIRD_NEWEST").unwrap();
-
-        // Scan should return only the newest version
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 1, "Should have 1 unique key");
-        assert_eq!(
-            &results[0].1[..],
-            b"THIRD_NEWEST",
-            "Should return the newest version"
-        );
-    }
-
-    #[test]
-    fn test_scan_with_mvcc() {
-        use std::ops::Bound;
-        let db = db_builder();
-
-        // Write initial values
-        db.put(b"key1", b"v1").unwrap();
-        db.put(b"key2", b"v2").unwrap();
-
-        // Update values (creates new versions)
-        db.put(b"key1", b"v1-updated").unwrap();
-
-        let results: Vec<_> = db.scan(Bound::Unbounded, Bound::Unbounded).collect();
-        assert_eq!(results.len(), 2);
-
-        // Should see newest version
-        assert_eq!(&results[0].0[..], b"key1");
-        assert_eq!(&results[0].1[..], b"v1-updated");
-        assert_eq!(&results[1].0[..], b"key2");
-        assert_eq!(&results[1].1[..], b"v2");
-    }
-}
+mod tests;

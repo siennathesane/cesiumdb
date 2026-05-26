@@ -7,7 +7,6 @@ use std::{
         Arc,
         atomic::{
             AtomicBool,
-            AtomicU64,
             Ordering,
         },
     },
@@ -31,6 +30,10 @@ use crate::{
         CompactionManager,
         SchedulerConfig,
         SegmentRegistry,
+    },
+    errs::{
+        CesiumError,
+        FsError,
     },
     levels::KeyRange,
     manifest_reader::ManifestReader,
@@ -115,8 +118,8 @@ impl DbStorageBuilder {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-    pub fn build(self) -> Mutex<DbStorageState> {
-        Mutex::new(DbStorageState::new(self))
+    pub fn build(self) -> Result<Mutex<DbStorageState>, CesiumError> {
+        Ok(Mutex::new(DbStorageState::new(self)?))
     }
 }
 
@@ -156,7 +159,7 @@ pub struct DbStorageState {
 }
 
 impl DbStorageState {
-    fn new(opts: DbStorageBuilder) -> Self {
+    fn new(opts: DbStorageBuilder) -> Result<Self, CesiumError> {
         let frozen_memtables = Arc::new(Mutex::new(vec![]));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (flush_tx, flush_rx) = bounded::<()>(1);
@@ -183,19 +186,23 @@ impl DbStorageState {
         };
 
         // Initialize or open manifest writer
-        let manifest = base_path.as_ref().map(|path| {
+        let manifest = if let Some(ref path) = base_path {
             // Ensure base directory exists
-            std::fs::create_dir_all(path.as_ref()).expect("Failed to create base directory");
+            std::fs::create_dir_all(path.as_ref())
+                .map_err(|e| CesiumError::FsError(FsError::IoError(e)))?;
 
             let manifest_path = path.as_ref();
             let writer = if manifest_path.join("MANIFEST").exists() {
                 ManifestWriter::open_existing(path.as_ref().clone())
-                    .expect("Failed to open existing manifest")
+                    .map_err(CesiumError::ManifestError)?
             } else {
-                ManifestWriter::create(path.as_ref().clone(), 0).expect("Failed to create manifest")
+                ManifestWriter::create(path.as_ref().clone(), 0)
+                    .map_err(CesiumError::ManifestError)?
             };
-            Arc::new(Mutex::new(writer))
-        });
+            Some(Arc::new(Mutex::new(writer)))
+        } else {
+            None
+        };
 
         // Initialize segment registry and compaction manager if base_path is provided
         let registry = base_path
@@ -244,7 +251,7 @@ impl DbStorageState {
             None
         };
 
-        Self {
+        Ok(Self {
             curr_memtable: RwLock::new(Arc::new(Memtable::new(0, opts.memtable_size))),
             frozen_memtables,
             version_manager,
@@ -260,7 +267,7 @@ impl DbStorageState {
             } else {
                 None
             },
-        }
+        })
     }
 
     /// Background thread that flushes frozen memtables to disk
@@ -316,7 +323,7 @@ impl DbStorageState {
                             // Log to manifest BEFORE updating version (write-ahead)
                             if let Some(ref manifest_writer) = manifest {
                                 let edit = VersionEdit::AddL0Segment {
-                                    segment_id: segment_id,
+                                    segment_id,
                                     key_range: (min_key, max_key),
                                     size: segment.size_in_bytes(),
                                 };
@@ -398,6 +405,13 @@ impl DbStorageState {
         self.curr_memtable.read().clone()
     }
 
+    pub fn should_stall_writes(&self) -> bool {
+        self.compaction_manager
+            .as_ref()
+            .map(|m| m.lock().should_stall_writes())
+            .unwrap_or(false)
+    }
+
     /// Returns a snapshot of frozen memtables for scanning.
     ///
     /// Returns a clone of the frozen memtables vector, allowing callers to
@@ -419,7 +433,7 @@ impl DbStorageState {
 
         // Search from newest (end) to oldest (front)
         for memtable in frozen.iter().rev() {
-            if let Some(val) = memtable.get(&key) {
+            if let Some(val) = memtable.get(key) {
                 return Some(val);
             }
         }
@@ -500,11 +514,10 @@ impl DbStorageState {
         self.compaction_manager.take();
 
         // 5. Sync manifest to ensure all edits are persisted
-        if let Some(ref manifest) = self.manifest {
-            if let Err(e) = manifest.lock().sync() {
+        if let Some(ref manifest) = self.manifest
+            && let Err(e) = manifest.lock().sync() {
                 tracing::error!(error = ?e, "Failed to sync manifest during shutdown");
             }
-        }
 
         Ok(())
     }
@@ -519,11 +532,10 @@ impl DbStorageState {
         self.drain_frozen_memtables();
 
         // Sync manifest to ensure all version edits are persisted
-        if let Some(ref manifest) = self.manifest {
-            if let Err(e) = manifest.lock().sync() {
+        if let Some(ref manifest) = self.manifest
+            && let Err(e) = manifest.lock().sync() {
                 tracing::error!(error = ?e, "Failed to sync manifest during sync()");
             }
-        }
 
         Ok(())
     }
@@ -555,7 +567,7 @@ impl DbStorageState {
                     // Log to manifest BEFORE updating version (write-ahead)
                     if let Some(ref manifest_writer) = self.manifest {
                         let edit = VersionEdit::AddL0Segment {
-                            segment_id: segment_id,
+                            segment_id,
                             key_range: (min_key, max_key),
                             size: segment.size_in_bytes(),
                         };
@@ -626,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_new_memtable() {
-        let state = DbStorageBuilder::default().build();
+        let state = DbStorageBuilder::default().build().unwrap();
 
         assert!(state.lock().frozen_memtables.lock().is_empty());
 
@@ -635,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_memtable_swap() {
-        let state = DbStorageBuilder::default().build();
+        let state = DbStorageBuilder::default().build().unwrap();
 
         let initial_id = state.lock().current_memtable().id();
         assert_eq!(initial_id, 0, "initial memtable should have id 0");
@@ -654,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_multiple_memtable_swaps() {
-        let state = DbStorageBuilder::default().build();
+        let state = DbStorageBuilder::default().build().unwrap();
 
         const NUM_SWAPS: u64 = 5;
 
@@ -680,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_current_memtable_returns_same_instance() {
-        let state = DbStorageBuilder::default().build();
+        let state = DbStorageBuilder::default().build().unwrap();
 
         let mt1 = state.lock().current_memtable();
         let mt2 = state.lock().current_memtable();
@@ -691,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_frozen_memtables_preserve_data() {
-        let state = DbStorageBuilder::default().build();
+        let state = DbStorageBuilder::default().build().unwrap();
 
         // write data to first memtable
         let key = KeyBytes::new(DEFAULT_NS, Bytes::from("test-key"), 1000);
@@ -726,7 +738,7 @@ mod tests {
             .block_size(custom_block_size)
             .target_segment_size(custom_segment_size)
             .num_memtable_limit(custom_memtable_limit)
-            .build();
+            .build().unwrap();
 
         // verify state is created successfully
         let current = state.lock().current_memtable();
@@ -739,14 +751,14 @@ mod tests {
             .block_size(4096)
             .target_segment_size(8192)
             .num_memtable_limit(6)
-            .build();
+            .build().unwrap();
 
         assert_eq!(state.lock().current_memtable().id(), 0);
     }
 
     #[test]
     fn test_memtable_id_monotonic_increase() {
-        let state = DbStorageBuilder::default().build();
+        let state = DbStorageBuilder::default().build().unwrap();
 
         let mut prev_id = 0;
         for _ in 0..10 {
