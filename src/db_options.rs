@@ -182,6 +182,7 @@ impl DbOptions {
                 guard.frozen_memtables_arc(),
             )
         };
+
         let inner = DbInner {
             state,
             curr_memtable: RwLock::new(curr_memtable),

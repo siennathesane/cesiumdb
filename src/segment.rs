@@ -3,7 +3,6 @@ use std::{
     ptr,
     sync::{
         Arc,
-        OnceLock,
         atomic::{
             AtomicU64,
             Ordering::Relaxed,
@@ -28,22 +27,28 @@ use crate::{
             Start,
         },
         MAX_ENTRY_SIZE,
+        ReadOnlyBlock,
     },
+    utils::Deserializer,
     errs::{
         SegmentError,
         SegmentError::{
             CantCreateReader,
+            CorruptedBlock,
+            MissingKey,
             ReadOnly,
+            ReadOutOfBounds,
         },
     },
     index::Index,
     keypair::DEFAULT_NS,
     map::Map,
+    scan::OwnedSegmentIterator,
     segment::BlockType::{
         Key,
         Value,
     },
-    segment_reader::SegmentReader,
+    segment_reader::{BlockCache, SegmentReader},
     segment_writer::SegmentWriter,
 };
 
@@ -236,9 +241,12 @@ pub struct Segment {
     /// yet.
     bytes_written: AtomicU64,
 
-    /// Lazily-initialized SegmentReader shared across all lookups.
-    /// Avoids re-creating the reader on every get.
-    cached_reader: OnceLock<crate::segment_reader::SegmentReader>,
+    /// Small per-segment value block cache for hot keys.
+    val_block_cache: parking_lot::Mutex<BlockCache<8>>,
+
+    /// Pre-computed visible block counts (valid for read-only segments).
+    visible_key_blocks: usize,
+    visible_val_blocks: usize,
 }
 
 impl Segment {
@@ -277,7 +285,9 @@ impl Segment {
             key_id,
             val_id,
             bytes_written: AtomicU64::new(0),
-            cached_reader: OnceLock::new(),
+            val_block_cache: parking_lot::Mutex::new(BlockCache::new()),
+            visible_key_blocks: 0,
+            visible_val_blocks: 0,
         }
     }
 
@@ -294,6 +304,39 @@ impl Segment {
         // For opened segments, compute bytes_written from the map sizes
         let total_bytes = key_map.len() as u64 + val_map.len() as u64;
 
+        // Compute visible key blocks (same logic as SegmentReader)
+        let segment_size = key_map.len();
+        let metadata_block_count = if segment_size >= 32 {
+            match key_map.read_range(segment_size - 32..segment_size, |slice| {
+                Bytes::copy_from_slice(slice)
+            }) {
+                | Ok(bytes) => {
+                    let m = Metadata::from(bytes);
+                    let index_end = m.index_start() + m.index_size();
+                    if index_end + 32 == segment_size {
+                        Some(m.block_count())
+                    } else {
+                        None
+                    }
+                },
+                | Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let index_blocks = key_index.num_blocks() as usize;
+        let num_blocks = segment_size.div_ceil(BLOCK_SIZE);
+        let visible_key_blocks = if let Some(block_count) = metadata_block_count {
+            block_count
+        } else if index_blocks > 0 {
+            index_blocks
+        } else if segment_size >= DEFAULT_SEGMENT_SIZE as usize {
+            0
+        } else {
+            num_blocks
+        };
+        let visible_val_blocks = val_map.len() / BLOCK_SIZE;
+
         Ok(Arc::new(Segment {
             key_writer: Mutex::new(None),
             key_handle: Some(key_map),
@@ -307,7 +350,9 @@ impl Segment {
             key_id,
             val_id,
             bytes_written: AtomicU64::new(total_bytes),
-            cached_reader: OnceLock::new(),
+            val_block_cache: parking_lot::Mutex::new(BlockCache::new()),
+            visible_key_blocks,
+            visible_val_blocks,
         }))
     }
 
@@ -364,33 +409,6 @@ impl Segment {
         // self.key_index.write().insert_item(key_without_ts);
 
         Ok(())
-    }
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
-    pub fn new_reader(&self) -> Result<SegmentReader, SegmentError> {
-        let km: Arc<Map> = match &self.key_handle {
-            | Some(handle) => handle.clone(),
-            | None => {
-                let writer = self.key_writer.lock();
-                match writer.as_ref() {
-                    | Some(w) => w.map.clone(),
-                    | None => return Err(CantCreateReader),
-                }
-            },
-        };
-
-        let vm: Arc<Map> = match &self.val_handle {
-            | Some(handle) => handle.clone(),
-            | None => {
-                let writer = self.val_writer.lock();
-                match writer.as_ref() {
-                    | Some(w) => w.map.clone(),
-                    | None => return Err(CantCreateReader),
-                }
-            },
-        };
-
-        SegmentReader::new(km, vm, self.key_index.clone())
     }
 
     /// Helper method to add an entry with retry logic.
@@ -911,34 +929,10 @@ impl Segment {
         }
     }
 
-    /// Creates a SegmentReader for this segment
-    ///
-    /// This can only be called on read-only segments (opened from disk).
     /// Quick bloom-filter check without creating a SegmentReader.
     /// Returns true if the segment *may* contain the key.
     #[inline]
-    pub fn may_contain(&self, key_without_ts: &[u8]) -> bool {
-        self.key_index.read().may_contain(key_without_ts)
-    }
-
-    /// Returns a cached SegmentReader, creating it on first access.
-    pub fn reader_cached(&self) -> Result<&crate::segment_reader::SegmentReader, SegmentError> {
-        if !self.is_read_only() {
-            return Err(SegmentError::ReadOnly);
-        }
-
-        self.cached_reader
-            .get_or_init(|| {
-                let key_handle = self.key_handle.as_ref().unwrap().clone();
-                let val_handle = self.val_handle.as_ref().unwrap().clone();
-                let key_index = self.key_index.clone();
-                crate::segment_reader::SegmentReader::new(key_handle, val_handle, key_index)
-                    .unwrap()
-            });
-        Ok(self.cached_reader.get().unwrap())
-    }
-
-    pub fn reader(&self) -> Result<crate::segment_reader::SegmentReader, SegmentError> {
+    pub(crate) fn reader(&self) -> Result<SegmentReader, SegmentError> {
         if !self.is_read_only() {
             return Err(SegmentError::ReadOnly);
         }
@@ -953,7 +947,230 @@ impl Segment {
         };
         let key_index = self.key_index.clone();
 
-        crate::segment_reader::SegmentReader::new(key_handle, val_handle, key_index)
+        crate::segment_reader::SegmentReader::new(
+            key_handle,
+            val_handle,
+            key_index,
+        )
+    }
+
+    /// Point lookup. Checks bloom internally; touches at most one key block.
+    /// Uses the per-segment value block cache for hot keys.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
+    pub fn get(&self, key_without_ts: &[u8]) -> Result<Option<Bytes>, SegmentError> {
+        if !self.is_read_only() {
+            return Err(SegmentError::ReadOnly);
+        }
+
+        let guard = self.key_index.read();
+        if !guard.may_contain(key_without_ts) {
+            return Ok(None);
+        }
+        let key_block_offset = match guard.get_block(key_without_ts) {
+            | Some(v) => v,
+            | None => return Ok(None),
+        };
+        drop(guard);
+
+        let offset = key_block_offset as usize * BLOCK_SIZE;
+        let key_handle = self.key_handle.as_ref().unwrap();
+        let key_bytes = key_handle.read_bytes(offset..offset + BLOCK_SIZE)?;
+        let key_block = ReadOnlyBlock::deserialize(key_bytes);
+
+        for entry_index in 0..key_block.num_entries() as usize {
+            let (flag, data) = match key_block.get(entry_index) {
+                | Some(v) => v,
+                | None => continue,
+            };
+            if data.len() < 10 {
+                continue;
+            }
+            let value_block_num = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            let value_entry_index = u16::from_le_bytes(data[8..10].try_into().unwrap());
+            let actual_key_data = &data[10..];
+
+            let key_matches = match flag {
+                | EntryFlag::Complete => {
+                    actual_key_data.len() >= key_without_ts.len()
+                        && &actual_key_data[..key_without_ts.len()] == key_without_ts
+                },
+                | EntryFlag::Start => {
+                    match self.read_full_key(key_block_offset as usize, entry_index) {
+                        | Ok(full_key_data) => {
+                            if full_key_data.len() < 10 {
+                                continue;
+                            }
+                            let full_actual_key = &full_key_data[10..];
+                            full_actual_key.len() >= key_without_ts.len()
+                                && &full_actual_key[..key_without_ts.len()] == key_without_ts
+                        },
+                        | Err(_) => continue,
+                    }
+                },
+                | _ => continue,
+            };
+
+            if key_matches {
+                return match self.read_value_from_block(
+                    value_block_num as usize,
+                    value_entry_index as usize,
+                ) {
+                    | Ok(v) => Ok(Some(v)),
+                    | Err(e) => Err(e),
+                };
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Range scan. Creates an internal reader and returns an owned iterator.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
+    pub fn scan(
+        &self,
+        lower: std::ops::Bound<crate::keypair::KeyBytes>,
+        upper: std::ops::Bound<crate::keypair::KeyBytes>,
+    ) -> Result<OwnedSegmentIterator, SegmentError> {
+        let reader = self.reader()?;
+        Ok(OwnedSegmentIterator::new(reader, lower, upper))
+    }
+
+    // --- helpers for get() ---
+
+    fn read_key_block_direct(&self, block_index: usize) -> Result<ReadOnlyBlock, SegmentError> {
+        if block_index >= self.visible_key_blocks {
+            return Err(ReadOutOfBounds);
+        }
+        let offset = block_index * BLOCK_SIZE;
+        let key_handle = self.key_handle.as_ref().unwrap();
+        let bytes = key_handle.read_bytes(offset..offset + BLOCK_SIZE)?;
+        Ok(ReadOnlyBlock::deserialize(bytes))
+    }
+
+    fn read_val_block_cached(&self, block_index: usize) -> Result<ReadOnlyBlock, SegmentError> {
+        if block_index >= self.visible_val_blocks {
+            return Err(ReadOutOfBounds);
+        }
+        let cache = self.val_block_cache.lock();
+        if let Some(cached) = cache.get(block_index) {
+            Ok(cached)
+        } else {
+            drop(cache);
+            let offset = block_index * BLOCK_SIZE;
+            let val_handle = self.val_handle.as_ref().unwrap();
+            let bytes = val_handle.read_bytes(offset..offset + BLOCK_SIZE)?;
+            let block = ReadOnlyBlock::deserialize(bytes);
+            self.val_block_cache.lock().insert(block_index, block.clone());
+            Ok(block)
+        }
+    }
+
+    fn read_full_key(&self, key_block_offset: usize, entry_index: usize) -> Result<Bytes, SegmentError> {
+        let block = self.read_key_block_direct(key_block_offset)?;
+        let (flag, data) = match block.get(entry_index).ok_or(MissingKey) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
+        };
+        self.read_multiblock_entry(flag, data, key_block_offset + 1)
+    }
+
+    fn read_multiblock_entry(
+        &self,
+        flag: EntryFlag,
+        initial_data: &[u8],
+        starting_block: usize,
+    ) -> Result<Bytes, SegmentError> {
+        use EntryFlag::*;
+        match flag {
+            | Complete => Ok(Bytes::copy_from_slice(initial_data)),
+            | Start => {
+                let mut buffer = BytesMut::with_capacity(initial_data.len() * 2);
+                buffer.extend_from_slice(initial_data);
+                let mut current_block_index = starting_block;
+                let mut found_end = false;
+                while current_block_index < self.visible_key_blocks && !found_end {
+                    let next_block = match self.read_key_block_direct(current_block_index) {
+                        | Ok(b) => b,
+                        | Err(e) => return Err(e),
+                    };
+                    if next_block.num_entries() == 0 {
+                        current_block_index += 1;
+                        continue;
+                    }
+                    let (next_flag, next_data) = match next_block.get(0).ok_or(CorruptedBlock) {
+                        | Ok(v) => v,
+                        | Err(e) => return Err(e),
+                    };
+                    match next_flag {
+                        | Middle => {
+                            buffer.extend_from_slice(next_data);
+                            current_block_index += 1;
+                        },
+                        | End => {
+                            buffer.extend_from_slice(next_data);
+                            found_end = true;
+                        },
+                        | _ => return Err(CorruptedBlock),
+                    }
+                }
+                if !found_end {
+                    return Err(CorruptedBlock);
+                }
+                Ok(buffer.freeze())
+            },
+            | Middle | End => Err(CorruptedBlock),
+        }
+    }
+
+    fn read_value_from_block(
+        &self,
+        val_block_index: usize,
+        entry_index: usize,
+    ) -> Result<Bytes, SegmentError> {
+        let block = self.read_val_block_cached(val_block_index)?;
+        if entry_index >= block.num_entries() as usize {
+            return Err(MissingKey);
+        }
+        match block.get_bytes(entry_index) {
+            | Some((EntryFlag::Complete, data)) => Ok(data),
+            | Some((EntryFlag::Start, data)) => {
+                let mut buffer = BytesMut::with_capacity(data.len() * 2);
+                buffer.extend_from_slice(&data);
+                let mut current_block_index = val_block_index + 1;
+                let mut found_end = false;
+                if current_block_index >= self.visible_val_blocks {
+                    return Err(CorruptedBlock);
+                }
+                while current_block_index < self.visible_val_blocks && !found_end {
+                    let next_block = self.read_val_block_cached(current_block_index)?;
+                    if next_block.num_entries() == 0 {
+                        current_block_index += 1;
+                        continue;
+                    }
+                    let (next_flag, next_data) = match next_block.get(0) {
+                        | Some(v) => v,
+                        | None => return Err(CorruptedBlock),
+                    };
+                    match next_flag {
+                        | EntryFlag::Middle => {
+                            buffer.extend_from_slice(next_data);
+                            current_block_index += 1;
+                        },
+                        | EntryFlag::End => {
+                            buffer.extend_from_slice(next_data);
+                            found_end = true;
+                        },
+                        | _ => return Err(CorruptedBlock),
+                    }
+                }
+                if !found_end {
+                    return Err(CorruptedBlock);
+                }
+                Ok(buffer.freeze())
+            },
+            | Some((EntryFlag::Middle | EntryFlag::End, _)) => Err(CorruptedBlock),
+            | None => Err(MissingKey),
+        }
     }
 }
 
@@ -990,6 +1207,7 @@ mod tests {
             HLC,
             HybridLogicalClock,
         },
+        segment_reader::SegmentReader,
         keypair::{
             DEFAULT_NS,
             KeyBytes,
@@ -1161,8 +1379,15 @@ mod tests {
     fn test_segment_reader_creation() {
         let (segment, _dir) = create_test_segment();
 
-        // Get a new reader
-        let reader = segment.new_reader();
+        // Get maps from writers since segment isn't read-only yet
+        let km = segment.key_writer.lock().as_ref().unwrap().map.clone();
+        let vm = segment.val_writer.lock().as_ref().unwrap().map.clone();
+
+        let reader = SegmentReader::new(
+            km,
+            vm,
+            segment.key_index.clone(),
+        );
         assert!(reader.is_ok());
     }
 

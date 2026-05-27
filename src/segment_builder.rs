@@ -381,13 +381,11 @@ mod tests {
             let reopened_segment = builder
                 .open(segment_id)
                 .expect("Failed to open existing segment");
-            let reader = reopened_segment
-                .new_reader()
-                .expect("Failed to create reader");
-
             for (key_bytes, expected_val_bytes) in &serialized_pairs {
-                let result = reader
-                    .get(key_bytes.as_ref())
+                // Segment::get() expects key_without_ts (no 16-byte timestamp suffix)
+                let key_without_ts = &key_bytes[..key_bytes.len() - 16];
+                let result = reopened_segment
+                    .get(key_without_ts)
                     .expect("Error during get operation");
 
                 assert!(
@@ -477,15 +475,13 @@ mod tests {
             let reopened_segment = builder2
                 .open(segment_id)
                 .expect("Failed to open existing segment");
-            let reader = reopened_segment
-                .new_reader()
-                .expect("Failed to create reader");
-
             // Verify data (keys must be serialized for get)
             for (key, expected_value) in &test_data[0..10] {
                 use crate::utils::Serializer;
-                let result = reader
-                    .get(key.serialize().as_ref())
+                let serialized = key.serialize();
+                let key_without_ts = &serialized[..serialized.len() - 16];
+                let result = reopened_segment
+                    .get(key_without_ts)
                     .expect("Error during get operation");
                 assert!(result.is_some(), "Key not found in reopened segment");
                 assert_eq!(
@@ -534,15 +530,13 @@ mod tests {
         // Step 2: Reopen each segment and verify data
         for (segment_id, test_data) in test_data_sets {
             let reopened_segment = builder.open(segment_id).expect("Failed to reopen segment");
-            let reader = reopened_segment
-                .new_reader()
-                .expect("Failed to create reader");
-
             // Verify data (keys must be serialized for get)
             for (key, expected_value) in &test_data {
                 use crate::utils::Serializer;
-                let result = reader
-                    .get(key.serialize().as_ref())
+                let serialized = key.serialize();
+                let key_without_ts = &serialized[..serialized.len() - 16];
+                let result = reopened_segment
+                    .get(key_without_ts)
                     .expect("Error during get operation");
                 assert!(result.is_some(), "Key not found in segment");
                 assert_eq!(

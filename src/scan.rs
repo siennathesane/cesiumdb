@@ -24,7 +24,7 @@ use crate::{
 ///
 /// This solves the lifetime issue where SegmentScanIterator borrows from
 /// SegmentReader by having the iterator own the reader.
-pub(crate) struct OwnedSegmentIterator {
+pub struct OwnedSegmentIterator {
     // reader is None after the iterator is created (taken by scan)
     pub(crate) reader: Option<SegmentReader>,
     // Store serialized KeyBytes bounds (with namespace + timestamp)

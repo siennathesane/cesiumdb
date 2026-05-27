@@ -198,6 +198,9 @@ struct BenchmarkResult {
     seconds: f64,
     bytes: u64,
     latencies: Vec<u64>, // microseconds
+    /// For mixed workloads (e.g. readwhilewriting), track read ops separately
+    /// so we can report reads/sec matching RocksDB semantics.
+    read_ops: u64,
 }
 
 impl BenchmarkResult {
@@ -238,13 +241,25 @@ impl BenchmarkResult {
     }
 
     fn print(&self) {
+        // For readwhilewriting, report reads/sec to match standard benchmark semantics.
+        let (ops_label, ops_display, rate_label) = if self.read_ops > 0 {
+            (
+                self.read_ops,
+                format!("{} reads + {} writes", self.read_ops, self.ops - self.read_ops),
+                "reads/sec",
+            )
+        } else {
+            (self.ops, format!("{}", self.ops), "ops/sec")
+        };
+        let ops_per_sec = ops_label as f64 / self.seconds.max(0.0001);
         println!(
-            "{:>14} : {:>10.3} micros/op {:>10.0} ops/sec {:>10.3} seconds {:>15} operations; {:>10.1} MB/s",
+            "{:>14} : {:>10.3} micros/op {:>10.0} {} {:>10.3} seconds {:>15} operations; {:>10.1} MB/s",
             self.name,
-            self.micros_per_op(),
-            self.ops_per_sec(),
+            self.seconds * 1_000_000.0 / ops_label.max(1) as f64,
+            ops_per_sec,
+            rate_label,
             self.seconds,
-            self.ops,
+            ops_display,
             self.mb_per_sec()
         );
         if !self.latencies.is_empty() {
@@ -288,7 +303,8 @@ fn open_db(args: &Args) -> Arc<Db> {
         .memtable_size(args.memtable_size)
         .max_memtables(args.max_memtables)
         .target_segment_size(args.target_segment_size)
-        .target_file_size_multiplier(args.target_file_size_multiplier);
+        .target_file_size_multiplier(args.target_file_size_multiplier)
+;
 
     let mut scheduler = cesiumdb::compaction::SchedulerConfig::default();
     scheduler.l0_compaction_trigger = args.l0_trigger;
@@ -329,6 +345,7 @@ fn run_fillseq(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
         seconds: elapsed,
         bytes: num * args.value_size as u64,
         latencies: sort_latencies(&latencies),
+        read_ops: 0,
     }
 }
 
@@ -399,6 +416,7 @@ fn run_fillrandom(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
         seconds: elapsed,
         bytes: actual_ops * args.value_size as u64,
         latencies: sort_latencies(&latencies),
+        read_ops: 0,
     }
 }
 
@@ -486,6 +504,7 @@ fn run_readrandom(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
         seconds: elapsed,
         bytes: actual_ops * args.value_size as u64,
         latencies: sort_latencies(&latencies),
+        read_ops: 0,
     }
 }
 
@@ -572,6 +591,7 @@ fn run_readwhilewriting(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
         seconds: elapsed,
         bytes: write_ops.load(Ordering::Relaxed) * args.value_size as u64,
         latencies: sort_latencies(&latencies),
+        read_ops: read_ops.load(Ordering::Relaxed),
     }
 }
 
@@ -640,6 +660,7 @@ fn run_seekrandom(db: &Arc<Db>, args: &Args) -> BenchmarkResult {
         seconds: elapsed,
         bytes: actual_ops * args.value_size as u64,
         latencies: sort_latencies(&latencies),
+        read_ops: 0,
     }
 }
 

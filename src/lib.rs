@@ -116,11 +116,12 @@ pub use db_options::{
     Batch,
     DbOptions,
 };
-pub(crate) use scan::OwnedSegmentIterator;
+pub use scan::OwnedSegmentIterator;
 pub use scan::{
     DbScanIterator,
     ReadAmpStats,
 };
+
 pub use version::VersionStats;
 
 /// The core CesiumDB API. Use this to create or open a database, and perform

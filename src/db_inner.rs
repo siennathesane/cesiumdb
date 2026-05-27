@@ -34,7 +34,6 @@ use crate::{
     CesiumError,
     CesiumError::MemtableError,
     DbScanIterator,
-    OwnedSegmentIterator,
     ReadAmpStats,
     VersionStats,
     db_options::Batch,
@@ -118,21 +117,8 @@ impl DbInner {
 
             // Check L0 segments in reverse chronological order (newest first)
             for segment in version.l0.iter().rev() {
-                // Fast bloom filter check without creating a SegmentReader.
-                if !segment.may_contain(&key_for_bloom) {
-                    continue;
-                }
-
                 self.l0_reads.fetch_add(1, Ordering::Relaxed);
-
-                let reader = match segment.reader_cached() {
-                    | Ok(r) => r,
-                    | Err(e) => return Err(CesiumError::SegmentError(e)),
-                };
-
-                // Fast point lookup – touches at most one key block.
-                // Bloom was already checked, so use the fast path.
-                match reader.get_latest_fast(&key_for_bloom) {
+                match segment.get(&key_for_bloom) {
                     | Ok(Some(val_bytes)) => {
                         let val = ValueBytes::deserialize(val_bytes);
                         if val.is_tombstone() {
@@ -148,21 +134,9 @@ impl DbInner {
             // Check L1-L7 sequentially from newest level to oldest.
             for level in &version.levels {
                 if level.strategy.allows_overlaps() {
-                    // Tiered / universal levels may have overlapping ranges.
-                    // Fall back to scanning all segments with bloom checks.
                     for segment in &level.segments {
-                        if !segment.may_contain(&key_for_bloom) {
-                            continue;
-                        }
-
                         self.ln_reads.fetch_add(1, Ordering::Relaxed);
-
-                        let reader = match segment.reader_cached() {
-                            | Ok(r) => r,
-                            | Err(e) => return Err(CesiumError::SegmentError(e)),
-                        };
-
-                        match reader.get_latest_fast(&key_for_bloom) {
+                        match segment.get(&key_for_bloom) {
                             | Ok(Some(val_bytes)) => {
                                 let val = ValueBytes::deserialize(val_bytes);
                                 if val.is_tombstone() {
@@ -175,35 +149,20 @@ impl DbInner {
                         }
                     }
                 } else {
-                    // Leveled levels have sorted, non-overlapping ranges.
-                    // Use binary search to touch at most one segment per level.
                     if let Some(segment_id) = level.find_segment_for_key_binary(&key_for_bloom) {
-                        let segment = match level.segments.iter().find(|s| s.id() == segment_id) {
-                            | Some(s) => s,
-                            | None => continue,
-                        };
-
-                        if !segment.may_contain(&key_for_bloom) {
-                            continue;
-                        }
-
-                        self.ln_reads.fetch_add(1, Ordering::Relaxed);
-
-                        let reader = match segment.reader_cached() {
-                            | Ok(r) => r,
-                            | Err(e) => return Err(CesiumError::SegmentError(e)),
-                        };
-
-                        match reader.get_latest_fast(&key_for_bloom) {
-                            | Ok(Some(val_bytes)) => {
-                                let val = ValueBytes::deserialize(val_bytes);
-                                if val.is_tombstone() {
-                                    return Ok(None);
-                                }
-                                return Ok(Some(val));
-                            },
-                            | Ok(None) => {},
-                            | Err(e) => return Err(CesiumError::SegmentError(e)),
+                        if let Some(segment) = level.segments.iter().find(|s| s.id() == segment_id) {
+                            self.ln_reads.fetch_add(1, Ordering::Relaxed);
+                            match segment.get(&key_for_bloom) {
+                                | Ok(Some(val_bytes)) => {
+                                    let val = ValueBytes::deserialize(val_bytes);
+                                    if val.is_tombstone() {
+                                        return Ok(None);
+                                    }
+                                    return Ok(Some(val));
+                                },
+                                | Ok(None) => {},
+                                | Err(e) => return Err(CesiumError::SegmentError(e)),
+                            }
                         }
                     }
                 }
@@ -289,27 +248,23 @@ impl DbInner {
 
             // Add L0 segments (can overlap, so all must be scanned)
             for segment in &version.l0 {
-                let reader = match segment.reader() {
-                    | Ok(r) => r,
+                let iter = match segment.scan(lower_key.clone(), upper_key.clone()) {
+                    | Ok(i) => i,
                     | Err(e) => return Err(CesiumError::SegmentError(e)),
                 };
-                let owned_iter =
-                    OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
                 iters
-                    .push(Box::new(owned_iter)
+                    .push(Box::new(iter)
                         as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
             }
 
             // Add segments from L1-L7
             for level in &version.levels {
                 for segment in &level.segments {
-                    let reader = match segment.reader() {
-                        | Ok(r) => r,
+                    let iter = match segment.scan(lower_key.clone(), upper_key.clone()) {
+                        | Ok(i) => i,
                         | Err(e) => return Err(CesiumError::SegmentError(e)),
                     };
-                    let owned_iter =
-                        OwnedSegmentIterator::new(reader, lower_key.clone(), upper_key.clone());
-                    iters.push(Box::new(owned_iter)
+                    iters.push(Box::new(iter)
                         as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
                 }
             }

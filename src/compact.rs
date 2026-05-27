@@ -647,7 +647,7 @@ mod tests {
         drop(segment);
         let builder = SegmentBuilder::new(output_path).unwrap();
         let reopened = builder.open(1).unwrap();
-        let reader = reopened.new_reader().unwrap();
+        let reader = reopened.reader().unwrap();
 
         let mut count = 0;
         for result in reader.scan(Bound::Unbounded, Bound::Unbounded) {

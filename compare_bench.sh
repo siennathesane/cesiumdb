@@ -121,7 +121,7 @@ function run_rocksdb() {
 function extract_metric() {
     local log="$1"
     local label="$2"
-    grep "$label" "$log" | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="ops/sec") print $(i-1)}'
+    grep "$label" "$log" | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="ops/sec" || $i=="reads/sec") print $(i-1)}'
 }
 
 function extract_mbs() {
@@ -180,7 +180,7 @@ RK_P9999=$(extract_p9999 /tmp/rocksdb_bench_${BENCH_TYPE}.log)
 
 # If the bench type isn't fillrandom, try the actual bench name
 case "$BENCH_TYPE" in
-    fillrandom|overwrite)
+    fillrandom|overwrite|readrandom|readwhilewriting|seekrandom)
         if [ -z "$CE_OPS" ]; then
             CE_OPS=$(extract_metric /tmp/cesium_bench_${BENCH_TYPE}.log "$BENCH_TYPE")
             CE_MB=$(extract_mbs /tmp/cesium_bench_${BENCH_TYPE}.log "$BENCH_TYPE")
