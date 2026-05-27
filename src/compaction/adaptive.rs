@@ -259,7 +259,7 @@ impl AdaptiveExecutor {
             let mut idle_cycles = 0u32;
 
             while !shutdown.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(100));
 
                 let current_jobs = jobs_completed.load(Ordering::Relaxed);
                 let _jobs_delta = current_jobs - last_jobs_completed;

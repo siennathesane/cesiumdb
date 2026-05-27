@@ -395,7 +395,7 @@ impl DbStorageState {
                 }
             } else {
                 // No flush needed - sleep briefly
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
