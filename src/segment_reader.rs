@@ -207,6 +207,74 @@ impl SegmentReader {
         }
         Ok(None)
     }
+    /// Perform a point lookup that matches any version of the key.
+    ///
+    /// Unlike [`get`](Self::get) which requires an exact timestamp match,
+    /// `get_latest` searches the indexed block for an entry whose prefix
+    /// (namespace + user key) matches `key_without_ts`.  This is the fast
+    /// path used by the DB read path because flushed/compacted segments
+    /// already contain only one version per key.
+    ///
+    /// The bloom filter and block index are consulted using
+    /// `key_without_ts`, so the lookup touches **at most one** key block.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
+    pub fn get_latest(&self, key_without_ts: &[u8]) -> Result<Option<Bytes>, SegmentError> {
+        // Bloom filter negative check
+        if !self.key_index.read().may_contain(key_without_ts) {
+            return Ok(None);
+        }
+        // Block index lookup
+        let key_block_offset = match self.key_index.read().get_block(key_without_ts) {
+            | Some(v) => v,
+            | None => return Ok(None),
+        };
+        let key_block = match self.read_key_block(key_block_offset as usize) {
+            | Ok(v) => v,
+            | Err(_e) => return Err(MissingKey),
+        };
+        for entry_index in 0..key_block.num_entries() as usize {
+            let (flag, data) = match key_block.get(entry_index) {
+                | Some(v) => v,
+                | None => continue,
+            };
+            if data.len() < 10 {
+                continue;
+            }
+            let value_block_num = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            let value_entry_index = u16::from_le_bytes(data[8..10].try_into().unwrap());
+            let actual_key_data = &data[10..];
+            let key_matches = match flag {
+                | EntryFlag::Complete => {
+                    actual_key_data.len() >= key_without_ts.len()
+                        && &actual_key_data[..key_without_ts.len()] == key_without_ts
+                },
+                | EntryFlag::Start => {
+                    match self.read_key(key_block_offset as usize, entry_index) {
+                        | Ok(full_key_data) => {
+                            if full_key_data.len() < 10 {
+                                continue;
+                            }
+                            let full_actual_key = &full_key_data[10..];
+                            full_actual_key.len() >= key_without_ts.len()
+                                && &full_actual_key[..key_without_ts.len()] == key_without_ts
+                        },
+                        | Err(_e) => continue,
+                    }
+                },
+                | _ => continue,
+            };
+            if key_matches {
+                return match self.read_value(
+                    value_block_num as usize,
+                    value_entry_index as usize,
+                ) {
+                    | Ok(v) => Ok(Some(v)),
+                    | Err(e) => Err(e),
+                };
+            }
+        }
+        Ok(None)
+    }
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn read_key_block(
         &self,
@@ -1006,5 +1074,59 @@ mod tests {
         let result3 = reader.get(&key3).unwrap();
         assert!(result3.is_some());
         assert_eq!(result3.unwrap().as_ref(), val3);
+    }
+    #[test]
+    fn test_get_latest_finds_key_regardless_of_timestamp() {
+        let (_dir, key_map, val_map, mut key_index, _val_index) = prepare_test_segment_for_get();
+        // Create a serialized key with a specific timestamp
+        let mut key = create_test_key(b"test_key");
+        // Override timestamp to something non-zero
+        let ts_bytes = 12345u128.to_le_bytes();
+        let key_len = key.len();
+        key[key_len - 16..].copy_from_slice(&ts_bytes);
+
+        let value = b"test_value";
+        let key_with_metadata = add_key_metadata(&key, 0, 0);
+
+        let mut key_block = Block::new();
+        key_block.add_entry(&key_with_metadata, EntryFlag::Complete).unwrap();
+        let mut val_block = Block::new();
+        val_block.add_entry(value, EntryFlag::Complete).unwrap();
+
+        write_block_to_mapfor_get(&key_map, 0, &key_block);
+        write_block_to_mapfor_get(&val_map, 0, &val_block);
+
+        let key_without_ts = &key[..key.len() - 16];
+        key_index.insert_item(key_without_ts);
+        key_index.inc_block_count(1);
+
+        let reader = SegmentReader::new(
+            key_map.clone(),
+            val_map.clone(),
+            Arc::new(parking_lot::RwLock::new(key_index)),
+        )
+        .unwrap();
+
+        // get() with the exact key (including timestamp) should find it
+        let result = reader.get(&key).unwrap();
+        assert!(result.is_some());
+
+        // get() with a different timestamp should NOT find it
+        let mut key2 = key.clone();
+        let key2_len = key2.len();
+        key2[key2_len - 16..].copy_from_slice(&99999u128.to_le_bytes());
+        let result2 = reader.get(&key2).unwrap();
+        assert!(result2.is_none());
+
+        // get_latest() with key_without_ts SHOULD find it
+        let result3 = reader.get_latest(key_without_ts).unwrap();
+        assert!(result3.is_some());
+        assert_eq!(result3.unwrap().as_ref(), value);
+
+        // get_latest() with a non-existent key should return None
+        let nonexistent = create_test_key(b"nonexistent_key");
+        let nonexistent_without_ts = &nonexistent[..nonexistent.len() - 16];
+        let result4 = reader.get_latest(nonexistent_without_ts).unwrap();
+        assert!(result4.is_none());
     }
 }

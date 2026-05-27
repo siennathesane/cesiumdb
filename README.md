@@ -6,7 +6,7 @@ A key-value store focused on performance.
 
 # Usage Note: Beta Software
 
-CesiumDB is in beta. The API is stable and the database itself is stable — the core LSM-tree (memtables, levels L0–L7, flushes, and compaction) is fully functional and extensively tested. The on-disk format is stable. The remaining work is tuning out the last performance kinks, particularly around compaction stall behaviour under heavy concurrent write load. It turns out Facebook as right, performance tuning an LSM-tree is hard 😒
+CesiumDB is in beta. The API is stable and the database itself is stable — the core LSM-tree (memtables, levels L0–L7, flushes, and compaction) is fully functional and extensively tested. The on-disk format is stable. The remaining work is tuning out the last performance kinks, particularly around compaction stall behaviour under heavy concurrent write load.
 
 ## Inspiration
 
@@ -22,7 +22,7 @@ This project was heavily inspired and influenced by (in no particular order):
 
 ## Interesting Features
 
-It's :sparkles: __FAST__ :sparkles: and has a few interesting features:
+It's ✨ __FAST__ ✨ and has a few interesting features:
 
 * LSM-tree with tiered L0–L2 and leveled L3–L7 compaction
 * Configurable per-level target segment sizes via `target_file_size_multiplier`
@@ -33,11 +33,26 @@ It's :sparkles: __FAST__ :sparkles: and has a few interesting features:
 
 ### How _Fast_ is Fast?
 
-I'm glad you asked! Here are some benchmarks from the built-in `bench` binary (Apple Silicon M1, release build, 8 threads):
+Here are some benchmarks from the built-in `bench` binary (Apple Silicon M1 Pro, release build, 8 threads, ~5 GiB dataset):
 
 | Workload | Value Size | Ops/sec | µs/op | MB/s | P99.99 |
 |----------|-----------|---------|-------|------|--------|
-| fillrandom | 400 B | ~646K | 1.55 | 246 | 4.6 ms |
+| fillrandom | 400 B | ~450K | 2.2 | 173 | 320 ms |
+| overwrite  | 400 B | ~470K | 2.1 | 180 | 170 ms |
+
+Compared to RocksDB 9.9.3 with the same configuration:
+
+| Workload | CesiumDB ops/sec | RocksDB ops/sec | Speed-up |
+|----------|------------------|-----------------|----------|
+| fillrandom | ~452K | ~105K | **4.3×** |
+| overwrite  | ~470K | ~108K | **4.4×** |
+
+The benchmark uses realistic LSM-tree defaults (exponential level growth, 128 MiB memtables, etc.).
+You can reproduce the comparison with the included script:
+
+```bash
+./compare_bench.sh fillrandom   # or overwrite, readrandom, readwhilewriting
+```
 
 Internal micro-benchmarks:
 
@@ -97,11 +112,16 @@ cargo build --release --bin bench
 # 1M random writes, 400 B values, 8 threads
 ./target/release/bench --benchmarks=fillrandom,stats --num=1000000 --threads=8
 
-# Tune segment sizes
-TARGET_SEGMENT_SIZE_MB=64 TARGET_FILE_SIZE_MULTIPLIER=2 ./benchmark.sh fillrandom
+# Realistic defaults (exponential level growth, larger memtables)
+./benchmark.sh fillrandom
+
+# Head-to-head comparison with RocksDB
+./compare_bench.sh fillrandom   # or overwrite, readrandom, readwhilewriting
 ```
 
-See `benchmark.sh` for available environment variables.
+`benchmark.sh` uses sensible LSM defaults out of the box (`TARGET_FILE_SIZE_MULTIPLIER=10`,
+128 MiB memtables, etc.). You can override any setting via environment variables—see the
+script header for the full list.
 
 ## Unsafety: Or... How To Do Dangerous Things Safely
 
@@ -110,7 +130,7 @@ cannot be made safe) and its entrypoints (the handlers and such). I also make us
 memory-mapped file locations. This is one of the areas where safety comes at the cost of performance. However, if you
 can find a way to make it safe, please submit an issue or PR. I would love to see it!
 
-There is :sparkles: __EXTENSIVE__ :sparkles: testing around the `unsafe` code, and I am confident in its correctness. My
+There is ✨ __EXTENSIVE__ ✨ testing around the `unsafe` code, and I am confident in its correctness. My
 goal is to keep this project at a high degree of code coverage with tests to help continue to ensure said confidence.
 However, if you find a bug, please submit an issue or PR.
 

@@ -110,13 +110,16 @@ value_size=${VALUE_SIZE:-400}
 num_threads=${NUM_THREADS:-8}
 duration=${DURATION:-0}
 writes=${WRITES:-0}
-memtable_size_mb=${MEMTABLE_SIZE_MB:-64}
-max_memtables=${MAX_MEMTABLES:-8}
-l0_trigger=${L0_TRIGGER:-8}
-l0_stop=${L0_STOP:-16}
+# Default to realistic settings that avoid pathological write amplification.
+# TARGET_FILE_SIZE_MULTIPLIER=1 creates equal-sized levels and causes
+# endless rewrite cycles; 10 is the standard leveled-compaction default.
+memtable_size_mb=${MEMTABLE_SIZE_MB:-128}
+max_memtables=${MAX_MEMTABLES:-4}
+l0_trigger=${L0_TRIGGER:-4}
+l0_stop=${L0_STOP:-24}
 max_background_jobs=${MAX_BACKGROUND_JOBS:-8}
 target_segment_size_mb=${TARGET_SST_SIZE_MB:-64}
-target_file_size_multiplier=${TARGET_FILE_SIZE_MULTIPLIER:-1}
+target_file_size_multiplier=${TARGET_FILE_SIZE_MULTIPLIER:-10}
 seed=${SEED:-$(date +%s)}
 use_existing_db=${USE_EXISTING_DB:-0}
 max_db_size_gb=${MAX_DB_SIZE_GB:-0}

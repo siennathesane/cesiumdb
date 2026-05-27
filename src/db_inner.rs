@@ -106,28 +106,6 @@ impl DbInner {
             // L0 must be checked sequentially because newer segments override older ones
             // We need to search by key prefix (ns + key) to find any version
             // Since timestamps are stored as (u128::MAX - ts), newest=0, oldest=u128::MAX
-            let key_prefix_lower = {
-                use bytes::{
-                    BufMut,
-                    BytesMut,
-                };
-                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len() + 16);
-                bytes.put_u64_le(key.ns());
-                bytes.put_slice(key.as_bytes().as_ref());
-                bytes.put_u128_le(0); // newest possible (u128::MAX - u128::MAX = 0)
-                bytes.freeze()
-            };
-            let key_prefix_upper = {
-                use bytes::{
-                    BufMut,
-                    BytesMut,
-                };
-                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len() + 16);
-                bytes.put_u64_le(key.ns());
-                bytes.put_slice(key.as_bytes().as_ref());
-                bytes.put_u128_le(u128::MAX); // oldest possible (u128::MAX - 0 = u128::MAX)
-                bytes.freeze()
-            };
 
             // Prepare key without timestamp for bloom filter checks
             let key_for_bloom = {
@@ -156,27 +134,17 @@ impl DbInner {
 
                 self.l0_reads.fetch_add(1, Ordering::Relaxed);
 
-                // Scan for keys matching this prefix (any timestamp)
-                use std::ops::Bound;
-                let scan_iter = reader.scan(
-                    Bound::Included(key_prefix_lower.as_ref()),
-                    Bound::Included(key_prefix_upper.as_ref()),
-                );
-
-                // Find the first entry whose user key matches exactly.
-                // Entries in-range share the same prefix but may differ in
-                // user key if hash collisions or block-level overlaps occur.
-                for result in scan_iter {
-                    if let Ok((found_key, val)) = result {
-                        if found_key.ns() == key.ns()
-                            && found_key.as_bytes() == key.as_bytes()
-                        {
-                            if val.is_tombstone() {
-                                return Ok(None);
-                            }
-                            return Ok(Some(val));
+                // Fast point lookup – touches at most one key block.
+                match reader.get_latest(&key_for_bloom) {
+                    | Ok(Some(val_bytes)) => {
+                        let val = ValueBytes::deserialize(val_bytes);
+                        if val.is_tombstone() {
+                            return Ok(None);
                         }
-                    }
+                        return Ok(Some(val));
+                    },
+                    | Ok(None) => {},
+                    | Err(e) => return Err(CesiumError::SegmentError(e)),
                 }
             }
 
@@ -198,22 +166,17 @@ impl DbInner {
 
                     self.ln_reads.fetch_add(1, Ordering::Relaxed);
 
-                    use std::ops::Bound;
-                    let scan_iter = reader.scan(
-                        Bound::Included(key_prefix_lower.as_ref()),
-                        Bound::Included(key_prefix_upper.as_ref()),
-                    );
-                    for result in scan_iter {
-                        if let Ok((found_key, val)) = result {
-                            if found_key.ns() == key.ns()
-                                && found_key.as_bytes() == key.as_bytes()
-                            {
-                                if val.is_tombstone() {
-                                    return Ok(None);
-                                }
-                                return Ok(Some(val));
+                    // Fast point lookup – touches at most one key block.
+                    match reader.get_latest(&key_for_bloom) {
+                        | Ok(Some(val_bytes)) => {
+                            let val = ValueBytes::deserialize(val_bytes);
+                            if val.is_tombstone() {
+                                return Ok(None);
                             }
-                        }
+                            return Ok(Some(val));
+                        },
+                        | Ok(None) => {},
+                        | Err(e) => return Err(CesiumError::SegmentError(e)),
                     }
                 }
             }
