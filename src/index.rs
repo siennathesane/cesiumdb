@@ -208,6 +208,24 @@ impl Index {
             .map(|idx| self.block_offset_entries[idx].1)
     }
 
+    /// Combined bloom-filter + block-index lookup.
+    /// Returns `None` if the bloom filter says the key is definitely absent,
+    /// otherwise returns `Some(block_offset)` (which may be `None` if the
+    /// block index doesn't have an entry).
+    #[inline]
+    pub fn may_contain_and_get_block(&self, key: &[u8]) -> Option<Option<u64>> {
+        let hash = safe_gxhash64(key, self.bloom_filter_seed);
+        if !self.bloom_filter.contains(&hash) {
+            return None;
+        }
+        let block = self
+            .block_offset_entries
+            .binary_search_by_key(&hash, |(h, _b)| *h)
+            .ok()
+            .map(|idx| self.block_offset_entries[idx].1);
+        Some(block)
+    }
+
     /// Get the id of this index
     pub fn id(&self) -> u64 {
         self.id

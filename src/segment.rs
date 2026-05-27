@@ -3,6 +3,7 @@ use std::{
     ptr,
     sync::{
         Arc,
+        OnceLock,
         atomic::{
             AtomicU64,
             Ordering::Relaxed,
@@ -234,6 +235,10 @@ pub struct Segment {
     /// Used as fallback for `size_in_bytes()` when handles aren't available
     /// yet.
     bytes_written: AtomicU64,
+
+    /// Lazily-initialized SegmentReader shared across all lookups.
+    /// Avoids re-creating the reader on every get.
+    cached_reader: OnceLock<crate::segment_reader::SegmentReader>,
 }
 
 impl Segment {
@@ -272,6 +277,7 @@ impl Segment {
             key_id,
             val_id,
             bytes_written: AtomicU64::new(0),
+            cached_reader: OnceLock::new(),
         }
     }
 
@@ -301,6 +307,7 @@ impl Segment {
             key_id,
             val_id,
             bytes_written: AtomicU64::new(total_bytes),
+            cached_reader: OnceLock::new(),
         }))
     }
 
@@ -907,6 +914,30 @@ impl Segment {
     /// Creates a SegmentReader for this segment
     ///
     /// This can only be called on read-only segments (opened from disk).
+    /// Quick bloom-filter check without creating a SegmentReader.
+    /// Returns true if the segment *may* contain the key.
+    #[inline]
+    pub fn may_contain(&self, key_without_ts: &[u8]) -> bool {
+        self.key_index.read().may_contain(key_without_ts)
+    }
+
+    /// Returns a cached SegmentReader, creating it on first access.
+    pub fn reader_cached(&self) -> Result<&crate::segment_reader::SegmentReader, SegmentError> {
+        if !self.is_read_only() {
+            return Err(SegmentError::ReadOnly);
+        }
+
+        self.cached_reader
+            .get_or_init(|| {
+                let key_handle = self.key_handle.as_ref().unwrap().clone();
+                let val_handle = self.val_handle.as_ref().unwrap().clone();
+                let key_index = self.key_index.clone();
+                crate::segment_reader::SegmentReader::new(key_handle, val_handle, key_index)
+                    .unwrap()
+            });
+        Ok(self.cached_reader.get().unwrap())
+    }
+
     pub fn reader(&self) -> Result<crate::segment_reader::SegmentReader, SegmentError> {
         if !self.is_read_only() {
             return Err(SegmentError::ReadOnly);

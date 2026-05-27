@@ -294,7 +294,7 @@ where
             .hash_one(data)
             .to_be_bytes()
             .chunks(self.key_size as usize)
-            .any(|chunk| self.bitmap.get(bytes_to_usize_key(chunk)))
+            .all(|chunk| self.bitmap.get(bytes_to_usize_key(chunk)))
     }
 
     pub fn bitmap(&self) -> &B {

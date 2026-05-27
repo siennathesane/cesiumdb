@@ -174,13 +174,18 @@ impl DbOptions {
             },
         };
 
-        let (curr_memtable, version_manager) = {
+        let (curr_memtable, version_manager, frozen_memtables) = {
             let guard = state.lock();
-            (guard.current_memtable(), Arc::clone(&guard.version_manager))
+            (
+                guard.current_memtable(),
+                Arc::clone(&guard.version_manager),
+                guard.frozen_memtables_arc(),
+            )
         };
         let inner = DbInner {
             state,
             curr_memtable: RwLock::new(curr_memtable),
+            frozen_memtables,
             version_manager,
             read_pool,
             total_gets: AtomicU64::new(0),

@@ -24,6 +24,11 @@ compile_warn!("cesiumdb is not tested on windows");
 #[cfg(not(target_pointer_width = "64"))]
 compile_warn!("cesiumdb is not tested on 32-bit systems");
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[allow(unused)]
 use std::sync::Arc;
 

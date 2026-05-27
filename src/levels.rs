@@ -290,6 +290,42 @@ impl Level {
             .collect()
     }
 
+    /// Binary-search for the single segment that may contain `key`.
+    ///
+    /// `key` must be the *user-key prefix* (`[ns:8][user_key]`) without the
+    /// 16-byte timestamp suffix.  This is only valid for leveled compaction
+    /// where key ranges are non-overlapping and sorted by user key.
+    /// Returns `None` if no range contains the key.
+    pub fn find_segment_for_key_binary(&self, key: &[u8]) -> Option<u64> {
+        if self.key_ranges.is_empty() {
+            return None;
+        }
+        // Binary search on the user-key prefix of `start`.
+        let mut lo = 0usize;
+        let mut hi = self.key_ranges.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let start_prefix =
+                &self.key_ranges[mid].start[..self.key_ranges[mid].start.len().saturating_sub(16)];
+            if start_prefix <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // `lo` is the first range whose start > key, so candidate is `lo - 1`.
+        let idx = lo.saturating_sub(1);
+        self.key_ranges.get(idx).and_then(|range| {
+            let start_prefix = &range.start[..range.start.len().saturating_sub(16)];
+            let end_prefix = &range.end[..range.end.len().saturating_sub(16)];
+            if key >= start_prefix && key <= end_prefix {
+                Some(range.segment_id)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Finds all segments that overlap with the given key range
     pub fn find_overlapping_segments(&self, start: &[u8], end: &[u8]) -> Vec<u64> {
         let query_range = KeyRange::new(start.to_vec(), end.to_vec(), 0);

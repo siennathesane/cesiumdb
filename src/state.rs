@@ -445,6 +445,12 @@ impl DbStorageState {
         self.frozen_memtables.lock().len()
     }
 
+    /// Returns a clone of the frozen-memtables Arc so callers can access the
+    /// queue without locking the outer `DbStorageState`.
+    pub fn frozen_memtables_arc(&self) -> Arc<Mutex<Vec<Arc<Memtable>>>> {
+        Arc::clone(&self.frozen_memtables)
+    }
+
     /// Returns the maximum number of frozen memtables before writes stall
     pub fn memtable_limit(&self) -> u64 {
         self.num_memtable_limit

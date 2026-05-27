@@ -47,7 +47,7 @@ use crate::{
     memtable::Memtable,
     merge,
     state::DbStorageState,
-    utils::Serializer,
+
     version::VersionManager,
 };
 
@@ -58,6 +58,9 @@ pub(crate) struct DbInner {
     /// Cached current memtable to avoid state lock on hot write/get paths.
     /// Updated whenever `new_memtable()` is called under state lock.
     pub(crate) curr_memtable: RwLock<Arc<Memtable>>,
+    /// Cached frozen-memtables Arc to avoid state lock on the read path.
+    /// Points to the same `Mutex<Vec<Arc<Memtable>>>` held by `DbStorageState`.
+    pub(crate) frozen_memtables: Arc<Mutex<Vec<Arc<Memtable>>>>,
     /// Version manager for checking L0 size without state lock
     pub(crate) version_manager: Arc<VersionManager>,
     /// Warm thread pool for parallel LSM reads across levels
@@ -85,57 +88,51 @@ impl DbInner {
             }
         }
 
-        // 2. Check frozen memtables (newest to oldest)
+        // 2. Check frozen memtables (newest to oldest) without state lock
         {
-            let guard = self.state.lock();
-            if let Some(val) = guard.get_from_frozen(&key) {
-                if val.is_tombstone() {
-                    return Ok(None);
+            let frozen = self.frozen_memtables.lock();
+            for memtable in frozen.iter().rev() {
+                if let Some(val) = memtable.get(&key) {
+                    if val.is_tombstone() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(val));
                 }
-                return Ok(Some(val));
             }
         }
 
-        // 3. Check L0-L7 via VersionManager
+        // 3. Check L0-L7 via VersionManager (no state lock)
         {
-            let guard = self.state.lock();
-            let version = guard.version_manager.current();
-            let _key_bytes = key.serialize();
+            let version = self.version_manager.current();
 
             // Check L0 (newest to oldest - reverse chronological)
             // L0 must be checked sequentially because newer segments override older ones
             // We need to search by key prefix (ns + key) to find any version
             // Since timestamps are stored as (u128::MAX - ts), newest=0, oldest=u128::MAX
 
-            // Prepare key without timestamp for bloom filter checks
-            let key_for_bloom = {
-                use bytes::{
-                    BufMut,
-                    BytesMut,
-                };
-                let mut bytes = BytesMut::with_capacity(8 + key.as_bytes().len());
-                bytes.put_u64_le(key.ns());
-                bytes.put_slice(key.as_bytes().as_ref());
-                bytes.freeze()
-            };
+            // Prepare key without timestamp for bloom filter checks.
+            // Use SmallVec to avoid heap allocation for typical key sizes.
+            let mut key_for_bloom = smallvec::SmallVec::<[u8; 64]>::with_capacity(8 + key.as_bytes().len());
+            key_for_bloom.extend_from_slice(&key.ns().to_le_bytes());
+            key_for_bloom.extend_from_slice(&key.as_bytes());
 
             // Check L0 segments in reverse chronological order (newest first)
             for segment in version.l0.iter().rev() {
-                let reader = match segment.reader() {
-                    | Ok(r) => r,
-                    | Err(e) => return Err(CesiumError::SegmentError(e)),
-                };
-
-                // Fast bloom filter check - skip L0 segments that definitely don't have
-                // this key. L0 segments DO have bloom filters (built during flush).
-                if !reader.may_contain(&key_for_bloom) {
+                // Fast bloom filter check without creating a SegmentReader.
+                if !segment.may_contain(&key_for_bloom) {
                     continue;
                 }
 
                 self.l0_reads.fetch_add(1, Ordering::Relaxed);
 
+                let reader = match segment.reader_cached() {
+                    | Ok(r) => r,
+                    | Err(e) => return Err(CesiumError::SegmentError(e)),
+                };
+
                 // Fast point lookup – touches at most one key block.
-                match reader.get_latest(&key_for_bloom) {
+                // Bloom was already checked, so use the fast path.
+                match reader.get_latest_fast(&key_for_bloom) {
                     | Ok(Some(val_bytes)) => {
                         let val = ValueBytes::deserialize(val_bytes);
                         if val.is_tombstone() {
@@ -148,35 +145,66 @@ impl DbInner {
                 }
             }
 
-            // Check L1-L7 sequentially from newest level to oldest
-            // Parallel search across levels is unsafe because deeper levels may
-            // return stale data before newer levels are checked.
+            // Check L1-L7 sequentially from newest level to oldest.
             for level in &version.levels {
-                for segment in &level.segments {
-                    let reader = match segment.reader() {
-                        | Ok(r) => r,
-                        | Err(e) => return Err(CesiumError::SegmentError(e)),
-                    };
+                if level.strategy.allows_overlaps() {
+                    // Tiered / universal levels may have overlapping ranges.
+                    // Fall back to scanning all segments with bloom checks.
+                    for segment in &level.segments {
+                        if !segment.may_contain(&key_for_bloom) {
+                            continue;
+                        }
 
-                    // Fast bloom filter check - skip segments that definitely don't have
-                    // this key
-                    if !reader.may_contain(&key_for_bloom) {
-                        continue;
+                        self.ln_reads.fetch_add(1, Ordering::Relaxed);
+
+                        let reader = match segment.reader_cached() {
+                            | Ok(r) => r,
+                            | Err(e) => return Err(CesiumError::SegmentError(e)),
+                        };
+
+                        match reader.get_latest_fast(&key_for_bloom) {
+                            | Ok(Some(val_bytes)) => {
+                                let val = ValueBytes::deserialize(val_bytes);
+                                if val.is_tombstone() {
+                                    return Ok(None);
+                                }
+                                return Ok(Some(val));
+                            },
+                            | Ok(None) => {},
+                            | Err(e) => return Err(CesiumError::SegmentError(e)),
+                        }
                     }
+                } else {
+                    // Leveled levels have sorted, non-overlapping ranges.
+                    // Use binary search to touch at most one segment per level.
+                    if let Some(segment_id) = level.find_segment_for_key_binary(&key_for_bloom) {
+                        let segment = match level.segments.iter().find(|s| s.id() == segment_id) {
+                            | Some(s) => s,
+                            | None => continue,
+                        };
 
-                    self.ln_reads.fetch_add(1, Ordering::Relaxed);
+                        if !segment.may_contain(&key_for_bloom) {
+                            continue;
+                        }
 
-                    // Fast point lookup – touches at most one key block.
-                    match reader.get_latest(&key_for_bloom) {
-                        | Ok(Some(val_bytes)) => {
-                            let val = ValueBytes::deserialize(val_bytes);
-                            if val.is_tombstone() {
-                                return Ok(None);
-                            }
-                            return Ok(Some(val));
-                        },
-                        | Ok(None) => {},
-                        | Err(e) => return Err(CesiumError::SegmentError(e)),
+                        self.ln_reads.fetch_add(1, Ordering::Relaxed);
+
+                        let reader = match segment.reader_cached() {
+                            | Ok(r) => r,
+                            | Err(e) => return Err(CesiumError::SegmentError(e)),
+                        };
+
+                        match reader.get_latest_fast(&key_for_bloom) {
+                            | Ok(Some(val_bytes)) => {
+                                let val = ValueBytes::deserialize(val_bytes);
+                                if val.is_tombstone() {
+                                    return Ok(None);
+                                }
+                                return Ok(Some(val));
+                            },
+                            | Ok(None) => {},
+                            | Err(e) => return Err(CesiumError::SegmentError(e)),
+                        }
                     }
                 }
             }
@@ -246,16 +274,18 @@ impl DbInner {
                     as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
         }
 
-        // 2. Add frozen memtables and segment iterators under a single state lock
+        // 2. Add frozen memtables without state lock
         {
-            let guard = self.state.lock();
-            let frozen = guard.frozen_memtables_for_scan();
+            let frozen = self.frozen_memtables.lock();
             for memtable in frozen.iter().rev() {
                 let iter = memtable.scan(lower_key.clone(), upper_key.clone());
                 iters.push(Box::new(iter) as Box<dyn Iterator<Item = (KeyBytes, ValueBytes)> + Send>);
             }
+        }
 
-            let version = guard.version_manager.current();
+        // 3. Add L0-L7 segment iterators under state lock
+        {
+            let version = self.version_manager.current();
 
             // Add L0 segments (can overlap, so all must be scanned)
             for segment in &version.l0 {

@@ -167,18 +167,18 @@ impl ParallelReader {
                 | BlockType::Value => Arc::clone(task.reader.val_handle()),
             };
 
-            // Check bounds
-            if offset + BLOCK_SIZE > handle.len() {
+            // Check bounds using pre-computed visible block counts
+            let max_blocks = match task.block_type {
+                | BlockType::Key => task.reader.visible_key_blocks,
+                | BlockType::Value => task.reader.visible_val_blocks,
+            };
+            if task.block_index >= max_blocks {
                 // Skip invalid reads
                 continue;
             }
 
-            // Read the block data directly to Bytes (avoid zeroing)
-            let bytes = handle
-                .read_range(offset..offset + BLOCK_SIZE, |slice| {
-                    Bytes::copy_from_slice(slice)
-                })
-                .ok();
+            // Read the block data directly to Bytes (zero-copy for read-only maps)
+            let bytes = handle.read_bytes(offset..offset + BLOCK_SIZE).ok();
 
             if bytes.is_none() {
                 continue;

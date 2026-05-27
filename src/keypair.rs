@@ -340,7 +340,7 @@ impl ValueBytes {
         ValueBytes {
             ns: u64::from_le_bytes(ns_arr),
             tombstone,
-            value: Bytes::copy_from_slice(&bytes[9..]),
+            value: bytes.slice(9..),
         }
     }
 

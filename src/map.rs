@@ -6,7 +6,9 @@ use std::{
     },
     ops::Range,
     path::PathBuf,
-    sync::atomic::{
+    sync::{
+        Arc,
+        atomic::{
             AtomicPtr,
             AtomicU64,
             Ordering::{
@@ -15,8 +17,10 @@ use std::{
                 Release,
             },
         },
+    },
 };
 
+use bytes::Bytes;
 use memmap2::MmapMut;
 use parking_lot::{
     Mutex,
@@ -31,6 +35,16 @@ use crate::errs::{
 /// The maximum amount of disk space that can be allocated at once.
 pub const MAX_GROWTH_INCREMENT: u64 = 8 * 1024 * 1024;
 
+/// Wrapper that lets an `Arc<Mmap>` satisfy `Bytes::from_owner`.
+#[derive(Debug, Clone)]
+struct MmapOwner(Arc<memmap2::Mmap>);
+
+impl AsRef<[u8]> for MmapOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
 #[derive(Debug)]
 pub struct Map {
     inner: AtomicPtr<SyncUnsafeCell<MmapMut>>,
@@ -38,6 +52,9 @@ pub struct Map {
     current_size: AtomicU64,
     resize_lock: RwLock<()>,
     read_only: bool,
+    /// For read-only maps, hold an `Arc<MmapMut>` so we can create zero-copy
+    /// `Bytes` views via `Bytes::from_owner`.
+    mmap_owner: Option<MmapOwner>,
 }
 
 impl Map {
@@ -77,6 +94,7 @@ impl Map {
             current_size: AtomicU64::new(size_metadata),
             resize_lock: RwLock::new(()),
             read_only: false,
+            mmap_owner: None,
         })
     }
 
@@ -106,6 +124,7 @@ impl Map {
             current_size: AtomicU64::new(size_metadata),
             resize_lock: RwLock::new(()),
             read_only: false,
+            mmap_owner: None,
         })
     }
 
@@ -131,12 +150,22 @@ impl Map {
             }
         };
 
+        // Create a second, immutable mmap for zero-copy Bytes creation.
+        // The file is already open; creating another mmap is cheap.
+        let mmap_ro = unsafe {
+            match memmap2::Mmap::map(&file) {
+                | Ok(v) => v,
+                | Err(e) => return Err(IoError(e)),
+            }
+        };
+
         Ok(Self {
             inner: AtomicPtr::new(Box::into_raw(Box::new(SyncUnsafeCell::new(mmap)))),
             file: Mutex::new(file),
             current_size: AtomicU64::new(size_metadata),
             resize_lock: RwLock::new(()),
             read_only: true,
+            mmap_owner: Some(MmapOwner(Arc::new(mmap_ro))),
         })
     }
 
@@ -413,6 +442,29 @@ impl Map {
         // Guard is explicitly kept alive until here
         drop(_guard);
         Ok(result)
+    }
+
+    /// Return a zero-copy `Bytes` view of the given range.
+    ///
+    /// For read-only maps this uses `Bytes::from_owner` backed by the mmap,
+    /// avoiding a 4 KB memcpy per block read.  For writable maps it falls
+    /// back to `read_range` + `Bytes::copy_from_slice`.
+    pub fn read_bytes(&self, range: Range<usize>) -> Result<Bytes, SegmentError> {
+        if let Some(ref owner) = self.mmap_owner {
+            let full = Bytes::from_owner(owner.clone());
+            if range.end > full.len() {
+                return Err(IoError(std::io::Error::other(
+                    format!(
+                        "read_bytes: range.end ({}) > map.len ({})",
+                        range.end,
+                        full.len()
+                    ),
+                )));
+            }
+            Ok(full.slice(range))
+        } else {
+            self.read_range(range, Bytes::copy_from_slice)
+        }
     }
 
     /// Hint to kernel that we'll need this range soon (prefetch)

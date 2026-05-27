@@ -405,6 +405,40 @@ impl ReadOnlyBlock {
     pub fn num_entries(&self) -> u16 {
         self.num_entries
     }
+
+    /// Same as [`get`](Self::get) but returns a `Bytes` slice instead of a
+    /// `&[u8]`, avoiding a copy when the caller needs an owned `Bytes`.
+    #[inline]
+    pub fn get_bytes(&self, index: usize) -> Option<(EntryFlag, Bytes)> {
+        if index >= self.num_entries as usize {
+            return None;
+        }
+
+        let start_offset = if index == 0 {
+            0
+        } else {
+            let offset_idx = (index - 1) * 2;
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
+        };
+
+        let end_offset = if index < self.num_entries as usize - 1 {
+            let offset_idx = index * 2;
+            u16::from_le_bytes([self.offsets[offset_idx], self.offsets[offset_idx + 1]]) as usize
+        } else {
+            self.entries.len()
+        };
+
+        let entry_data = self.entries.slice(start_offset..end_offset);
+        let flag = match entry_data[0] {
+            | 0 => EntryFlag::Complete,
+            | 1 => EntryFlag::Start,
+            | 2 => EntryFlag::Middle,
+            | 3 => EntryFlag::End,
+            | _ => unreachable!("invalid entry flag"),
+        };
+
+        Some((flag, entry_data.slice(1..)))
+    }
 }
 
 #[cfg(test)]

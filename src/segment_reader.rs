@@ -42,6 +42,7 @@ struct BlockCache<const N: usize> {
     entries: [(usize, Option<crate::block::ReadOnlyBlock>); N],
     next: usize,
 }
+#[allow(dead_code)]
 impl<const N: usize> BlockCache<N> {
     fn new() -> Self {
         Self {
@@ -72,7 +73,6 @@ pub struct SegmentReader {
     pub(crate) key_index: Arc<parking_lot::RwLock<Index>>,
     pub(crate) visible_key_blocks: usize,
     pub(crate) visible_val_blocks: usize,
-    value_block_cache: parking_lot::Mutex<BlockCache<8>>,
 }
 impl SegmentReader {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
@@ -126,7 +126,6 @@ impl SegmentReader {
             key_index,
             visible_key_blocks,
             visible_val_blocks,
-            value_block_cache: parking_lot::Mutex::new(BlockCache::new()),
         })
     }
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
@@ -275,6 +274,61 @@ impl SegmentReader {
         }
         Ok(None)
     }
+    /// Same as [`get_latest`](Self::get_latest) but skips the redundant bloom
+    /// filter check — the caller already verified the key *may* be present.
+    #[inline]
+    pub fn get_latest_fast(&self, key_without_ts: &[u8]) -> Result<Option<Bytes>, SegmentError> {
+        let key_block_offset = match self.key_index.read().get_block(key_without_ts) {
+            | Some(v) => v,
+            | None => return Ok(None),
+        };
+        let key_block = match self.read_key_block(key_block_offset as usize) {
+            | Ok(v) => v,
+            | Err(_e) => return Err(MissingKey),
+        };
+        for entry_index in 0..key_block.num_entries() as usize {
+            let (flag, data) = match key_block.get(entry_index) {
+                | Some(v) => v,
+                | None => continue,
+            };
+            if data.len() < 10 {
+                continue;
+            }
+            let value_block_num = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            let value_entry_index = u16::from_le_bytes(data[8..10].try_into().unwrap());
+            let actual_key_data = &data[10..];
+            let key_matches = match flag {
+                | EntryFlag::Complete => {
+                    actual_key_data.len() >= key_without_ts.len()
+                        && &actual_key_data[..key_without_ts.len()] == key_without_ts
+                },
+                | EntryFlag::Start => {
+                    match self.read_key(key_block_offset as usize, entry_index) {
+                        | Ok(full_key_data) => {
+                            if full_key_data.len() < 10 {
+                                continue;
+                            }
+                            let full_actual_key = &full_key_data[10..];
+                            full_actual_key.len() >= key_without_ts.len()
+                                && &full_actual_key[..key_without_ts.len()] == key_without_ts
+                        },
+                        | Err(_e) => continue,
+                    }
+                },
+                | _ => continue,
+            };
+            if key_matches {
+                return match self.read_value(
+                    value_block_num as usize,
+                    value_entry_index as usize,
+                ) {
+                    | Ok(v) => Ok(Some(v)),
+                    | Err(e) => Err(e),
+                };
+            }
+        }
+        Ok(None)
+    }
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all, level = "debug"))]
     pub(crate) fn read_key_block(
         &self,
@@ -370,49 +424,27 @@ impl SegmentReader {
         if val_block_index >= self.visible_val_blocks {
             return Err(ReadOutOfBounds);
         }
-        // Try to get from cache first
-        let block = {
-            let cache = self.value_block_cache.lock();
-            if let Some(cached_block) = cache.get(val_block_index) {
-                // Cache hit - clone the block
-                cached_block.clone()
-            } else {
-                // Cache miss - drop lock before expensive read
-                drop(cache);
-                // Read the value block from disk
-                let block = match self.read_block_at(val_block_index, Value) {
-                    | Ok(v) => v,
-                    | Err(e) => {
-                        return Err(e);
-                    },
-                };
-                // Insert into cache
-                self.value_block_cache
-                    .lock()
-                    .insert(val_block_index, block.clone());
-                block
-            }
+        // Read the value block directly (no per-reader cache —
+        // random-access workloads have near-zero hit rate anyway).
+        let block = match self.read_block_at(val_block_index, Value) {
+            | Ok(v) => v,
+            | Err(e) => return Err(e),
         };
         // Check if the entry exists
         if entry_index >= block.num_entries() as usize {
             return Err(MissingKey);
         }
-        let (flag, data) = match block.get(entry_index) {
-            | Some(v) => v,
-            | None => {
-                return Err(MissingKey);
-            },
-        };
         // Handle different entry types
-        match flag {
-            | EntryFlag::Complete => {
-                // Simple case - entire value is in this entry
-                Ok(Bytes::copy_from_slice(data))
+        match block.get_bytes(entry_index) {
+            | Some((EntryFlag::Complete, data)) => {
+                // Simple case - entire value is in this entry.
+                // `data` is already a `Bytes` slice into the block — zero copy.
+                Ok(data)
             },
-            | EntryFlag::Start => {
+            | Some((EntryFlag::Start, data)) => {
                 // For multi-block values, we need to find the End flag
                 let mut buffer = BytesMut::with_capacity(data.len() * 2);
-                buffer.extend_from_slice(data);
+                buffer.extend_from_slice(&data);
                 let mut current_block_index = val_block_index + 1;
                 let mut found_end = false;
                 // Check if we have more blocks to read - if not, this is corrupted
@@ -456,7 +488,8 @@ impl SegmentReader {
                 }
                 Ok(buffer.freeze())
             },
-            | EntryFlag::Middle | EntryFlag::End => Err(CorruptedBlock),
+            | Some((EntryFlag::Middle | EntryFlag::End, _)) => Err(CorruptedBlock),
+            | None => Err(MissingKey),
         }
     }
     /// Returns a reference to the key map handle
@@ -475,34 +508,22 @@ impl SegmentReader {
         block_type: BlockType,
     ) -> Result<crate::block::ReadOnlyBlock, SegmentError> {
         let offset = block_index * BLOCK_SIZE;
+        // Use pre-computed visible block counts to avoid fstat on every read.
+        let max_blocks = match block_type {
+            | Key => self.visible_key_blocks,
+            | Value => self.visible_val_blocks,
+        };
+        if block_index >= max_blocks {
+            return Err(ReadOutOfBounds);
+        }
         // Directly create Bytes from mmap without intermediate copy
-        let bytes = match block_type {
-            | Key => {
-                if offset + BLOCK_SIZE > self.key_handle.len() {
-                    return Err(ReadOutOfBounds);
-                }
-                match self
-                    .key_handle
-                    .read_range(offset..offset + BLOCK_SIZE, |slice| {
-                        Bytes::copy_from_slice(slice)
-                    }) {
-                    | Ok(b) => b,
-                    | Err(e) => return Err(e),
-                }
-            },
-            | Value => {
-                if offset + BLOCK_SIZE > self.val_handle.len() {
-                    return Err(ReadOutOfBounds);
-                }
-                match self
-                    .val_handle
-                    .read_range(offset..offset + BLOCK_SIZE, |slice| {
-                        Bytes::copy_from_slice(slice)
-                    }) {
-                    | Ok(b) => b,
-                    | Err(e) => return Err(e),
-                }
-            },
+        let handle = match block_type {
+            | Key => &self.key_handle,
+            | Value => &self.val_handle,
+        };
+        let bytes = match handle.read_bytes(offset..offset + BLOCK_SIZE) {
+            | Ok(b) => b,
+            | Err(e) => return Err(e),
         };
         let block = crate::block::ReadOnlyBlock::deserialize(bytes);
         Ok(block)
