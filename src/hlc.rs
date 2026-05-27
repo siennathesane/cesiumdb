@@ -64,7 +64,7 @@ impl HybridLogicalClock {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
-                let diff = now - last_tick_clone.load(Relaxed);
+                let diff = now.saturating_sub(last_tick_clone.load(Relaxed));
                 if diff == 0 {
                     continue;
                 }

@@ -152,7 +152,6 @@ where
 
     let mut min_key: Option<Vec<u8>> = None;
     let mut max_key: Option<Vec<u8>> = None;
-    let mut last_key_bytes: Option<Bytes> = None;
 
     let segment_mut = match Arc::try_unwrap(segment)
         .map_err(|_| SegmentError::CantCreateWriter(crate::segment::BlockType::Key, segment_id))
@@ -201,9 +200,26 @@ where
         let key_ref = entry.raw_key();
         let val_ref = entry.raw_val();
 
-        // Track min key only once (first written)
-        if min_key.is_none() {
-            min_key = Some(key_ref.to_vec());
+        // Track min/max using raw byte comparison to match KeyRange ordering.
+        // The merge iterator may use cmp_key (integer ns) ordering, which can
+        // differ from raw byte ordering when namespaces differ (little-endian
+        // byte order != integer order). We must ensure min_key <= max_key in
+        // the byte comparison used by KeyRange.
+        match &min_key {
+            | None => min_key = Some(key_ref.to_vec()),
+            | Some(current) => {
+                if key_ref.as_ref() < current.as_slice() {
+                    min_key = Some(key_ref.to_vec());
+                }
+            },
+        }
+        match &max_key {
+            | None => max_key = Some(key_ref.to_vec()),
+            | Some(current) => {
+                if key_ref.as_ref() > current.as_slice() {
+                    max_key = Some(key_ref.to_vec());
+                }
+            },
         }
 
         let write_start = Instant::now();
@@ -211,15 +227,9 @@ where
             return Err(e);
         }
         write_time += write_start.elapsed();
-
-        last_key_bytes = Some(key_ref.clone());
     }
 
     let loop_time = loop_start.elapsed();
-
-    if let Some(last) = last_key_bytes {
-        max_key = Some(last.to_vec());
-    }
 
     let close_start = Instant::now();
     if let Err(e) = seg.close() {

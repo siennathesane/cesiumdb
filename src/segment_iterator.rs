@@ -164,6 +164,7 @@ impl SegmentScanIterator {
         };
         satisfies_lower && satisfies_upper
     }
+
     /// Reads the value for a key.
     /// The key format is:
     /// [value_block_num:u64][value_entry_index:u16][actual_key_data]

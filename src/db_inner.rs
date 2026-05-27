@@ -158,18 +158,25 @@ impl DbInner {
 
                 // Scan for keys matching this prefix (any timestamp)
                 use std::ops::Bound;
-                let mut scan_iter = reader.scan(
+                let scan_iter = reader.scan(
                     Bound::Included(key_prefix_lower.as_ref()),
                     Bound::Included(key_prefix_upper.as_ref()),
                 );
 
-                // Take the first match (newest version due to timestamp ordering)
-                // scan_iter returns (KeyBytes, ValueBytes) already deserialized
-                if let Some(Ok((_, val))) = scan_iter.next() {
-                    if val.is_tombstone() {
-                        return Ok(None);
+                // Find the first entry whose user key matches exactly.
+                // Entries in-range share the same prefix but may differ in
+                // user key if hash collisions or block-level overlaps occur.
+                for result in scan_iter {
+                    if let Ok((found_key, val)) = result {
+                        if found_key.ns() == key.ns()
+                            && found_key.as_bytes() == key.as_bytes()
+                        {
+                            if val.is_tombstone() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(val));
+                        }
                     }
-                    return Ok(Some(val));
                 }
             }
 
@@ -192,15 +199,21 @@ impl DbInner {
                     self.ln_reads.fetch_add(1, Ordering::Relaxed);
 
                     use std::ops::Bound;
-                    let mut scan_iter = reader.scan(
+                    let scan_iter = reader.scan(
                         Bound::Included(key_prefix_lower.as_ref()),
                         Bound::Included(key_prefix_upper.as_ref()),
                     );
-                    if let Some(Ok((_, val))) = scan_iter.next() {
-                        if val.is_tombstone() {
-                            return Ok(None);
+                    for result in scan_iter {
+                        if let Ok((found_key, val)) = result {
+                            if found_key.ns() == key.ns()
+                                && found_key.as_bytes() == key.as_bytes()
+                            {
+                                if val.is_tombstone() {
+                                    return Ok(None);
+                                }
+                                return Ok(Some(val));
+                            }
                         }
-                        return Ok(Some(val));
                     }
                 }
             }
