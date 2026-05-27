@@ -333,16 +333,59 @@ impl CompactionManager {
     ///
     /// This will compact the entire database or a specific key range.
     pub fn compact(&self) {
-        // Try to schedule compactions repeatedly until no more are needed
-        // This will compact multiple levels if necessary
+        // Try to schedule compactions repeatedly until no more are needed.
+        // We use the same in-flight tracking and duplicate checks as the
+        // background loop to prevent overlapping jobs from running concurrently.
         for _ in 0..10 {
-            // Get FRESH version each iteration (not stale snapshot)
-            let version = self.version_manager.current();
+            let total_jobs = self.queue.queued_count() + self.queue.in_progress_count();
+            if total_jobs >= self.scheduler.config().max_concurrent_jobs {
+                break;
+            }
 
-            if let Some(job) = self.scheduler.pick_compaction(&version) {
+            let version = self.version_manager.current();
+            let slots = self.scheduler.config().max_concurrent_jobs - total_jobs;
+            let in_flight_snapshot = {
+                let guard = self.in_flight_segments.read();
+                guard.clone()
+            };
+
+            let jobs = self
+                .scheduler
+                .pick_compactions(&version, &in_flight_snapshot, slots);
+            if jobs.is_empty() {
+                break;
+            }
+
+            let mut enqueued_any = false;
+            for job in jobs {
+                // RocksDB-style: serialize L0 compactions
+                if job.job_type == CompactionJobType::L0Compaction
+                    && self.l0_compactions_in_progress.load(Ordering::Relaxed) > 0
+                {
+                    tracing::debug!(
+                        job_id = job.id,
+                        "compact: skipping L0 job, serialization"
+                    );
+                    continue;
+                }
+
+                // Double-check no segment is already in-flight (race protection)
+                if self.is_duplicate_job(&job) {
+                    tracing::debug!(job_id = job.id, "compact: duplicate job");
+                    continue;
+                }
+
+                self.mark_in_flight(&job);
+                if job.job_type == CompactionJobType::L0Compaction {
+                    self.l0_compactions_in_progress
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 self.queue.enqueue(job);
-            } else {
-                break; // No more compactions needed
+                enqueued_any = true;
+            }
+
+            if !enqueued_any {
+                break;
             }
         }
     }

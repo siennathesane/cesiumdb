@@ -11,6 +11,22 @@ use bytes::{
 use gxhash::gxhash64;
 use tracing::instrument;
 
+/// Minimum safe input length for gxhash64 SIMD loads.
+const MIN_HASH_LEN: usize = 16;
+
+/// Safely hash a byte slice with gxhash64, padding short inputs to avoid
+/// out-of-bounds SIMD reads on small heap allocations.
+#[inline]
+fn safe_gxhash64(key: &[u8], seed: i64) -> u64 {
+    if key.len() >= MIN_HASH_LEN {
+        gxhash64(key, seed)
+    } else {
+        let mut padded = [0u8; MIN_HASH_LEN];
+        padded[..key.len()].copy_from_slice(key);
+        gxhash64(&padded, seed)
+    }
+}
+
 use crate::{
     bloom::{
         Bloom2,
@@ -103,7 +119,7 @@ impl Index {
     /// Insert an item into the index.
     #[instrument(level = "trace")]
     pub fn insert_item(&mut self, key: &[u8]) {
-        let hash = gxhash64(key, self.bloom_filter_seed);
+        let hash = safe_gxhash64(key, self.bloom_filter_seed);
 
         self.bloom_filter.insert(&hash);
         match self
@@ -136,7 +152,7 @@ impl Index {
         let mut hashes = Vec::with_capacity(1000); // Preallocate for common case
 
         for (key, block_idx) in key_block_pairs {
-            let hash = gxhash64(key, self.bloom_filter_seed);
+            let hash = safe_gxhash64(key, self.bloom_filter_seed);
             new_bloom.insert(&hash);
             hashes.push((hash, block_idx));
         }
@@ -169,7 +185,7 @@ impl Index {
 
     /// Check if a key might be present in the index
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        let hash = gxhash64(key, self.bloom_filter_seed);
+        let hash = safe_gxhash64(key, self.bloom_filter_seed);
         self.bloom_filter.contains(&hash)
     }
 
@@ -185,7 +201,7 @@ impl Index {
     /// Get a block offset by hash from the in-memory block index
     #[instrument(level = "trace")]
     pub fn get_block(&self, key: &[u8]) -> Option<u64> {
-        let hash = gxhash64(key, self.bloom_filter_seed);
+        let hash = safe_gxhash64(key, self.bloom_filter_seed);
         self.block_offset_entries
             .binary_search_by_key(&hash, |(h, _b)| *h)
             .ok()

@@ -164,23 +164,27 @@ impl VersionManager {
     /// ```
     pub fn update<F>(&self, f: F) -> Arc<VersionSet>
     where
-        F: FnOnce(&mut VersionSet), {
-        // Get current version under read lock
-        let current = self.current();
+        F: FnOnce(&mut VersionSet),
+    {
+        // Take write lock for the entire operation so that concurrent
+        // updates build on the latest version rather than a stale snapshot.
+        // This prevents lost updates when multiple compactions or flushes
+        // finish concurrently.
+        let mut current = self.current.write();
 
         // Create a new version with incremented sequence
         let next_seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
-        let mut new_version = (*current).clone();
+        let mut new_version = VersionSet::clone(&*current);
         new_version.sequence = next_seq;
 
         // Apply modifications
         f(&mut new_version);
 
         // Install atomically
-        self.install(new_version);
+        *current = Arc::new(new_version);
 
         // Return new current
-        self.current()
+        current.clone()
     }
 
     /// Gets the current sequence number
