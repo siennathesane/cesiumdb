@@ -49,7 +49,7 @@ use crate::{
 };
 
 pub const DEFAULT_BLOCK_SIZE: u64 = 4096;
-pub const DEFAULT_TARGET_SEGMENT_SIZE: u64 = 4096;
+pub const DEFAULT_TARGET_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_NUM_MEMTABLES: u64 = 4;
 
 /// The default set of database options.
